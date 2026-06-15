@@ -1,880 +1,655 @@
-import asyncio
-import json
-import re
-import time
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Literal
+import inspect
+import sys
+import sysconfig
+import threading
+from contextvars import ContextVar
+from functools import wraps
+from pathlib import Path
+from time import perf_counter
+from typing import Any
 
-from bs4 import BeautifulSoup, Tag
-from bs4.filter import SoupStrainer
+from app.config.environment import ENV
 
-from app.utils.text_process import preprocess
+# ── project vs library path detection ─────────────────────────────────────────
 
-from .search_service import SearchService
+_VENV_PATHS = {
+    Path(p).resolve()
+    for p in [
+        sysconfig.get_path("stdlib"),
+        sysconfig.get_path("purelib"),
+        sysconfig.get_path("platlib"),
+    ]
+    if p
+}
 
 
-class RetrievalService:
-    def __init__(self):
-        self.search = SearchService()
+# ── formatting ────────────────────────────────────────────────────────────────
 
-    def replace_special_words(self, text: str) -> str:
-        return text
 
-    def preprocess_pipeline(self, texts: list[str], *args, **kwargs) -> list[str]:
-        texts = [text.lower() for text in texts]
-        texts = [self.replace_special_words(text) for text in texts]
-        return texts
+def fmt(seconds: float) -> str:
+    if seconds >= 1:
+        return f"{seconds:.2f} s"
+    if seconds >= 1e-3:
+        return f"{seconds * 1e3:.2f} ms"
+    return f"{seconds * 1e6:.0f} µs"
 
-    @staticmethod
-    def build_tag_index(soup: Any) -> Any:
-        """Index all <a> tags by their 'name' attribute for O(1) access."""
-        index = defaultdict(list)
-        for tag in soup.find_all("a", attrs={"name": True}):
-            index[tag["name"]].append(tag)
-        return index
 
-    @staticmethod
-    def find_p_tags_until_next_dieu_optimized(soup: BeautifulSoup, number: int) -> list[Tag]:
-        if not soup:
-            return []
+# ── tree ──────────────────────────────────────────────────────────────────────
 
-        # Simple searching is fast enough on a Strainer-reduced soup
-        start_pattern = re.compile(rf"Điều {number}\.")
-        next_dieu_pattern = re.compile(r"Điều \d+\.")
+_current_node: ContextVar[dict | None] = ContextVar("_current_node", default=None)
 
-        all_p_tags = soup.find_all("p")
 
-        results = []
-        is_capturing = False
-        for p_tag in all_p_tags:
-            tag_text = p_tag.get_text()
-            if is_capturing:
-                if next_dieu_pattern.search(tag_text):
-                    break
-                else:
-                    results.append(p_tag)
-            elif start_pattern.search(tag_text):
-                is_capturing = True
-                results.append(p_tag)
-        return results
+def make_node(name: str) -> dict:
+    return {"name": name, "time": None, "start": perf_counter(), "children": []}
 
-    @staticmethod
-    def filter_and_transform_a_tags_indexed(source_a_tags: list[Tag], tag_index: dict) -> Any:
-        """
-        Uses a dictionary lookup (O(1)) instead of scanning the whole DOM (O(N)).
-        """
-        based_tag = set()
-        for a_tag in source_a_tags:
-            original_name = a_tag.get("name")
-            if original_name and original_name.startswith("x"):
-                parts = original_name.split("_")
-                if len(parts) == 2:
-                    base_name, _ = parts
-                    based_tag.add(base_name)
 
-        unique_based_tag = list(based_tag)
-        pattern_dieu = re.compile(r"^\s*Điều\s+(\d+)")
-        found_article_numbers = []
+# ── output tuning ──────────────────────────────────────────────────────────
+# Tree nodes whose wall time is below this fraction of the root total are
+# hidden, collapsed into one "… N hidden" line per parent. Default 0.0 shows
+# everything; raise it (e.g. 0.01) when the tree gets too noisy.
+MIN_PCT = 0.0
+# Number of functions to list in the flat "hot spots" summary. 0 disables it.
+HOT_SPOTS = 15
+# When set, the rendered report is also written to this path (e.g. "perf.txt").
+OUTPUT_FILE: str | None = None
 
-        for name in unique_based_tag:
-            # 1. Retrieve candidate tags from Index
-            candidate_tags = []
 
-            for key, tags in tag_index.items():
-                if key.startswith(name):
-                    candidate_tags.extend(tags)
+# ── auto-patch instances created during a trace session ───────────────────────
 
-            if not candidate_tags:
-                continue
+_patched_classes: set = set()
+# Classes already judged non-project (or our own). The setprofile hook hits
+# _patch_class on EVERY call during a trace — including millions of calls inside
+# uninstrumented libraries (e.g. BeautifulSoup). Caching the negative verdict
+# turns that hot path into one set lookup instead of a per-call filesystem path
+# resolution, which otherwise inflates and destabilises CPU-bound self times.
+_skip_classes: set = set()
 
-            # Logic: if >= 2, take index 1, else index 0
-            a_tag = candidate_tags[1] if len(candidate_tags) >= 2 else candidate_tags[0]
+# When True, modules living under stdlib/site-packages are also instrumented.
+# Default False: only project code is traced (recommended — patching stdlib
+# logging/traceback internals corrupts the logging machinery and crashes).
+SCAN_VENV = False
 
-            text_2_check = a_tag.get_text().strip()
-            match = pattern_dieu.match(text_2_check)
-            if match:
-                found_article_numbers.append(str(match.group(1)))
+# When SCAN_VENV is True, optionally restrict scanning to these top-level
+# packages (e.g. ("langfuse", "openai")). Empty = scan EVERYTHING under
+# stdlib/site-packages, which is noisy (importlib, pydantic, …) and can break
+# fragile libraries. Scoping to the package you care about is strongly advised.
+_SCAN_INCLUDE_PREFIXES: tuple = ()
 
-            parent_p = a_tag.find_parent("p")
-            if not parent_p:
-                continue
+# Modules to always skip, even when SCAN_VENV is True. Patching these recurses
+# through the profiler/logging path and produces endless "--- Logging error ---".
+_SKIP_MODULE_PREFIXES = (
+    "_pydevd",
+    "pydevd",
+    "debugpy",
+    "pytest",
+    "_pytest",
+    "ipykernel",
+    "IPython",
+    "jedi",
+    "logging",
+    "traceback",
+    "linecache",
+    "tokenize",
+    "threading",
+)
 
-            previous_p_tags = parent_p.find_all_previous("p")
-            for prev_p in previous_p_tags:
-                text_to_check = prev_p.get_text().strip()
-                match = pattern_dieu.match(text_to_check)
-                if match:
-                    found_article_numbers.append(str(match.group(1)))
-                    break
 
-        return found_article_numbers
+def _is_project_module(module: Any) -> bool:
+    name = getattr(module, "__name__", "")
+    if any(name.startswith(prefix) for prefix in _SKIP_MODULE_PREFIXES):
+        return False
+    filepath = getattr(module, "__file__", None)
+    if filepath is None:
+        return False
+    # C extensions can't be patched
+    if filepath.endswith((".so", ".pyd", ".dylib")):
+        return False
+    if SCAN_VENV:
+        if _SCAN_INCLUDE_PREFIXES:
+            return any(name.startswith(prefix) for prefix in _SCAN_INCLUDE_PREFIXES)
+        return True
+    resolved = Path(filepath).resolve()
+    return not any(resolved.is_relative_to(venv) for venv in _VENV_PATHS)
 
-    @staticmethod
-    def extract_a_tags_from_p_list(p_tags: list[Tag]) -> list[Tag]:
-        all_a_tags = []
-        for p_tag in p_tags:
-            all_a_tags.extend(p_tag.find_all("a"))
-        return all_a_tags
 
-    @staticmethod
-    def process_stage_group(stage_group_data: Any, last_law_id: int, init_document_name: str) -> Any:
-        """
-        This function runs in a separate process.
-        It handles ONE item from 'all_stages' (one law, multiple articles).
-        """
-        if stage_group_data["stages"] == []:
-            return {
-                "results": stage_group_data["articles"],
-                "law_id": last_law_id,
-                "init_document_name": init_document_name,
-                "parse_time": 0,
-                "total_time": 0,
-                "article_count": len(stage_group_data["articles"]),
-            }
-        t0 = time.time()
+def _is_project_class(cls: type) -> bool:
+    module = sys.modules.get(cls.__module__)
+    if module is None:
+        return False
+    return _is_project_module(module)
 
-        articles = stage_group_data["articles"]
-        stages_config = stage_group_data["stages"]
-        last_law_id = None
-        last_document_name = None
 
-        # 1. SETUP: Parse HTML & Build Index (Happens ONCE per Law)
-        parser = "html.parser"
-
-        strainer = SoupStrainer(["p", "a"])
-
-        prepared_stages = []
-
-        # Pre-process the stages
-        for stage in stages_config:
-            # Parse
-            soup_before = BeautifulSoup(stage["before"]["content"], parser, parse_only=strainer)
-            soup_after = BeautifulSoup(stage["after"]["content"], parser, parse_only=strainer)
-            last_law_id = stage["after"]["law_id"]
-            last_document_name = stage["after"]["document_name"]
-
-            # Index
-            tag_index_after = RetrievalService.build_tag_index(soup_after)
-
-            prepared_stages.append({"soup_before": soup_before, "tag_index_after": tag_index_after})
-
-        parse_time = time.time() - t0
-
-        # 2. EXECUTE: Process Articles (Sequential is fine here because data is ready)
-        results = []
-
-        for article_list in articles:
-            current_result = article_list  # Start with input e.g. ['77', '78']
-
-            # Pass through all stages (usually 1)
-            for prep_stage in prepared_stages:
-                # Inner Loop: Process specific numbers
-                temp_res = []
-                for dieu in current_result:
-                    dieu = int(dieu)
-                    p_tags = RetrievalService.find_p_tags_until_next_dieu_optimized(prep_stage["soup_before"], dieu)
-                    a_tags = RetrievalService.extract_a_tags_from_p_list(p_tags)
-                    found = RetrievalService.filter_and_transform_a_tags_indexed(a_tags, prep_stage["tag_index_after"])
-                    temp_res.extend(found)
-
-                current_result = list(set(temp_res))
-
-            results.append(current_result)
-
-        total_time = time.time() - t0
-
-        return {
-            "results": results,
-            "law_id": last_law_id,
-            "init_document_name": last_document_name,
-            "parse_time": parse_time,
-            "total_time": total_time,
-            "article_count": len(articles),
-        }
-
-    @staticmethod
-    def process_stage_group_optimize(all_stages_list: list[dict]) -> Any:
-        """
-        This function runs in a separate process.
-        It handles ONE item from 'all_stages' (one law, multiple articles).
-        """
-        return [
-            RetrievalService.process_stage_group(
-                stage_group_data,
-                stage_group_data["init_law_id"],
-                stage_group_data["init_document_name"],
-            )
-            for stage_group_data in all_stages_list
-        ]
-
-    @staticmethod
-    def execute_all_stages_parallel(all_stages_list: Any) -> Any:
-        """
-        Parallelizes the processing of the 'all_stages' list.
-        """
-
-        # We map the results back to the original order if needed,
-        # but since inputs are independent, appending is fine.
-
-        print(f" Processing {len(all_stages_list)} Law Groups in Parallel...")
-
-        # ProcessPoolExecutor for heavy text processing
-        with ProcessPoolExecutor(max_workers=4) as executor:
-            # Submit tasks
-            future_to_idx = {
-                executor.submit(
-                    RetrievalService.process_stage_group,
-                    stage_data,
-                    stage_data["init_law_id"],
-                    stage_data["init_document_name"],
-                ): idx
-                for idx, stage_data in enumerate(all_stages_list)
-            }
-
-            # Collect results
-            results_map = [None] * len(all_stages_list)
-
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    data = future.result()
-                    results_map[idx] = {
-                        "law_id": data["law_id"],
-                        "results": data["results"],
-                        "document_name": data["init_document_name"],
-                    }
-
-                    print(f" Group {idx} finished: {data['article_count']} articles.")
-                    print(f"   - Parse Time: {data['parse_time']:.4f}s")
-                    print(f"   - Total Time: {data['total_time']:.4f}s")
-
-                except Exception as exc:
-                    print(f"❌ Group {idx} generated an exception: {exc}")
-                    import traceback
-
-                    traceback.print_exc()
-
-        return results_map
-
-    @staticmethod
-    def execute_all_stages_parallel_optimize(all_stages_list: Any, *args, **kwargs) -> Any:
-        """
-        Parallelizes the processing of the 'all_stages' list.
-        """
-
-        # We map the results back to the original order if needed,
-        # but since inputs are independent, appending is fine.
-
-        print(f" Processing {len(all_stages_list)} Law Groups in Parallel...")
-
-        # Collect results
-        results_map = [None] * len(all_stages_list)
-        state_group_result = RetrievalService.process_stage_group_optimize(all_stages_list)
-
-        for idx, data in enumerate(state_group_result):
-            try:
-                results_map[idx] = {
-                    "law_id": data["law_id"],
-                    "results": data["results"],
-                    "document_name": data["init_document_name"],
-                }
-
-                print(f" Group {idx} finished: {data['article_count']} articles.")
-                print(f"   - Parse Time: {data['parse_time']:.4f}s")
-                print(f"   - Total Time: {data['total_time']:.4f}s")
-
-            except Exception as exc:
-                print(f"❌ Group {idx} generated an exception: {exc}")
-                import traceback
-
-                traceback.print_exc()
-
-        return results_map
-
-    # Process each replacement result concurrently
-    async def process_replacement(self, ress: Any) -> Any:
-        law_id = ress.get("law_id")
-        document_name = ress.get("document_name")
-        list_ccpl_content = await self.search.get_content_by_articles_and_lawid(ress.get("numbers"), law_id)
-
-        ccpl_content_items = []
-        retrieved_content_items = []
-
-        for item in list_ccpl_content:
-            # Add to ccpl_content_
-            ccpl_content_items.append(
-                {
-                    "text": item.get("new_text"),
-                    "dieu": item.get("dieu"),
-                    "law_id": ress.get("law_id"),
-                    "document_name": document_name,
-                    "News_Effectless": item.get("News_Effectless"),
-                    "link": item.get("link"),
-                    "News_EffectDate": item.get("News_EffectDate"),
-                }
-                if item.get("new_text")
-                else {
-                    "text": item.get("text"),
-                    "dieu": item.get("dieu"),
-                    "law_id": ress.get("law_id"),
-                    "document_name": document_name,
-                    "News_Effectless": item.get("News_Effectless"),
-                    "link": item.get("link"),
-                    "News_EffectDate": item.get("News_EffectDate"),
-                }
-            )
-
-            if item.get("new_text"):
-                retrieved_content_items.append(
-                    {
-                        "text": item.get("new_text"),
-                        "dieu": item.get("dieu"),
-                        "law_id": ress.get("law_id"),
-                        "document_name": document_name,
-                        "News_Effectless": item.get("News_Effectless"),
-                        "link": item.get("link"),
-                        "News_EffectDate": item.get("News_EffectDate"),
-                    }
-                )
+def _patch_module_functions(module: Any) -> None:
+    """Patch free functions defined in a project module."""
+    # never patch ourselves — would recurse infinitely
+    if module.__name__ == __name__:
+        return
+    for name in list(vars(module)):
+        if name.startswith("_"):
+            continue
+        try:
+            attr = vars(module)[name]
+        except Exception:
+            continue
+        if (
+            not inspect.isfunction(attr)
+            or isinstance(attr, type)
+            or getattr(attr, "__module__", None) != module.__name__
+            or getattr(attr, "_perf_wrapped", False)
+        ):
+            continue
+        try:
+            if inspect.iscoroutinefunction(attr):
+                wrapped = _async_wrap(attr, f"{module.__name__}.{name}")
             else:
-                retrieved_content_items.append(
-                    {
-                        "text": item.get("text"),
-                        "dieu": item.get("dieu"),
-                        "law_id": ress.get("law_id"),
-                        "document_name": document_name,
-                        "News_Effectless": item.get("News_Effectless").isoformat()
-                        if item.get("News_Effectless")
-                        else None,
-                        "link": item.get("link"),
-                        "News_EffectDate": item.get("News_EffectDate"),
-                    }
+                wrapped = _sync_wrap(attr, f"{module.__name__}.{name}")
+            wrapped._perf_wrapped = True  # type: ignore
+            setattr(module, name, wrapped)
+        except (TypeError, AttributeError):
+            continue
+
+
+def _patch_class(cls: type) -> None:
+    if cls in _patched_classes or cls in _skip_classes:
+        return
+    if not _is_project_class(cls) or cls.__module__ == __name__:
+        _skip_classes.add(cls)  # cache the verdict; never re-resolve this class
+        return
+    _patched_classes.add(cls)
+    for name in list(vars(cls)):
+        if name.startswith("__"):
+            continue
+        try:
+            raw = vars(cls)[name]
+        except Exception:
+            continue
+        try:
+            if isinstance(raw, staticmethod):
+                inner = raw.__func__
+                wrapped = (
+                    _async_wrap(inner, f"{cls.__name__}.{name}")
+                    if inspect.iscoroutinefunction(inner)
+                    else _sync_wrap(inner, f"{cls.__name__}.{name}")
                 )
-
-        return ccpl_content_items, retrieved_content_items
-
-    async def run_retrieve_in_vanban_phase(
-        self, questions_list: list[str], top_k: int = 5, score_threshold: float = 0.7
-    ) -> Any:
-        try:
-            start_time = time.time()
-            all_results = await self.search.search_law_documents(
-                queries=questions_list, limit=top_k, score_threshold=score_threshold
-            )
-            vanban_cauhoi = []
-            uniquee_cauhoi = set()
-            for item in all_results.points:
-                res = item.payload.get("metadata").get("legal_ground").get("code")
-                law_id = str(res).split("_")[0]
-                article = str(res).split("_")[1]
-                key = f"{law_id}_{article}"
-                if key not in uniquee_cauhoi:
-                    uniquee_cauhoi.add(key)
-                    vanban_cauhoi.append(
-                        {
-                            "law_id": int(law_id),
-                            "article": int(article),
-                        }
-                    )
-            groupedd = defaultdict(list)
-            for item in vanban_cauhoi:
-                groupedd[item["law_id"]].append(item["article"])
-
-            # 2. Convert back to list of dictionaries
-            result = [{"law_id": k, "articles": v} for k, v in groupedd.items()]
-            elapsed_time = time.time() - start_time
-            print(f"[TIME LOG] run_retrieve_in_vanban_phase: {elapsed_time:.2f}s")
-            return result
-        except Exception as e:
-            raise e
-
-    async def run_retrieval_htpl_phase(
-        self, questions: list[str], max_retries: int = 3, top_k: int = 5, score_threshold: float = 0.7
-    ) -> Any:
-        try:
-            start_time = time.time()
-            final_retrieval = []
-            for question in questions:
-                for attempt in range(max_retries + 1):
-                    try:
-                        data_1 = await self.search.search_documents(
-                            queries=[question], limit=top_k, score_threshold=score_threshold
-                        )
-                        processed_ids_1 = [
-                            {
-                                "extracted_question": result.payload.get("metadata").get("extracted_question"),
-                                "extracted_answer": result.payload.get("metadata").get("extracted_answer"),
-                                "rewrite_question": result.payload.get("metadata").get("rewrite_question"),
-                                "similarity_score": result.payload.get("metadata").get("similarity_score"),
-                                "rewrite_answer": result.payload.get("metadata").get("rewrite_answer"),
-                                "field_type": result.payload.get("metadata").get("field_types"),
-                                "articles_associations": result.payload.get("metadata").get("legal_ground_codes"),
-                            }
-                            for result in data_1.points
-                        ]
-
-                        final_retrieval.extend(processed_ids_1)
-                        break
-
-                    except Exception:
-                        if attempt < max_retries:
-                            await asyncio.sleep(2**attempt)
-                        else:  # Continue with empty results for this question
-                            final_retrieval.extend([])
-
-            unique_list = []
-            seen = set()
-            for item in final_retrieval:
-                key = json.dumps(
-                    sorted(
-                        [
-                            {"law_id": str(article).split("_")[0], "article": str(article).split("_")[1]}
-                            for article in item["articles_associations"]
-                        ],
-                        key=lambda x: (x["law_id"], x["article"]),
-                    )
+                setattr(cls, name, staticmethod(wrapped))
+            elif isinstance(raw, classmethod):
+                inner = raw.__func__
+                wrapped = (
+                    _async_wrap(inner, f"{cls.__name__}.{name}")
+                    if inspect.iscoroutinefunction(inner)
+                    else _sync_wrap(inner, f"{cls.__name__}.{name}")
                 )
-                if key not in seen:
-                    articles_associations = item["articles_associations"]
-                    item["articles_associations"] = [
-                        {"id": article, "law_id": str(article).split("_")[0], "article": str(article).split("_")[1]}
-                        for article in articles_associations
-                    ]
-                    unique_list.append(item)
-                    seen.add(key)
+                setattr(cls, name, classmethod(wrapped))
+            elif inspect.isfunction(raw):
+                if inspect.iscoroutinefunction(raw):
+                    setattr(cls, name, _async_wrap(raw, f"{cls.__name__}.{name}"))
+                else:
+                    setattr(cls, name, _sync_wrap(raw, f"{cls.__name__}.{name}"))
+        except (TypeError, AttributeError):
+            # immutable C-extension type — skip it and move on
+            continue
 
-            if len(unique_list) == 0:
-                unique_list = [
-                    {
-                        "rewrite_question": "Không có dữ liệu",
-                        "extracted_question": "N/A",
-                        "extracted_answer": "N/A",
-                    }
-                ]
 
-            # NOTE: Rerank Here by extract question, answer, etc.
-            # get unique articles associations
-            seen_ids = set()
-            unique_articles_associations = []
-            for item in unique_list:
-                if item.get("articles_associations") is not None:
-                    for association in item.get("articles_associations"):
-                        if association.get("id") not in seen_ids:
-                            seen_ids.add(association.get("id"))
-                            if association.get("article") != "-1" and association.get("article") != "0":
-                                unique_articles_associations.append(association)
+def _patch_instance(obj: object) -> None:
+    _patch_class(type(obj))
 
-            unique_law_ids = []
-            for association in unique_articles_associations:
-                unique_law_ids.append(
-                    {
-                        "law_id": int(association.get("law_id")),
-                        "article": int(association.get("article")),
-                    }
-                )
 
-            grouped = defaultdict(list)
-            for item in unique_law_ids:
-                grouped[item["law_id"]].append(item["article"])
-            result = []
-            for law_id in grouped:
-                val = [grouped[law_id][0]] if len(grouped[law_id]) == 1 else list(grouped[law_id])
-
-                result.append({"law_id": law_id, "articles": val})
-            elapsed_time = time.time() - start_time
-            print(f"[TIME LOG] run_retrieval_htpl_phase: {elapsed_time:.2f}s")
-            return result
-        except Exception as e:
-            raise e
-
-    async def run_retrieval_hyde_drill_phase(
-        self, questions: list[str], top_k: int = 5, score_threshold: float = 0.7
-    ) -> Any:
-        try:
-            start_time = time.time()
-            vanban_cauhoi = []
-            uniquee_cauhoi = set()
-            datas = await self.search.search_drill_documents(
-                queries=questions, top_k=top_k, score_threshold=score_threshold
-            )
-            for data in datas:
-                query_points = data.points
-                for point in query_points:
-                    code = point.payload.get("metadata").get("code")
-                    law_id = code.split("_")[0]
-                    article = code.split("_")[1]
-                    key = f"{law_id}_{article}"
-                    if key not in uniquee_cauhoi:
-                        uniquee_cauhoi.add(key)
-                        vanban_cauhoi.append(
-                            {
-                                "law_id": int(law_id),
-                                "article": int(article),
-                            }
-                        )
-            grouped = defaultdict(list)
-            for item in vanban_cauhoi:
-                grouped[item["law_id"]].append(item["article"])
-            result = [{"law_id": k, "articles": v} for k, v in grouped.items()]
-            elapsed_time = time.time() - start_time
-            print(f"[TIME LOG] run_retrieval_hyde_drill_phase: {elapsed_time:.2f}s")
-            return result
-        except Exception as e:
-            raise e
-
-    async def run_retrieval_hyde_phase(self, hyde_answer: str, top_k: int = 5, score_threshold: float = 0.7) -> Any:
-        try:
-            phase_time = time.time()
-            pattern = r"\[.*?\]%%\[.*?\]%%\[.*?\]"
-            raw_list = re.findall(pattern, hyde_answer)
-
-            parsed_data = []
-            unique_doc_names = set()
-
-            for item in raw_list:
-                parts = item.split("%%")
-                if len(parts) >= 3:
-                    parsed_data.append((parts[1], parts[2]))
-                    unique_doc_names.add(parts[2].strip("[]"))
-
-            if not parsed_data:
-                print("No valid CCPL data found in first_answer.")
-                return []
-            phase1_time = time.time() - phase_time
-            print(f"⏱️ [1/5] Parsing & Deduplication: {phase1_time:.4f}s | Items: {len(parsed_data)}")
-
-            phase_time = time.time()
-            doc_map = {}
-
+def _patch_all_project_classes() -> None:
+    for module in list(sys.modules.values()):
+        if module is None or not _is_project_module(module):
+            continue
+        _patch_module_functions(module)  # ← NEW
+        for attr_name in list(vars(module)):
             try:
-                rows = await self.search.find_legal_documents_by_batch(unique_doc_names)
-                for row in rows:
-                    doc_map[row["doc_name"].lower()] = int(row["law_id"])
-            except Exception as e:
-                print(f"Error looking up documents in batch: {e}")
-            phase2_time = time.time() - phase_time
-            print(f"⏱️ [2/5] Document Lookup: {phase2_time:.4f}s | Items: {len(doc_map)}")
-
-            phase_time = time.time()
-            texts_to_embed = []
-            metadata_batch = []
-            try:
-                for content, doc_name in parsed_data:
-                    doc_name = doc_name.strip("[]").lower()
-                    # Only include doc_name if it occurs after its first position in doc_map
-                    if doc_name in doc_map:
-                        law_row = doc_map[doc_name]
-
-                        # Text Processing
-                        processed_text = str(preprocess(f"{doc_name} {content.strip('[]')}"))
-
-                        texts_to_embed.append(processed_text)
-                        metadata_batch.append(
-                            {"law_id": law_row, "doc_name": doc_name, "processed_text": processed_text}
-                        )
-
-                if not texts_to_embed:
-                    print("No valid CCPL data found in first_answer.")
-                    return []
-
-                phase3_time = time.time() - phase_time
-                print(f"⏱️ [3/5] Text Preprocessing: {phase3_time:.4f}s | Batch Size: {len(texts_to_embed)}")
-            except Exception as e:
-                print(f"Error preprocessing text: {e}")
-                return []
-
-            phase_time = time.time()
-            all_list = []
-            final_result = []
-            try:
-                results = await self.search.find_ccpl_by_first_answer(metadata_batch)
-                for result in results:
-                    points = result.points
-                    for point in points:
-                        payload = point.payload.get("metadata")
-                        law_id = payload.get("law_id")
-                        bm_code = payload.get("bm_code")
-                        article = bm_code.split("_")[1]
-                        all_list.append({"law_id": law_id, "article": article})
-
-                grouped = defaultdict(list)
-                for item in all_list:
-                    grouped[item["law_id"]].append(item["article"])
-                final_result = [{"law_id": k, "articles": v} for k, v in grouped.items()]
-
-            except Exception as e:
-                print(f"Error finding CCPL by first answer: {e}")
-                return []
-
-            return final_result
-        except Exception as e:
-            raise e
-
-    async def postprocess_pipeline(
-        self,
-        normal_queries: list[str],
-        hyde_drill_queries: list[str],
-        hyde_answer: str,
-        top_k: int,
-        score_threshold: float,
-        query_timestamp: int = int(time.time()),
-    ) -> list[dict]:
-        retrieve_vanban_task = asyncio.create_task(
-            self.run_retrieve_in_vanban_phase(
-                questions_list=normal_queries, top_k=top_k, score_threshold=score_threshold
-            )
-        )
-
-        retrieval_htpl_task = asyncio.create_task(
-            self.run_retrieval_htpl_phase(questions=normal_queries, top_k=top_k, score_threshold=score_threshold)
-        )
-
-        retrieve_hyde_drill = asyncio.create_task(
-            self.run_retrieval_hyde_drill_phase(
-                questions=hyde_drill_queries, top_k=top_k, score_threshold=score_threshold
-            )
-        )
-
-        retrieve_hyde = asyncio.create_task(
-            self.run_retrieval_hyde_phase(hyde_answer=hyde_answer, top_k=top_k, score_threshold=score_threshold)
-        )
-
-        (
-            retrieve_vanban_results,
-            retrieval_htpl_results,
-            retrieve_hyde_drill_results,
-            retrieve_hyde_results,
-        ) = await asyncio.gather(retrieve_vanban_task, retrieval_htpl_task, retrieve_hyde_drill, retrieve_hyde)
-
-        full_ccpls = (
-            retrieval_htpl_results + retrieve_vanban_results + retrieve_hyde_drill_results + retrieve_hyde_results
-        )
-
-        merged_dict = {}
-
-        for item in full_ccpls:
-            lid = item["law_id"]
-            articles = item["articles"]
-            if lid not in merged_dict:
-                merged_dict[lid] = []
-            # Extend the current list with the new articles
-            merged_dict[lid].extend(articles)
-
-        # 3. Format back to list and remove duplicates
-        final_result = []
-        for lid, all_articles in merged_dict.items():
-            # dict.fromkeys() is a fast trick to remove duplicates while preserving Order
-            # (Sets would scramble the order)
-            unique_articles = list(dict.fromkeys(all_articles))
-            final_result.append({"law_id": lid, "articles": unique_articles})
-        distinct_ids = list({item["law_id"] for item in final_result if "law_id" in item})
-
-        document_names = await self.search.get_document_name_by_many_ids(distinct_ids)
-        document_names_dict = {item["LawID"]: item["News_Subject"] for item in document_names}
-        for item in final_result:
-            item["init_document_name"] = document_names_dict.get(item["law_id"], "")
-
-        final_results = final_result
-
-        # tasks = [
-        #     self.search.get_stages_by_lawid(result["law_id"], result["articles"], result["init_document_name"])
-        #     for result in final_results
-        # ]
-
-        # results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        results = await self.search.get_stages_by_lawid_all(final_results)
-
-        all_stages = []
-
-        for _, stages in zip(final_results, results, strict=False):
-            if isinstance(stages, Exception):
+                attr = vars(module)[attr_name]
+            except Exception:
                 continue
+            if isinstance(attr, type) and attr.__module__ == module.__name__:
+                _patch_class(attr)
 
-            if stages != {}:
-                all_stages.append(stages)
 
-        # final_results_after_stages = self.execute_all_stages_parallel(all_stages)
-        final_results_after_stages = self.execute_all_stages_parallel_optimize(all_stages)
-        merged_data = defaultdict(lambda: {"numbers": set(), "document_name": None})
+# ── sync / async node wrappers ────────────────────────────────────────────────
 
-        # 2. Process and Merge the data
-        for item in final_results_after_stages:
-            law_id = item["law_id"]
 
-            # Store document name (overwrites if duplicates exist)
-            merged_data[law_id]["document_name"] = item["document_name"]
+def _sync_wrap(func: Any, name: str) -> Any:
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        parent = _current_node.get()
+        node = make_node(name)
+        if parent is not None:
+            parent["children"].append(node)
+        token = _current_node.set(node)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            node["time"] = perf_counter() - node["start"]
+            _current_node.reset(token)
 
-            # Merge numbers using set .update() (handles uniqueness automatically)
-            for sublist in item["results"]:
-                merged_data[law_id]["numbers"].update([int(i) for i in sublist])
+    return wrapper
 
-        # 3. Format the final output as a LIST of dictionaries
-        replacement_results = [
+
+def _async_wrap(func: Any, name: str) -> Any:
+    @wraps(func)
+    async def wrapper(*args, **kwargs) -> Any:
+        parent = _current_node.get()
+        node = make_node(name)
+        if parent is not None:
+            parent["children"].append(node)
+        token = _current_node.set(node)
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            node["time"] = perf_counter() - node["start"]
+            _current_node.reset(token)
+
+    return wrapper
+
+
+# ── setprofile hook: intercepts __init__ and call to patch instances ──────────
+
+
+def _make_profiler() -> Any:
+    def profiler(frame: Any, event: Any, arg: Any) -> None:
+        if (event == "return" and frame.f_code.co_name == "__init__") or event == "call":
+            self = frame.f_locals.get("self")
+            if self is not None:
+                _patch_instance(self)
+
+    return profiler
+
+
+# ── @trace entry-point decorator ─────────────────────────────────────────────
+
+
+def trace(func: Any) -> Any:
+    if not ENV.debug:
+        return func
+
+    if inspect.iscoroutinefunction(func):
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:  # type: ignore
+            _patch_all_project_classes()  # ← NEW
+            root = make_node(func.__qualname__)
+            _current_node.set(root)
+            # _patched_classes.clear()  ← REMOVED
+            profiler = _make_profiler()
+            threading.setprofile(profiler)
+            sys.setprofile(profiler)
+            try:
+                result = await func(*args, **kwargs)
+            finally:
+                root["time"] = perf_counter() - root["start"]
+                sys.setprofile(None)
+                threading.setprofile(None)
+                print_tree(root)
+            return result
+    else:
+
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            _patch_all_project_classes()  # ← NEW
+            root = make_node(func.__qualname__)
+            _current_node.set(root)
+            # _patched_classes.clear()  ← REMOVED
+            profiler = _make_profiler()
+            threading.setprofile(profiler)
+            sys.setprofile(profiler)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                root["time"] = perf_counter() - root["start"]
+                sys.setprofile(None)
+                threading.setprofile(None)
+                print_tree(root)
+            return result
+
+    return wrapper
+
+
+# ── collapse / merge helpers ─────────────────────────────────────────────────
+
+
+def _merge_children(nodes: list) -> list:
+    """Merge same-named nodes: wall via interval union, cumulative via sum.
+
+    Wall is the union of the merged instances' time intervals — the same rule
+    _collapse uses. Using max here instead (the old behaviour) reported only the
+    single longest instance, which could be *smaller* than the union of the
+    node's own children, producing an impossible "child wall > parent wall".
+    """
+    merged: dict[str, dict] = {}
+    order = []
+    for node in nodes:
+        name = node["name"]
+        if name not in merged:
+            merged[name] = {
+                "name": name,
+                "time": 0.0,
+                "cumulative": 0.0,
+                "count": 0,
+                "start": float("inf"),  # will become min
+                "children": [],
+                "_intervals": [],
+            }
+            order.append(name)
+        node_wall = node["time"] or 0
+        node_cumul = node.get("cumulative") or node_wall
+        merged[name]["start"] = min(merged[name]["start"], node.get("start", float("inf")))
+        merged[name]["cumulative"] += node_cumul
+        merged[name]["count"] += node.get("count", 1)
+        merged[name]["children"].extend(node["children"])
+        merged[name]["_intervals"].append({"start": node.get("start", 0), "time": node_wall})
+
+    for name in order:
+        merged[name]["time"] = _wall_from_intervals(merged[name].pop("_intervals"))
+        merged[name]["children"] = _collapse(merged[name]["children"])
+        # drop cumulative if it equals wall (no noise)
+        if abs(merged[name]["time"] - merged[name]["cumulative"]) < 1e-6:
+            del merged[name]["cumulative"]
+
+    return [merged[name] for name in order]
+
+
+def _wall_from_intervals(nodes: list) -> float:
+    """Compute true wall time using interval union (handles parallel + sequential)."""
+    intervals = []
+    for n in nodes:
+        s = n.get("start", 0)
+        t = n.get("time") or 0
+        intervals.append((s, s + t))
+    if not intervals:
+        return 0
+    intervals.sort()
+    merged_start, merged_end = intervals[0]
+    total = 0
+    for s, e in intervals[1:]:
+        if s <= merged_end:
+            merged_end = max(merged_end, e)
+        else:
+            total += merged_end - merged_start
+            merged_start, merged_end = s, e
+    total += merged_end - merged_start
+    return total
+
+
+def _collapse(children: list) -> list:
+    if not children:
+        return []
+
+    group_collapsed = _collapse_repeating_groups(children)
+    if group_collapsed is not None:
+        return group_collapsed
+
+    # Merge same-named siblings into one aggregate node per name — including
+    # non-adjacent duplicates (e.g. SQL.run_query interleaved with other calls).
+    # First occurrence fixes the display order.
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for node in children:
+        name = node["name"]
+        if name not in groups:
+            groups[name] = []
+            order.append(name)
+        groups[name].append(node)
+
+    collapsed = []
+    for name in order:
+        group = groups[name]
+        if len(group) == 1:
+            node = group[0]
+            collapsed.append({**node, "children": _collapse(node["children"])})
+            continue
+        merged_children = _merge_children([c for n in group for c in n["children"]])
+        wall = _wall_from_intervals(group)
+        cumulative = sum((n.get("cumulative") or n["time"] or 0) for n in group)
+        calls = sum(n.get("count", 1) for n in group)
+        collapsed.append(
             {
-                "law_id": lid,
-                "numbers": sorted(data["numbers"]),
-                "document_name": data["document_name"],
+                "name": f"{name} ×{calls}",
+                "time": wall,
+                "cumulative": cumulative,
+                "count": calls,
+                "start": min(n.get("start", 0) for n in group),
+                "children": merged_children,
             }
-            for lid, data in merged_data.items()
-        ]
+        )
+    return collapsed
 
-        tasks = [self.process_replacement(ress) for ress in replacement_results]
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+def _collapse_repeating_groups(children: list) -> list | None:
+    """Detect [A,B,C,A,B,C,...] cycles and collapse into one [xN] group.
 
-        # Combine all results
-        list_retrieved_content = []
-        list_ccpl_content_ = []
-        for ccpl_items, retrieved_items in results:
-            list_ccpl_content_.extend(ccpl_items)
-            list_retrieved_content.extend(retrieved_items)
+    Only multi-step cycles get a [xN] wrapper. A single name repeated
+    ([A,A,A,...]) is not a cycle, so it falls through to _collapse, which
+    renders it as the much clearer "A xN" node instead of "[xN] -> A".
+    """
+    n = len(children)
+    for size in range(1, n // 2 + 1):
+        if n % size != 0:
+            continue
+        pattern = [c["name"] for c in children[:size]]
+        if len(set(pattern)) <= 1:
+            continue
+        reps = n // size
+        if all(children[i * size + j]["name"] == pattern[j] for i in range(reps) for j in range(size)):
+            merged_group = []
+            for j in range(size):
+                instances = [children[i * size + j] for i in range(reps)]
+                wall = _wall_from_intervals(instances)
+                cumulative = sum(inst["time"] or 0 for inst in instances)
+                merged_children = _merge_children([c for inst in instances for c in inst["children"]])
+                merged_group.append(
+                    {
+                        "name": instances[0]["name"],
+                        "time": wall,
+                        "cumulative": cumulative,
+                        "count": sum(inst.get("count", 1) for inst in instances),
+                        "start": min(inst.get("start", 0) for inst in instances),  # ← add
+                        "children": _collapse(merged_children),
+                    }
+                )
+            group_wall = sum(c["time"] or 0 for c in merged_group)
+            group_cumulative = sum(c.get("cumulative") or c["time"] or 0 for c in merged_group)
+            return [
+                {
+                    "name": f"[x{reps}]",
+                    "time": group_wall,
+                    "cumulative": group_cumulative,
+                    "count": reps,
+                    "start": min(c.get("start", 0) for c in merged_group),  # ← add
+                    "children": merged_group,
+                }
+            ]
+    return None
 
-        unique_retrieved_content = set()
-        unique_list_retrieved_content = []
 
-        for item in list_retrieved_content:
-            key = f"{item.get('law_id')}_{item.get('dieu')}"
-            if key not in unique_retrieved_content:
-                unique_retrieved_content.add(key)
-                unique_list_retrieved_content.append(item)
+# ── self time & flat aggregation ──────────────────────────────────────────────
 
-        # Filter out documents that are not in effect on the query date
-        unique_retrieved_content = [
-            law
-            for law in unique_list_retrieved_content
-            if (
-                law["News_EffectDate"] is not None
-                and law["News_EffectDate"].timestamp() <= query_timestamp
-                and (law["News_Effectless"] is None or law["News_EffectDate"].timestamp() > query_timestamp)
+
+def _total(node: dict) -> float:
+    """Work attributed to a node: cumulative when it merges calls, else wall.
+
+    Wall-vs-wall ratios break down once concurrent calls are merged (a merged
+    node's wall is an overlap-aware union, so a child's union can exceed its
+    parent's → >100%). Cumulative never exceeds the parent's, so %parent uses
+    this instead.
+    """
+    return node.get("cumulative") or (node["time"] or 0)
+
+
+def _self_time(node: dict) -> float:
+    """Wall time spent inside this node excluding its children (exclusive time)."""
+    children = node["children"]
+    t = node["time"] or 0
+    if not children:
+        return t
+    return max(t - _wall_from_intervals(children), 0.0)
+
+
+def _aggregate(root: dict) -> dict[str, dict]:
+    """Flat per-function stats over the raw tree.
+
+    For each function name we track three different time totals — they diverge
+    under concurrency, and that divergence is the useful signal:
+      • self  — summed exclusive (busy) time. Sums of overlapping concurrent
+                calls legitimately exceed wall, so this is NOT a % of runtime.
+      • wall  — interval union of every call: the real elapsed footprint,
+                always ≤ total runtime. self/wall ≫ 1 ⇒ heavy concurrency.
+      • cumulative — summed inclusive time across calls.
+    """
+    stats: dict[str, dict] = {}
+
+    def visit(node: dict) -> None:
+        name = node["name"]
+        s = stats.get(name)
+        if s is None:
+            s = {"self": 0.0, "cumulative": 0.0, "calls": 0, "intervals": []}
+            stats[name] = s
+        s["self"] += _self_time(node)
+        s["cumulative"] += node["time"] or 0
+        s["calls"] += 1
+        s["intervals"].append({"start": node.get("start", 0), "time": node["time"] or 0})
+        for child in node["children"]:
+            visit(child)
+
+    for child in root["children"]:  # skip root: it's the 100% entry point
+        visit(child)
+    for s in stats.values():
+        s["wall"] = _wall_from_intervals(s.pop("intervals"))
+    return stats
+
+
+def _format_hot_spots(root: dict, total: float) -> str:
+    if not HOT_SPOTS:
+        return ""
+    stats = _aggregate(root)
+    if not stats:
+        return ""
+    ranked = sorted(stats.items(), key=lambda kv: kv[1]["self"], reverse=True)[:HOT_SPOTS]
+    rows = []
+    for name, s in ranked:
+        wall = s["wall"]
+        conc = s["cumulative"] / wall if wall else 1.0
+        rows.append(
+            (
+                name,
+                fmt(s["self"]),
+                fmt(wall),
+                f"{min(wall / total, 1.0) * 100:4.0f}%",
+                f"{conc:.1f}×",
+                str(s["calls"]),
             )
-        ]
-
-        used_dieu = []
-        for doc in unique_retrieved_content:
-            used_dieu.append({"dieu": doc.get("dieu"), "law_id": doc.get("law_id")})
-
-        grouped = {}
-        for item in used_dieu:
-            lid = item["law_id"]
-            if lid not in grouped:
-                grouped[lid] = []
-            grouped[lid].append(item["dieu"])
-
-        # 2. Transform into the desired list format
-        grouped_result = [{"law_id": k, "numbers": v} for k, v in grouped.items()]
-
-        ccpl_relation_list = []
-
-        tasks = [self.search.process_single_rep_result_first(rep) for rep in grouped_result]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            ccpl_relation_list.extend(result)
-
-        return unique_retrieved_content, ccpl_relation_list
-
-    async def retrieval(
-        self,
-        normal_queries: list[str],
-        hyde_drill_queries: list[str],
-        hyde_answer: str,
-        top_k: int = 5,
-        score_threshold: float = 0.7,
-        query_timestamp: int = int(time.time()),
-    ) -> dict:
-        normal_queries = self.preprocess_pipeline(normal_queries)
-        hyde_drill_queries = self.preprocess_pipeline(hyde_drill_queries)
-        replace_articles, change_articles = await self.postprocess_pipeline(
-            normal_queries=normal_queries,
-            hyde_drill_queries=hyde_drill_queries,
-            hyde_answer=hyde_answer,
-            top_k=top_k,
-            score_threshold=score_threshold,
-            query_timestamp=query_timestamp,
         )
-        result = {"replace_articles": replace_articles, "change_articles": change_articles}
+    headers = ("function", "self", "wall", "%tot", "conc", "calls")
+    cols = list(zip(headers, *rows, strict=False))
+    widths = [max(len(c) for c in col) for col in cols]
+    n_w, self_w, wall_w, pct_w, conc_w, calls_w = widths
 
-        # result = await self.run_retrieval_hyde_phase(
-        #     hyde_answer=hyde_answer, top_k=top_k, score_threshold=score_threshold
-        # )
-        return result
-
-    async def postprocess_contract(
-        self,
-        normal_queries: list[str],
-        top_k: int = 5,
-        score_threshold: float = 0.7,
-    ) -> dict:
-        contract_ids = await self.search.search_contract_ids(
-            queries=normal_queries, limit=top_k, score_threshold=score_threshold
+    def line(name: str, self_t: str, wall: str, pct: str, conc: str, calls: str) -> str:
+        return (
+            f"{name:<{n_w}}  {self_t:>{self_w}}  {wall:>{wall_w}}  "
+            f"{pct:>{pct_w}}  {conc:>{conc_w}}  {calls:>{calls_w}}\n"
         )
 
-        contracts = await self.search.search_contracts(contract_ids)
-        contracts = [dict(contract) for contract in contracts]
-        for contract in contracts:
-            contract["create_day"] = contract["create_day"].strftime("%Y-%m-%d")
-        return contracts
+    out = f"\nhot spots — top {len(rows)} by self time\n"
+    out += (
+        "  self = summed busy time · wall = elapsed (overlap-aware) · "
+        "%tot = wall/total · conc = cumul/wall ≈ avg parallelism (1.0× = sequential)\n"
+    )
+    out += "─" * (n_w + self_w + wall_w + pct_w + conc_w + calls_w + 10) + "\n"
+    out += line(*headers)
+    for r in rows:
+        out += line(*r)
+    return out
 
-    async def retrieval_contract(
-        self,
-        normal_queries: list[str],
-        top_k: int = 5,
-        score_threshold: float = 0.7,
-    ) -> dict:
-        normal_queries = self.preprocess_pipeline(normal_queries)
-        contracts = await self.postprocess_contract(
-            normal_queries=normal_queries,
-            top_k=top_k,
-            score_threshold=score_threshold,
-        )
 
-        return {"contracts": contracts}
+# ── printer ───────────────────────────────────────────────────────────────────
 
-    async def postprocess_file(
-        self,
-        normal_queries: list[str],
-        top_k: int = 5,
-        score_threshold: float = 0.7,
-        file_ids: list[str] | None = None,
-        source: Literal["UPLOAD", "EDITOR", "ALL"] = "ALL",
-    ) -> dict:
-        files = await self.search.search_file(
-            queries=normal_queries,
-            limit=top_k,
-            score_threshold=score_threshold,
-            file_ids=file_ids,
-            source=source,
-        )
 
-        file_ids = list({f["id"].split("_")[0] for f in files})
+def print_tree(root: dict) -> None:
+    lines: list[tuple[str, str, str, str, str]] = []
+    total = root["time"] or 1
+    threshold = total * MIN_PCT
 
-        full_file_contents = await self.search.search_full_files(file_ids)
+    def pct_of_parent(node: dict, parent_total: float) -> str:
+        if not parent_total:
+            return "   —"
+        # cap at 100%: residual overflow is a merge artifact, not real work
+        ratio = min(_total(node) / parent_total, 1.0)
+        return f"{ratio * 100:4.0f}%"
 
-        return {
-            str(f["id"]): {
-                "full_content": f["structured_data"],
-                "chunk": [mf for mf in files if str(mf["id"]).startswith(str(f["id"]))],
-            }
-            for f in full_file_contents
-        }
+    def walk(node: dict, prefix: str, is_last: bool, parent_total: float) -> None:
+        branch = "└─ " if is_last else "├─ "
+        t = node["time"] or 0
+        cumulative = node.get("cumulative")
+        children = node["children"]
+        self_t = _self_time(node)
 
-    async def retrieval_file(
-        self,
-        normal_queries: list[str],
-        top_k: int = 5,
-        score_threshold: float = 0.7,
-        file_ids: list[str] | None = None,
-        source: Literal["UPLOAD", "EDITOR", "ALL"] = "ALL",
-    ) -> dict:
-        normal_queries = self.preprocess_pipeline(normal_queries)
-        files = await self.postprocess_file(
-            normal_queries=normal_queries,
-            top_k=top_k,
-            score_threshold=score_threshold,
-            file_ids=file_ids,
-            source=source,
-        )
+        children_sum = sum(c["time"] or 0 for c in children)
+        parallel_hint = "  [parallel]" if len(children) > 1 and children_sum > t * 1.2 else ""
 
-        return {"files": files}
+        time_str = f"{fmt(t)} / {fmt(cumulative)}" if cumulative and abs(cumulative - t) > 1e-4 else fmt(t)
+        # self time only adds info when there are children to exclude
+        self_str = fmt(self_t) if children else "—"
+        pct_tot = f"{t / total * 100:4.0f}%"
+        pct_par = pct_of_parent(node, parent_total)
+
+        lines.append((prefix + branch + node["name"] + parallel_hint, time_str, self_str, pct_tot, pct_par))
+
+        # apply the noise threshold: small siblings collapse into one summary line
+        visible = [c for c in children if (c["time"] or 0) >= threshold]
+        hidden = [c for c in children if (c["time"] or 0) < threshold]
+        child_prefix = prefix + ("   " if is_last else "│  ")
+        node_total = _total(node)
+        for i, child in enumerate(visible):
+            last = i == len(visible) - 1 and not hidden
+            walk(child, child_prefix, last, node_total)
+        if hidden:
+            ht = sum(c["time"] or 0 for c in hidden)
+            h_total = sum(_total(c) for c in hidden)
+            lines.append(
+                (
+                    f"{child_prefix}└─ … {len(hidden)} hidden < {MIN_PCT * 100:g}%",
+                    fmt(ht),
+                    "—",
+                    f"{ht / total * 100:4.0f}%",
+                    f"{min(h_total / node_total, 1.0) * 100:4.0f}%" if node_total else "   —",
+                )
+            )
+
+    root_cumulative = root.get("cumulative")
+    if root_cumulative and abs(root_cumulative - (root["time"] or 0)) > 1e-4:
+        root_time_str = f"{fmt(root['time'] or 0)} / {fmt(root_cumulative)}"
+    else:
+        root_time_str = fmt(root["time"] or 0)
+
+    lines.append(("─ " + root["name"], root_time_str, fmt(_self_time(root)), "100%", "  —"))
+    children = _collapse(root["children"])
+    root_total = _total(root)
+    for i, child in enumerate(children):
+        walk(child, "", i == len(children) - 1, root_total)
+
+    name_w = max(len(n) for n, *_ in lines) + 2
+    time_w = max(len(t) for _, t, *_ in lines) + 2
+    self_w = max(max(len(s) for _, _, s, _, _ in lines), len("self")) + 2
+
+    result = _format_hot_spots(root, total)
+    result += f"\n{'call':<{name_w}}{'wall/cumul':>{time_w}}{'self':>{self_w}}   %tot  %parent\n"
+    result += "─" * (name_w + time_w + self_w + 16) + "\n"
+    for name, t, self_t, pct_tot, pct_par in lines:
+        result += f"{name:<{name_w}}{t:>{time_w}}{self_t:>{self_w}}   {pct_tot} {pct_par}\n"
+
+    print(result)
+    if OUTPUT_FILE:
+        with open(OUTPUT_FILE, "w") as f:
+            f.write(result)
+
+    import json
+    with open('sample.json', 'w') as f:
+        f.write(json.dumps(root, indent=4))
+
+
+# @trace
+# def a() -> None:
+#     print(1)
