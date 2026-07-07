@@ -1,9 +1,11 @@
-import atexit
+import asyncio
 import inspect
 import re
+import signal
 import sys
 import sysconfig
 import threading
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
@@ -52,6 +54,12 @@ MIN_PCT = 0.0
 HOT_SPOTS = 15
 # When set, the rendered report is also written to this path (e.g. "perf.txt").
 OUTPUT_FILE: str | None = None
+# Auto-terminate a traced call that runs longer than this many seconds. The
+# async path cancels the coroutine (asyncio.wait_for); the sync path interrupts
+# via SIGALRM (Unix main thread only — a background thread is left to run and a
+# warning is printed). The partial tree collected so far is still printed on
+# timeout. None disables the watchdog.
+TIMEOUT: float | None = 1.0
 
 
 # ── auto-patch instances created during a trace session ───────────────────────
@@ -100,7 +108,7 @@ _SKIP_MODULE_PREFIXES = (
 # as JSON-native structures (dicts stay dicts, lists stay lists) with FULL
 # contents — no truncation — so nested dict results are preserved verbatim.
 # Turn off to shrink the file / avoid touching values.
-CAPTURE_IO = False
+CAPTURE_IO = True
 # Guards against runaway/cyclic objects: max recursion depth when converting a
 # value to JSON. Beyond it, the sub-value falls back to a repr string.
 MAX_DEPTH = 20
@@ -351,40 +359,36 @@ def _make_profiler() -> Any:
     return profiler
 
 
-# ── trace lifecycle: guarantee the tree prints even on Ctrl+C ─────────────────
-# @trace often wraps a long-running async entry point (e.g. a Kafka consumer
-# handler). On Ctrl+C the event loop is torn down and the in-flight coroutine is
-# abandoned, so its `finally` block — and thus print_tree — never runs. We track
-# every in-flight root here and flush any survivor at process exit, making the
-# finish step idempotent so a normally-completing trace still prints exactly once.
-
-_active_roots: list[dict] = []
+# ── timeout watchdog ──────────────────────────────────────────────────────────
 
 
-def _finish_trace(root: dict) -> None:
-    """Stop profiling and print the tree once; safe to call more than once."""
-    if root.get("_finished"):
+@contextmanager
+def _sync_timeout(seconds: float | None, name: str) -> Any:
+    """Interrupt the wrapped block after `seconds` via SIGALRM.
+
+    Only works on the main thread of the main interpreter (a SIGALRM handler
+    can't be installed elsewhere); off the main thread it degrades to a no-op
+    with a warning, since a running sync call in a background thread can't be
+    forcibly killed anyway.
+    """
+    if seconds is None or not hasattr(signal, "SIGALRM"):
+        yield
         return
-    root["_finished"] = True
-    if root.get("time") is None:
-        root["time"] = perf_counter() - root["start"]
-    sys.setprofile(None)
-    threading.setprofile(None)
+    if threading.current_thread() is not threading.main_thread():
+        print(f"[perf] TIMEOUT ignored for {name}: not on main thread", file=sys.stderr)
+        yield
+        return
+
+    def _handler(signum: int, frame: Any) -> None:
+        raise TimeoutError(f"{name} exceeded TIMEOUT of {seconds:g}s")
+
+    previous = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
-        _active_roots.remove(root)
-    except ValueError:
-        pass
-    print_tree(root)
-
-
-@atexit.register
-def _flush_active_roots() -> None:
-    # newest first: the deepest interrupted trace is usually the interesting one
-    for root in reversed(list(_active_roots)):
-        try:
-            _finish_trace(root)
-        except Exception:  # never let a broken tree block interpreter shutdown
-            pass
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 # ── @trace entry-point decorator ─────────────────────────────────────────────
@@ -400,7 +404,6 @@ def trace(func: Any) -> Any:
         async def wrapper(*args, **kwargs) -> Any:  # type: ignore
             _patch_all_project_classes()  # ← NEW
             root = make_node(func.__qualname__)
-            _active_roots.append(root)
             _record_inputs(root, args, kwargs)
             _current_node.set(root)
             # _patched_classes.clear()  ← REMOVED
@@ -408,14 +411,19 @@ def trace(func: Any) -> Any:
             threading.setprofile(profiler)
             sys.setprofile(profiler)
             try:
-                result = await func(*args, **kwargs)
+                if TIMEOUT is not None:
+                    result = await asyncio.wait_for(func(*args, **kwargs), TIMEOUT)
+                else:
+                    result = await func(*args, **kwargs)
                 _record_output(root, result)
             except BaseException as exc:
                 _record_exception(root, exc)
                 raise
             finally:
                 root["time"] = perf_counter() - root["start"]
-                _finish_trace(root)
+                sys.setprofile(None)
+                threading.setprofile(None)
+                print_tree(root)
             return result
     else:
 
@@ -423,7 +431,6 @@ def trace(func: Any) -> Any:
         def wrapper(*args, **kwargs) -> Any:
             _patch_all_project_classes()  # ← NEW
             root = make_node(func.__qualname__)
-            _active_roots.append(root)
             _record_inputs(root, args, kwargs)
             _current_node.set(root)
             # _patched_classes.clear()  ← REMOVED
@@ -431,14 +438,17 @@ def trace(func: Any) -> Any:
             threading.setprofile(profiler)
             sys.setprofile(profiler)
             try:
-                result = func(*args, **kwargs)
+                with _sync_timeout(TIMEOUT, func.__qualname__):
+                    result = func(*args, **kwargs)
                 _record_output(root, result)
             except BaseException as exc:
                 _record_exception(root, exc)
                 raise
             finally:
                 root["time"] = perf_counter() - root["start"]
-                _finish_trace(root)
+                sys.setprofile(None)
+                threading.setprofile(None)
+                print_tree(root)
             return result
 
     return wrapper
