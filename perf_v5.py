@@ -53,7 +53,7 @@ MIN_PCT = 0.0
 # Number of functions to list in the flat "hot spots" summary. 0 disables it.
 HOT_SPOTS = 15
 # When set, the rendered report is also written to this path (e.g. "perf.txt").
-OUTPUT_FILE: str | None = None
+OUTPUT_FILE: str | None = "perf.json"
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None disables it.
 ENDPOINT_URL: str | None = "http://localhost:7999/api/traces"
