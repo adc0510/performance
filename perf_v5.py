@@ -54,12 +54,17 @@ MIN_PCT = 0.0
 HOT_SPOTS = 15
 # When set, the rendered report is also written to this path (e.g. "perf.txt").
 OUTPUT_FILE: str | None = None
+# When set, the raw trace tree is POSTed here at the end of every traced call,
+# wrapped as {"status", "tags", "trace"} (see _send_trace). None disables it.
+ENDPOINT_URL: str | None = "http://localhost:7999/api/traces"
+# Tags attached to every posted trace (e.g. ["prod", "search"]).
+TAGS: list = ["dev"]
 # Auto-terminate a traced call that runs longer than this many seconds. The
 # async path cancels the coroutine (asyncio.wait_for); the sync path interrupts
 # via SIGALRM (Unix main thread only — a background thread is left to run and a
 # warning is printed). The partial tree collected so far is still printed on
 # timeout. None disables the watchdog.
-TIMEOUT: float | None = 1.0
+TIMEOUT: float | None = None
 
 
 # ── auto-patch instances created during a trace session ───────────────────────
@@ -793,6 +798,44 @@ def print_tree(root: dict) -> None:
 
         with open(OUTPUT_FILE, "w") as f:
             f.write(json.dumps(root, indent=2, ensure_ascii=False, default=str))
+    _send_trace(root)
+
+
+# ── remote trace shipping ─────────────────────────────────────────────────────
+
+
+def _send_trace(root: dict) -> None:
+    """POST the raw trace tree to ENDPOINT_URL, wrapped as {status, tags, trace}.
+
+    Runs in a daemon thread so a slow/unreachable collector never blocks (or
+    crashes) the traced call. A failed send is logged to stderr and swallowed.
+    """
+    if not ENDPOINT_URL:
+        return
+    import json
+    import urllib.request
+
+    payload = {
+        "status": "error" if root.get("exception") else "ok",
+        "tags": TAGS,
+        "trace": root,
+    }
+    data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+
+    def _post() -> None:
+        req = urllib.request.Request(
+            ENDPOINT_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+        except Exception as e:  # never let telemetry break the traced call
+            print(f"[perf] failed to POST trace to {ENDPOINT_URL}: {e}", file=sys.stderr)
+
+    threading.Thread(target=_post, name="perf-send-trace", daemon=True).start()
 
 
 # @trace
