@@ -1,3 +1,21 @@
+"""perf — a zero-dependency call-tree profiler / tracer.
+
+Decorate an entry point with :func:`trace` and every project function and method
+reached during that call is instrumented, producing a wall/self/cumulative call
+tree (printed, and optionally written to a file or POSTed to a collector).
+
+Basic usage::
+
+    import perf
+
+    @perf.trace
+    def main() -> None:
+        ...
+
+Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_FILE``,
+``perf.ENDPOINT_URL``, ``perf.TIMEOUT``, ``perf.SCAN_VENV`` — see each below.
+"""
+
 import asyncio
 import inspect
 import re
@@ -7,10 +25,26 @@ import sysconfig
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+
+__version__ = "0.1.0"
+__all__ = [
+    "trace",
+    "print_tree",
+    "fmt",
+    "MIN_PCT",
+    "HOT_SPOTS",
+    "OUTPUT_FILE",
+    "ENDPOINT_URL",
+    "TAGS",
+    "TIMEOUT",
+    "SCAN_VENV",
+    "CAPTURE_IO",
+    "MAX_DEPTH",
+]
 
 # ── project vs library path detection ─────────────────────────────────────────
 
@@ -29,6 +63,20 @@ _VENV_PATHS = {
 
 
 def fmt(seconds: float) -> str:
+    """Format a duration in seconds as a short human-readable string.
+
+    Picks the largest unit that keeps the number readable: seconds (``s``) with
+    2 decimals for ``>= 1s``, milliseconds (``ms``) with 2 decimals for
+    ``>= 1ms``, otherwise whole microseconds (``µs``). Used throughout the
+    printed report and hot-spots table.
+
+    Args:
+        seconds: A non-negative duration in seconds.
+
+    Returns:
+        The duration rendered with its unit, e.g. ``"1.20 s"``, ``"5.26 ms"``,
+        ``"261 µs"``.
+    """
     if seconds >= 1:
         return f"{seconds:.2f} s"
     if seconds >= 1e-3:
@@ -42,6 +90,23 @@ _current_node: ContextVar[dict | None] = ContextVar("_current_node", default=Non
 
 
 def make_node(name: str) -> dict:
+    """Create a fresh call-tree node and stamp its start time.
+
+    A node is the unit the whole tracer is built on. It starts with ``time``
+    unset (``None``) — the wrapper fills it in with the measured wall duration
+    when the call returns — and ``start`` set to the current ``perf_counter()``
+    so overlap-aware wall math (:func:`_wall_from_intervals`) can later place it
+    on the timeline. Input/output values (``args``, ``kwargs``, ``result``,
+    ``exception``) and aggregate fields (``cumulative``, ``count``) are attached
+    lazily by other helpers and are absent here.
+
+    Args:
+        name: Display label for the node, e.g. ``"Class.method"`` or a
+            ``module.function`` qualname.
+
+    Returns:
+        A dict with keys ``name``, ``time`` (``None``), ``start``, ``children``.
+    """
     return {"name": name, "time": None, "start": perf_counter(), "children": []}
 
 
@@ -52,11 +117,13 @@ def make_node(name: str) -> dict:
 MIN_PCT = 0.0
 # Number of functions to list in the flat "hot spots" summary. 0 disables it.
 HOT_SPOTS = 15
-# When set, the rendered report is also written to this path (e.g. "perf.txt").
-OUTPUT_FILE: str | None = "perf.json"
+# When set, the raw trace tree is written to this path as JSON (e.g. "perf.json").
+# None (the default) disables it — set it to opt in.
+OUTPUT_FILE: str | None = None
 # When set, the raw trace tree is POSTed here at the end of every traced call,
-# wrapped as {"status", "tags", "trace"} (see _send_trace). None disables it.
-ENDPOINT_URL: str | None = "http://localhost:7999/api/traces"
+# wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
+# disables it — set it to opt in (e.g. "http://localhost:7999/api/traces").
+ENDPOINT_URL: str | None = None
 # Tags attached to every posted trace (e.g. ["prod", "search"]).
 TAGS: list = ["dev"]
 # Auto-terminate a traced call that runs longer than this many seconds. The
@@ -170,6 +237,19 @@ def _safe_repr(value: Any) -> str:
 
 
 def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
+    """Attach a JSON-safe snapshot of a call's arguments to its node.
+
+    No-op unless :data:`CAPTURE_IO` is on. Positional args keep their index in
+    ``node["args"]``; a value with no useful serialization (the ``_SKIP``
+    sentinel from :func:`_jsonable`) is replaced by a compact ``"<TypeName>"``
+    marker so the slot is preserved. Keyword args go to ``node["kwargs"]``, where
+    skipped values are dropped entirely rather than marked.
+
+    Args:
+        node: The call-tree node to annotate in place.
+        args: The positional arguments the traced function was called with.
+        kwargs: The keyword arguments the traced function was called with.
+    """
     if not CAPTURE_IO:
         return
     # positional args keep their slot; skipped objects become a compact marker
@@ -178,17 +258,59 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
 
 
 def _record_output(node: dict, result: Any) -> None:
+    """Attach a JSON-safe snapshot of a call's return value to its node.
+
+    No-op unless :data:`CAPTURE_IO` is on. Stores the converted value under
+    ``node["result"]``; an unserializable result (``_SKIP``) becomes a
+    ``"<TypeName>"`` marker so the fact that *something* was returned is kept.
+
+    Args:
+        node: The call-tree node to annotate in place.
+        result: The value returned by the traced function.
+    """
     if CAPTURE_IO:
         jv = _jsonable(result)
         node["result"] = f"<{type(result).__name__}>" if jv is _SKIP else jv
 
 
 def _record_exception(node: dict, exc: BaseException) -> None:
+    """Record, under ``node["exception"]``, the repr of an exception a call raised.
+
+    No-op unless :data:`CAPTURE_IO` is on. Uses :func:`_safe_repr` so an
+    exception whose own ``__repr__`` misbehaves can't break the trace. The
+    presence of this key is also what flips a shipped trace's status to
+    ``"error"`` in :func:`_send_trace`.
+
+    Args:
+        node: The call-tree node to annotate in place.
+        exc: The exception raised out of the traced call (re-raised by the caller).
+    """
     if CAPTURE_IO:
         node["exception"] = _safe_repr(exc)
 
 
 def _is_project_module(module: Any) -> bool:
+    """Decide whether a module's functions should be instrumented.
+
+    This is the core "your code vs. someone else's code" gate. A module is
+    considered project code (and thus patchable) unless it is disqualified by:
+
+    * matching a :data:`_SKIP_MODULE_PREFIXES` entry (profiler/logging internals
+      that recurse or crash when patched);
+    * having no ``__file__`` (built-in / namespace module);
+    * being a C extension (``.so`` / ``.pyd`` / ``.dylib`` — can't be patched).
+
+    When :data:`SCAN_VENV` is False (default), any module whose file resolves
+    under stdlib/site-packages (:data:`_VENV_PATHS`) is excluded, so only your
+    own source is traced. When :data:`SCAN_VENV` is True, library code is
+    included too — optionally narrowed to :data:`_SCAN_INCLUDE_PREFIXES`.
+
+    Args:
+        module: A module object (typically from ``sys.modules``).
+
+    Returns:
+        True if functions/classes defined in this module should be wrapped.
+    """
     name = getattr(module, "__name__", "")
     if any(name.startswith(prefix) for prefix in _SKIP_MODULE_PREFIXES):
         return False
@@ -207,6 +329,18 @@ def _is_project_module(module: Any) -> bool:
 
 
 def _is_project_class(cls: type) -> bool:
+    """Return whether a class is defined in project code, via its module.
+
+    Resolves the class's ``__module__`` to the live module object and defers to
+    :func:`_is_project_module`. A class whose defining module is no longer in
+    ``sys.modules`` is treated as non-project (not patchable).
+
+    Args:
+        cls: The class to test.
+
+    Returns:
+        True if the class's methods should be instrumented.
+    """
     module = sys.modules.get(cls.__module__)
     if module is None:
         return False
@@ -214,7 +348,23 @@ def _is_project_class(cls: type) -> bool:
 
 
 def _patch_module_functions(module: Any) -> None:
-    """Patch free functions defined in a project module."""
+    """Wrap the module-level (free) functions defined in a project module.
+
+    Iterates the module's public names (``_``-prefixed are skipped) and replaces
+    each function *defined in this module* with a timing wrapper — async
+    functions get :func:`_async_wrap`, everything else :func:`_sync_wrap`. It
+    deliberately skips:
+
+    * this tracer's own module (patching it would recurse infinitely);
+    * classes, imported functions (``__module__`` differs), and anything already
+      wrapped (marked with ``_perf_wrapped``, making the pass idempotent).
+
+    Individual attributes that can't be read or reassigned (e.g. immutable
+    C-defined members) are skipped rather than raising.
+
+    Args:
+        module: A module already judged to be project code.
+    """
     # never patch ourselves — would recurse infinitely
     if module.__name__ == __name__:
         return
@@ -244,6 +394,26 @@ def _patch_module_functions(module: Any) -> None:
 
 
 def _patch_class(cls: type) -> None:
+    """Wrap the methods of a project class in place (once), with fast negative caching.
+
+    Called on the hot path from the profiler hook for essentially every object
+    seen during a trace, so it short-circuits aggressively:
+
+    * already-patched classes (:data:`_patched_classes`) return immediately;
+    * classes previously judged non-project (:data:`_skip_classes`) return
+      immediately — the negative verdict is cached so a class living in a library
+      is path-resolved only once instead of on every call (see the comment on
+      ``_skip_classes``).
+
+    For a project class, each attribute is wrapped according to its kind:
+    ``staticmethod``/``classmethod`` are re-wrapped preserving that descriptor,
+    plain functions are wrapped directly; async callables use
+    :func:`_async_wrap`, others :func:`_sync_wrap`. Dunder names are left alone,
+    and immutable C-extension types (which reject ``setattr``) are skipped.
+
+    Args:
+        cls: The class to instrument.
+    """
     if cls in _patched_classes or cls in _skip_classes:
         return
     if not _is_project_class(cls) or cls.__module__ == __name__:
@@ -285,10 +455,29 @@ def _patch_class(cls: type) -> None:
 
 
 def _patch_instance(obj: object) -> None:
+    """Patch the class of a live instance seen during tracing.
+
+    Thin adapter used by the profiler hook: given an object observed at a
+    ``call``/``__init__`` boundary, ensure its type's methods are instrumented.
+    Delegates (with all its caching) to :func:`_patch_class`.
+
+    Args:
+        obj: Any instance encountered while a trace is active.
+    """
     _patch_class(type(obj))
 
 
 def _patch_all_project_classes() -> None:
+    """Instrument every already-imported project module up front.
+
+    Run once at the start of each traced call so functions and classes that
+    exist before the profiler hook starts firing are covered too. Walks a
+    snapshot of ``sys.modules``, and for each project module (per
+    :func:`_is_project_module`) wraps its free functions
+    (:func:`_patch_module_functions`) and every class *defined in that module*
+    (:func:`_patch_class`). Instances created *during* the call are picked up
+    separately by the ``setprofile`` hook.
+    """
     for module in list(sys.modules.values()):
         if module is None or not _is_project_module(module):
             continue
@@ -306,6 +495,24 @@ def _patch_all_project_classes() -> None:
 
 
 def _sync_wrap(func: Any, name: str) -> Any:
+    """Wrap a synchronous callable so each call becomes a timed tree node.
+
+    The returned wrapper: creates a node named ``name``, records inputs, links
+    itself under the current node (:data:`_current_node`) so the tree mirrors the
+    real call stack, and makes itself current for the duration via a
+    ``ContextVar`` token. On the way out it records the result (or the raised
+    exception, which is re-raised) and always stamps the node's wall ``time`` and
+    restores the previous current-node — so the tree stays consistent even when a
+    call raises.
+
+    Args:
+        func: The original synchronous function/method to time.
+        name: Display name for the node (typically ``"Owner.attr"``).
+
+    Returns:
+        A ``functools.wraps``-preserving wrapper with the same signature.
+    """
+
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
         parent = _current_node.get()
@@ -329,6 +536,23 @@ def _sync_wrap(func: Any, name: str) -> Any:
 
 
 def _async_wrap(func: Any, name: str) -> Any:
+    """Wrap a coroutine function so each awaited call becomes a timed tree node.
+
+    Async analogue of :func:`_sync_wrap`: same node creation, input/output
+    capture, parent linking, and current-node bookkeeping, but it ``await``\\ s
+    the inner coroutine. Because linkage flows through a ``ContextVar``, sibling
+    coroutines running concurrently each attach to their own logical parent, and
+    their nodes' start/time intervals let the reporter compute overlap-aware wall
+    time.
+
+    Args:
+        func: The original coroutine function to time.
+        name: Display name for the node (typically ``"Owner.attr"``).
+
+    Returns:
+        A ``functools.wraps``-preserving async wrapper with the same signature.
+    """
+
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
         parent = _current_node.get()
@@ -355,6 +579,20 @@ def _async_wrap(func: Any, name: str) -> Any:
 
 
 def _make_profiler() -> Any:
+    """Build the ``sys.setprofile`` hook that patches instances on the fly.
+
+    Up-front patching (:func:`_patch_all_project_classes`) can't see objects
+    whose classes are imported or instantiated *after* the trace starts. This
+    hook closes that gap: on every ``call`` event, and on ``return`` from an
+    ``__init__``, it grabs the frame's ``self`` and routes it through
+    :func:`_patch_instance` (whose caching keeps this cheap despite firing on
+    virtually every call).
+
+    Returns:
+        A ``profiler(frame, event, arg)`` callable to hand to
+        ``sys.setprofile`` / ``threading.setprofile``.
+    """
+
     def profiler(frame: Any, event: Any, arg: Any) -> None:
         if (event == "return" and frame.f_code.co_name == "__init__") or event == "call":
             self = frame.f_locals.get("self")
@@ -398,63 +636,125 @@ def _sync_timeout(seconds: float | None, name: str) -> Any:
 
 # ── @trace entry-point decorator ─────────────────────────────────────────────
 
+# Config attributes that may be overridden per-decorator, e.g.
+# ``@trace(MIN_PCT=0.01, TIMEOUT=5)``. Each name maps to the module-level global
+# of the same name; an override temporarily sets that global for the dynamic
+# extent of the traced call (including printing/sending), then restores it.
+_CONFIG_KEYS = frozenset(
+    {
+        "MIN_PCT",
+        "HOT_SPOTS",
+        "OUTPUT_FILE",
+        "ENDPOINT_URL",
+        "TAGS",
+        "TIMEOUT",
+        "SCAN_VENV",
+        "CAPTURE_IO",
+        "MAX_DEPTH",
+    }
+)
 
-def trace(func: Any) -> Any:
-    # if not ENV.debug:
-    #     return func
+
+def _check_overrides(overrides: dict) -> None:
+    unknown = set(overrides) - _CONFIG_KEYS
+    if unknown:
+        raise TypeError(
+            f"trace() got unexpected config override(s): {', '.join(sorted(unknown))}. "
+            f"Valid keys: {', '.join(sorted(_CONFIG_KEYS))}"
+        )
+
+
+@contextmanager
+def _apply_overrides(overrides: dict) -> Any:
+    """Temporarily set module-level config globals from `overrides`, then restore.
+
+    All config is read through module globals, so applying overrides for the
+    duration of the traced call makes every consumer (patching, capture, print,
+    send) honour them without threading a config object through the codebase.
+
+    Note: because it mutates globals, concurrently running traced calls that pass
+    *different* overrides can transiently see each other's values — same caveat
+    that already applies to setting ``perf.MIN_PCT`` etc. directly.
+    """
+    if not overrides:
+        yield
+        return
+    g = globals()
+    saved = {k: g[k] for k in overrides}
+    g.update(overrides)
+    try:
+        yield
+    finally:
+        g.update(saved)
+
+
+def trace(func: Any = None, **overrides: Any) -> Any:
+    """Instrument `func`'s call tree. Usable bare or with config overrides.
+
+    ``@trace`` traces using the current module-level config. ``@trace(MIN_PCT=.01,
+    TIMEOUT=5, ...)`` overrides those config globals just for calls to this
+    function. Valid keys are the module config attributes (see ``_CONFIG_KEYS``).
+    """
+    # Called with parentheses (@trace(...) / trace(**cfg)): defer until we get func.
+    if func is None:
+        _check_overrides(overrides)
+        return partial(trace, **overrides)
+    _check_overrides(overrides)
 
     if inspect.iscoroutinefunction(func):
 
         @wraps(func)
         async def wrapper(*args, **kwargs) -> Any:  # type: ignore
-            _patch_all_project_classes()  # ← NEW
-            root = make_node(func.__qualname__)
-            _record_inputs(root, args, kwargs)
-            _current_node.set(root)
-            # _patched_classes.clear()  ← REMOVED
-            profiler = _make_profiler()
-            threading.setprofile(profiler)
-            sys.setprofile(profiler)
-            try:
-                if TIMEOUT is not None:
-                    result = await asyncio.wait_for(func(*args, **kwargs), TIMEOUT)
-                else:
-                    result = await func(*args, **kwargs)
-                _record_output(root, result)
-            except BaseException as exc:
-                _record_exception(root, exc)
-                raise
-            finally:
-                root["time"] = perf_counter() - root["start"]
-                sys.setprofile(None)
-                threading.setprofile(None)
-                print_tree(root)
-            return result
+            with _apply_overrides(overrides):
+                _patch_all_project_classes()  # ← NEW
+                root = make_node(func.__qualname__)
+                _record_inputs(root, args, kwargs)
+                _current_node.set(root)
+                # _patched_classes.clear()  ← REMOVED
+                profiler = _make_profiler()
+                threading.setprofile(profiler)
+                sys.setprofile(profiler)
+                try:
+                    if TIMEOUT is not None:
+                        result = await asyncio.wait_for(func(*args, **kwargs), TIMEOUT)
+                    else:
+                        result = await func(*args, **kwargs)
+                    _record_output(root, result)
+                except BaseException as exc:
+                    _record_exception(root, exc)
+                    raise
+                finally:
+                    root["time"] = perf_counter() - root["start"]
+                    sys.setprofile(None)
+                    threading.setprofile(None)
+                    print_tree(root)
+                return result
     else:
 
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
-            _patch_all_project_classes()  # ← NEW
-            root = make_node(func.__qualname__)
-            _record_inputs(root, args, kwargs)
-            _current_node.set(root)
-            # _patched_classes.clear()  ← REMOVED
-            profiler = _make_profiler()
-            threading.setprofile(profiler)
-            sys.setprofile(profiler)
-            try:
-                with _sync_timeout(TIMEOUT, func.__qualname__):
-                    result = func(*args, **kwargs)
-                _record_output(root, result)
-            except BaseException as exc:
-                _record_exception(root, exc)
-                raise
-            finally:
-                root["time"] = perf_counter() - root["start"]
-                sys.setprofile(None)
-                threading.setprofile(None)
-                print_tree(root)
-            return result
+            with _apply_overrides(overrides):
+                _patch_all_project_classes()  # ← NEW
+                root = make_node(func.__qualname__)
+                _record_inputs(root, args, kwargs)
+                _current_node.set(root)
+                # _patched_classes.clear()  ← REMOVED
+                profiler = _make_profiler()
+                threading.setprofile(profiler)
+                sys.setprofile(profiler)
+                try:
+                    with _sync_timeout(TIMEOUT, func.__qualname__):
+                        result = func(*args, **kwargs)
+                    _record_output(root, result)
+                except BaseException as exc:
+                    _record_exception(root, exc)
+                    raise
+                finally:
+                    root["time"] = perf_counter() - root["start"]
+                    sys.setprofile(None)
+                    threading.setprofile(None)
+                    print_tree(root)
+                return result
 
     return wrapper
 
@@ -526,6 +826,24 @@ def _wall_from_intervals(nodes: list) -> float:
 
 
 def _collapse(children: list) -> list:
+    """Compress a sibling list for display, recursing into each survivor.
+
+    Two reductions make a repetitive tree readable:
+
+    1. Cyclic runs like ``[A,B,C,A,B,C,…]`` are folded into a single ``[xN]``
+       group (:func:`_collapse_repeating_groups`), taken when detected.
+    2. Otherwise same-named siblings — even non-adjacent ones — are merged into
+       one ``"name ×N"`` aggregate whose wall is the overlap-aware interval union
+       (:func:`_wall_from_intervals`) and whose cumulative/count are summed. The
+       first occurrence fixes display order; single, unique nodes pass through
+       with their own children collapsed recursively.
+
+    Args:
+        children: The child nodes of one parent, in call order.
+
+    Returns:
+        A new, possibly shorter list of display nodes (input is not mutated).
+    """
     if not children:
         return []
 
@@ -720,6 +1038,26 @@ def _format_hot_spots(root: dict, total: float) -> str:
 
 
 def print_tree(root: dict) -> None:
+    """Render a finished trace and emit it to every configured sink.
+
+    This is the reporting entry point, called once when a traced call finishes.
+    It builds two things from the raw ``root`` tree and prints them together:
+
+    * a flat **hot spots** table (top :data:`HOT_SPOTS` functions by self time,
+      via :func:`_format_hot_spots`);
+    * the **call tree**, after :func:`_collapse`, with per-node
+      wall/cumulative/self times and ``%tot`` / ``%parent`` columns. Nodes below
+      :data:`MIN_PCT` of the root total are hidden into a ``"… N hidden"`` line,
+      and obviously-parallel parents are flagged ``[parallel]``. Column widths are
+      computed so the table aligns.
+
+    Side effects: writes the report to stdout; if :data:`OUTPUT_FILE` is set,
+    dumps the raw ``root`` tree there as JSON; then hands ``root`` to
+    :func:`_send_trace` for optional shipping to :data:`ENDPOINT_URL`.
+
+    Args:
+        root: The root call-tree node, with ``time`` already filled in.
+    """
     lines: list[tuple[str, str, str, str, str]] = []
     total = root["time"] or 1
     threshold = total * MIN_PCT

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "perf"
+version = "0.1.0"
+description = "A zero-dependency call-tree profiler / tracer for Python."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "thang", email = "adc05102002@gmail.com" }]
+keywords = ["profiler", "tracing", "performance", "call-tree", "async"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: System :: Benchmark",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/adc0510/performance"
+Source = "https://github.com/adc0510/performance"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/perf"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/perf", "README.md", "pyproject.toml"]
