@@ -44,6 +44,7 @@ __all__ = [
     "SCAN_VENV",
     "CAPTURE_IO",
     "MAX_DEPTH",
+    "MAX_SIZE_CAPTURE",
 ]
 
 # ── project vs library path detection ─────────────────────────────────────────
@@ -184,6 +185,12 @@ CAPTURE_IO = True
 # Guards against runaway/cyclic objects: max recursion depth when converting a
 # value to JSON. Beyond it, the sub-value falls back to a repr string.
 MAX_DEPTH = 20
+# Only capture a value whose JSON-serialized size (in UTF-8 bytes) is below this
+# limit. A converted arg / kwarg / result at or above it is dropped and replaced
+# with a compact "<TypeName too large: N>" marker, so the node still records that
+# something flowed through without bloating perf.json. None (the default)
+# disables the limit — capture values of any size.
+MAX_SIZE_CAPTURE: int | None = None
 
 
 # Returned by _jsonable for values with no useful serialization (objects whose
@@ -229,6 +236,38 @@ def _jsonable(value: Any, depth: int = 0) -> Any:
     return _SKIP if _DEFAULT_REPR.match(r) else r
 
 
+def _size_of(jv: Any) -> int:
+    """Approximate the serialized size, in UTF-8 bytes, of a JSON-able value.
+
+    Uses the byte length of its compact JSON (UTF-8) encoding as a cheap,
+    structure-aware proxy for how much room the value takes in perf.json. Falls
+    back to the byte length of its repr if it somehow can't be JSON-encoded.
+    """
+    import json
+
+    try:
+        return len(json.dumps(jv, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        return len(_safe_repr(jv).encode("utf-8"))
+
+
+def _capture_value(value: Any) -> Any:
+    """Convert `value` for capture, dropping it if too large.
+
+    Returns the JSON-able form from :func:`_jsonable`, unless it is the ``_SKIP``
+    sentinel (no useful serialization) or — when :data:`MAX_SIZE_CAPTURE` is set —
+    its serialized size is at or above the limit. In those cases the ``_SKIP``
+    sentinel is returned so the caller can drop or mark the slot; an oversize
+    value is signalled distinctly via a paired size so callers may annotate it.
+    """
+    jv = _jsonable(value)
+    if jv is _SKIP:
+        return _SKIP
+    if MAX_SIZE_CAPTURE is not None and _size_of(jv) >= MAX_SIZE_CAPTURE:
+        return _SKIP
+    return jv
+
+
 def _safe_repr(value: Any) -> str:
     try:
         return repr(value)
@@ -252,9 +291,9 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
     """
     if not CAPTURE_IO:
         return
-    # positional args keep their slot; skipped objects become a compact marker
-    node["args"] = [f"<{type(a).__name__}>" if (jv := _jsonable(a)) is _SKIP else jv for a in args]
-    node["kwargs"] = {k: jv for k, v in kwargs.items() if (jv := _jsonable(v)) is not _SKIP}
+    # positional args keep their slot; skipped/oversize objects become a compact marker
+    node["args"] = [f"<{type(a).__name__}>" if (jv := _capture_value(a)) is _SKIP else jv for a in args]
+    node["kwargs"] = {k: jv for k, v in kwargs.items() if (jv := _capture_value(v)) is not _SKIP}
 
 
 def _record_output(node: dict, result: Any) -> None:
@@ -269,7 +308,7 @@ def _record_output(node: dict, result: Any) -> None:
         result: The value returned by the traced function.
     """
     if CAPTURE_IO:
-        jv = _jsonable(result)
+        jv = _capture_value(result)
         node["result"] = f"<{type(result).__name__}>" if jv is _SKIP else jv
 
 
@@ -651,6 +690,7 @@ _CONFIG_KEYS = frozenset(
         "SCAN_VENV",
         "CAPTURE_IO",
         "MAX_DEPTH",
+        "MAX_SIZE_CAPTURE",
     }
 )
 
