@@ -109,9 +109,14 @@ def make_node(name: str) -> dict:
             ``module.function`` qualname.
 
     Returns:
-        A dict with keys ``name``, ``time`` (``None``), ``start``, ``children``.
+        A dict with keys ``name``, ``time`` (``None``), ``start``, ``end``
+        (``None``), ``children``. ``end`` is pre-seeded here (rather than only
+        added by :func:`_finish_node`) purely to fix its key order in the
+        written JSON: dicts preserve insertion order, so seeding it right after
+        ``start`` keeps them adjacent instead of ``end`` landing after
+        ``children`` once :func:`_finish_node` later assigns it.
     """
-    return {"name": name, "time": None, "start": perf_counter(), "children": []}
+    return {"name": name, "time": None, "start": perf_counter(), "end": None, "children": []}
 
 
 def _finish_node(node: dict) -> None:
