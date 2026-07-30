@@ -114,6 +114,31 @@ def make_node(name: str) -> dict:
     return {"name": name, "time": None, "start": perf_counter(), "children": []}
 
 
+def _finish_node(node: dict) -> None:
+    """Stamp a node's wall ``time`` and ``end`` now that its call has returned.
+
+    ``end`` is ``start + time`` — the wall-clock moment the call finished —
+    stored alongside ``start`` so a written trace shows both endpoints of the
+    call instead of just start + duration.
+    """
+    node["time"] = perf_counter() - node["start"]
+    node["end"] = node["start"] + node["time"]
+
+
+def _restart(node: dict) -> None:
+    """Re-stamp a node's ``start`` right before the traced call actually begins.
+
+    :func:`make_node` stamps ``start`` at node creation, but the ``trace()``
+    entry-point wrapper does real setup after that — installing the
+    ``sys.setprofile``/``threading.setprofile`` hooks — before the wrapped
+    function runs. Left alone, that setup cost would be counted as part of the
+    root node's time. Calling this right before invoking the wrapped function
+    moves ``start`` to the true beginning of the call, so setup overhead is
+    excluded the same way capture overhead is excluded by :func:`_finish_node`.
+    """
+    node["start"] = perf_counter()
+
+
 # ── output tuning ──────────────────────────────────────────────────────────
 # Tree nodes whose wall time is below this fraction of the root total are
 # hidden, collapsed into one "… N hidden" line per parent. Default 0.0 shows
@@ -552,13 +577,15 @@ def _patch_all_project_classes() -> None:
 def _sync_wrap(func: Any, name: str) -> Any:
     """Wrap a synchronous callable so each call becomes a timed tree node.
 
-    The returned wrapper: creates a node named ``name``, records inputs, links
-    itself under the current node (:data:`_current_node`) so the tree mirrors the
-    real call stack, and makes itself current for the duration via a
-    ``ContextVar`` token. On the way out it records the result (or the raised
-    exception, which is re-raised) and always stamps the node's wall ``time`` and
-    restores the previous current-node — so the tree stays consistent even when a
-    call raises.
+    The returned wrapper: creates a node named ``name``, links it under the
+    current node (:data:`_current_node`) so the tree mirrors the real call
+    stack, and makes it current for the duration via a ``ContextVar`` token —
+    all before invoking `func`, so nothing but that bookkeeping sits between the
+    node's start stamp and the real call. As soon as `func` returns or raises,
+    :func:`_finish_node` stamps ``time``/``end`` immediately — before input/output
+    capture, which can be slow (JSON-ifying large args/results) and must not be
+    counted as part of the function's own time. Exceptions are recorded then
+    re-raised, and the previous current-node is always restored.
 
     Args:
         func: The original synchronous function/method to time.
@@ -572,19 +599,21 @@ def _sync_wrap(func: Any, name: str) -> Any:
     def wrapper(*args, **kwargs) -> Any:
         parent = _current_node.get()
         node = make_node(name)
-        _record_inputs(node, args, kwargs)
         if parent is not None:
             parent["children"].append(node)
         token = _current_node.set(node)
         try:
             result = func(*args, **kwargs)
+            _finish_node(node)
+            _record_inputs(node, args, kwargs)
             _record_output(node, result)
             return result
         except BaseException as exc:
+            _finish_node(node)
+            _record_inputs(node, args, kwargs)
             _record_exception(node, exc)
             raise
         finally:
-            node["time"] = perf_counter() - node["start"]
             _current_node.reset(token)
 
     return wrapper
@@ -595,10 +624,11 @@ def _async_wrap(func: Any, name: str) -> Any:
 
     Async analogue of :func:`_sync_wrap`: same node creation, input/output
     capture, parent linking, and current-node bookkeeping, but it ``await``\\ s
-    the inner coroutine. Because linkage flows through a ``ContextVar``, sibling
-    coroutines running concurrently each attach to their own logical parent, and
-    their nodes' start/time intervals let the reporter compute overlap-aware wall
-    time.
+    the inner coroutine. Timing is stamped immediately around the ``await`` —
+    input/output capture happens after — for the same reason as the sync path.
+    Because linkage flows through a ``ContextVar``, sibling coroutines running
+    concurrently each attach to their own logical parent, and their nodes'
+    start/time intervals let the reporter compute overlap-aware wall time.
 
     Args:
         func: The original coroutine function to time.
@@ -612,19 +642,21 @@ def _async_wrap(func: Any, name: str) -> Any:
     async def wrapper(*args, **kwargs) -> Any:
         parent = _current_node.get()
         node = make_node(name)
-        _record_inputs(node, args, kwargs)
         if parent is not None:
             parent["children"].append(node)
         token = _current_node.set(node)
         try:
             result = await func(*args, **kwargs)
+            _finish_node(node)
+            _record_inputs(node, args, kwargs)
             _record_output(node, result)
             return result
         except BaseException as exc:
+            _finish_node(node)
+            _record_inputs(node, args, kwargs)
             _record_exception(node, exc)
             raise
         finally:
-            node["time"] = perf_counter() - node["start"]
             _current_node.reset(token)
 
     return wrapper
@@ -766,23 +798,25 @@ def trace(func: Any = None, **overrides: Any) -> Any:
             with _apply_overrides(overrides):
                 _patch_all_project_classes()  # ← NEW
                 root = make_node(func.__qualname__)
-                _record_inputs(root, args, kwargs)
                 _current_node.set(root)
-                # _patched_classes.clear()  ← REMOVED
                 profiler = _make_profiler()
                 threading.setprofile(profiler)
                 sys.setprofile(profiler)
+                _restart(root)  # setup above shouldn't count as the call's own time
                 try:
                     if TIMEOUT is not None:
                         result = await asyncio.wait_for(func(*args, **kwargs), TIMEOUT)
                     else:
                         result = await func(*args, **kwargs)
+                    _finish_node(root)
+                    _record_inputs(root, args, kwargs)
                     _record_output(root, result)
                 except BaseException as exc:
+                    _finish_node(root)
+                    _record_inputs(root, args, kwargs)
                     _record_exception(root, exc)
                     raise
                 finally:
-                    root["time"] = perf_counter() - root["start"]
                     sys.setprofile(None)
                     threading.setprofile(None)
                     print_tree(root)
@@ -794,21 +828,23 @@ def trace(func: Any = None, **overrides: Any) -> Any:
             with _apply_overrides(overrides):
                 _patch_all_project_classes()  # ← NEW
                 root = make_node(func.__qualname__)
-                _record_inputs(root, args, kwargs)
                 _current_node.set(root)
-                # _patched_classes.clear()  ← REMOVED
                 profiler = _make_profiler()
                 threading.setprofile(profiler)
                 sys.setprofile(profiler)
                 try:
                     with _sync_timeout(TIMEOUT, func.__qualname__):
+                        _restart(root)  # setup above shouldn't count as the call's own time
                         result = func(*args, **kwargs)
+                        _finish_node(root)
+                    _record_inputs(root, args, kwargs)
                     _record_output(root, result)
                 except BaseException as exc:
+                    _finish_node(root)
+                    _record_inputs(root, args, kwargs)
                     _record_exception(root, exc)
                     raise
                 finally:
-                    root["time"] = perf_counter() - root["start"]
                     sys.setprofile(None)
                     threading.setprofile(None)
                     print_tree(root)
