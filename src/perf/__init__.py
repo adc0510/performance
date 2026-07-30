@@ -12,8 +12,9 @@ Basic usage::
     def main() -> None:
         ...
 
-Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_FILE``,
-``perf.ENDPOINT_URL``, ``perf.TIMEOUT``, ``perf.SCAN_VENV`` — see each below.
+Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_DIR``,
+``perf.OUTPUT_FILE``, ``perf.ENDPOINT_URL``, ``perf.TIMEOUT``,
+``perf.SCAN_VENV`` — see each below.
 """
 
 import asyncio
@@ -32,19 +33,21 @@ from typing import Any
 
 __version__ = "0.1.0"
 __all__ = [
-    "trace",
-    "print_tree",
-    "fmt",
-    "MIN_PCT",
-    "HOT_SPOTS",
-    "OUTPUT_FILE",
-    "ENDPOINT_URL",
-    "TAGS",
-    "TIMEOUT",
-    "SCAN_VENV",
     "CAPTURE_IO",
+    "ENDPOINT_URL",
+    "HOT_SPOTS",
+    "LOG_FUNCTIONS",
     "MAX_DEPTH",
     "MAX_SIZE_CAPTURE",
+    "MIN_PCT",
+    "OUTPUT_DIR",
+    "OUTPUT_FILE",
+    "SCAN_VENV",
+    "TAGS",
+    "TIMEOUT",
+    "fmt",
+    "print_tree",
+    "trace",
 ]
 
 # ── project vs library path detection ─────────────────────────────────────────
@@ -118,9 +121,22 @@ def make_node(name: str) -> dict:
 MIN_PCT = 0.0
 # Number of functions to list in the flat "hot spots" summary. 0 disables it.
 HOT_SPOTS = 15
+# When set, each traced call's raw tree is written as JSON into this directory,
+# one file per call — so repeated/concurrent traces don't clobber each other.
+# The filename is OUTPUT_FILE if set (user-chosen, ".json" appended if missing),
+# otherwise a fresh uuid4 per call. None (the default) disables directory output.
+OUTPUT_DIR: str | None = None
 # When set, the raw trace tree is written to this path as JSON (e.g. "perf.json").
-# None (the default) disables it — set it to opt in.
+# If OUTPUT_DIR is also set, this is treated as just a filename inside it rather
+# than a full path. None (the default) disables it — set it to opt in.
 OUTPUT_FILE: str | None = None
+# Whitelist of function names (as they appear as node["name"], e.g. "Class.method"
+# or "module.function") to keep when writing the tree out (OUTPUT_DIR/OUTPUT_FILE).
+# A matched node's ancestors are kept too, so the path down to it survives, but
+# unmatched siblings/subtrees are pruned. Empty (the default) disables filtering —
+# the full tree is written, as before. Does not affect what's printed to stdout or
+# sent to ENDPOINT_URL.
+LOG_FUNCTIONS: list = []
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
 # disables it — set it to opt in (e.g. "http://localhost:7999/api/traces").
@@ -683,7 +699,9 @@ _CONFIG_KEYS = frozenset(
     {
         "MIN_PCT",
         "HOT_SPOTS",
+        "OUTPUT_DIR",
         "OUTPUT_FILE",
+        "LOG_FUNCTIONS",
         "ENDPOINT_URL",
         "TAGS",
         "TIMEOUT",
@@ -1074,6 +1092,63 @@ def _format_hot_spots(root: dict, total: float) -> str:
     return out
 
 
+# ── output file writing ──────────────────────────────────────────────────────
+
+
+def _filter_by_names(children: list, names: set) -> list:
+    """Prune a sibling list to nodes matching `names`, keeping ancestors of matches.
+
+    Recurses first so a node survives if either its own name matches or any of
+    its descendants do (in which case its subtree is itself filtered down to
+    just those matches) — pruning unrelated branches while preserving the path
+    to every match.
+    """
+    kept = []
+    for child in children:
+        filtered_children = _filter_by_names(child["children"], names)
+        if child["name"] in names or filtered_children:
+            kept.append({**child, "children": filtered_children})
+    return kept
+
+
+def _write_output(root: dict) -> None:
+    """Dump the raw trace tree as JSON, per :data:`OUTPUT_DIR` / :data:`OUTPUT_FILE`.
+
+    * Neither set: no-op.
+    * ``OUTPUT_FILE`` only: written to that path as-is (legacy behaviour).
+    * ``OUTPUT_DIR`` set: written inside that directory (created if missing),
+      named ``OUTPUT_FILE`` (".json" appended if it lacks a suffix) when given,
+      otherwise a fresh ``uuid4().json`` per call — so concurrent/repeated
+      traces each land in their own file instead of clobbering one another.
+
+    If :data:`LOG_FUNCTIONS` is non-empty, the tree is pruned to only the nodes
+    named in it (plus their ancestors) before being written — see
+    :func:`_filter_by_names`. The root itself is always kept as the container.
+    """
+    if not OUTPUT_DIR and not OUTPUT_FILE:
+        return
+
+    import json
+
+    tree = {**root, "children": _filter_by_names(root["children"], set(LOG_FUNCTIONS))} if LOG_FUNCTIONS else root
+
+    if OUTPUT_DIR:
+        directory = Path(OUTPUT_DIR)
+        directory.mkdir(parents=True, exist_ok=True)
+        if OUTPUT_FILE:
+            filename = OUTPUT_FILE if OUTPUT_FILE.endswith(".json") else f"{OUTPUT_FILE}.json"
+        else:
+            import uuid
+
+            filename = f"{uuid.uuid4()}.json"
+        path = directory / filename
+    else:
+        path = Path(OUTPUT_FILE)
+
+    with open(path, "w") as f:
+        f.write(json.dumps(tree, indent=2, ensure_ascii=False, default=str))
+
+
 # ── printer ───────────────────────────────────────────────────────────────────
 
 
@@ -1171,11 +1246,7 @@ def print_tree(root: dict) -> None:
         result += f"{name:<{name_w}}{t:>{time_w}}{self_t:>{self_w}}   {pct_tot} {pct_par}\n"
 
     print(result)
-    if OUTPUT_FILE:
-        import json
-
-        with open(OUTPUT_FILE, "w") as f:
-            f.write(json.dumps(root, indent=2, ensure_ascii=False, default=str))
+    _write_output(root)
     _send_trace(root)
 
 
