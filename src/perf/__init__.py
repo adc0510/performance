@@ -26,6 +26,7 @@ import sysconfig
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
@@ -93,6 +94,17 @@ def fmt(seconds: float) -> str:
 _current_node: ContextVar[dict | None] = ContextVar("_current_node", default=None)
 
 
+def _now_iso() -> str:
+    """Current local wall-clock time as an ISO-8601 string with offset and microseconds.
+
+    ``perf_counter()`` (used for ``start``/``end``/``time``) is monotonic but
+    has no meaningful absolute epoch, so it can't tell a reader *when* a call
+    happened — only how long it took. This gives ``start_timestamp``/
+    ``end_timestamp`` an absolute, human-readable wall-clock value instead.
+    """
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
 def make_node(name: str) -> dict:
     """Create a fresh call-tree node and stamp its start time.
 
@@ -100,48 +112,62 @@ def make_node(name: str) -> dict:
     unset (``None``) — the wrapper fills it in with the measured wall duration
     when the call returns — and ``start`` set to the current ``perf_counter()``
     so overlap-aware wall math (:func:`_wall_from_intervals`) can later place it
-    on the timeline. Input/output values (``args``, ``kwargs``, ``result``,
-    ``exception``) and aggregate fields (``cumulative``, ``count``) are attached
-    lazily by other helpers and are absent here.
+    on the timeline. ``start_timestamp`` records the same instant as an
+    absolute, human-readable wall-clock time. Input/output values (``args``,
+    ``kwargs``, ``result``, ``exception``) and aggregate fields (``cumulative``,
+    ``count``) are attached lazily by other helpers and are absent here.
 
     Args:
         name: Display label for the node, e.g. ``"Class.method"`` or a
             ``module.function`` qualname.
 
     Returns:
-        A dict with keys ``name``, ``time`` (``None``), ``start``, ``end``
-        (``None``), ``children``. ``end`` is pre-seeded here (rather than only
-        added by :func:`_finish_node`) purely to fix its key order in the
-        written JSON: dicts preserve insertion order, so seeding it right after
-        ``start`` keeps them adjacent instead of ``end`` landing after
-        ``children`` once :func:`_finish_node` later assigns it.
+        A dict with keys ``name``, ``time`` (``None``), ``start``,
+        ``start_timestamp``, ``end`` (``None``), ``end_timestamp`` (``None``),
+        ``children``. ``end``/``end_timestamp`` are pre-seeded here (rather than
+        only added by :func:`_finish_node`) purely to fix their key order in the
+        written JSON: dicts preserve insertion order, so seeding them right
+        after ``start``/``start_timestamp`` keeps the pairs adjacent instead of
+        landing after ``children`` once :func:`_finish_node` later assigns them.
     """
-    return {"name": name, "time": None, "start": perf_counter(), "end": None, "children": []}
+    return {
+        "name": name,
+        "time": None,
+        "start": perf_counter(),
+        "start_timestamp": _now_iso(),
+        "end": None,
+        "end_timestamp": None,
+        "children": [],
+    }
 
 
 def _finish_node(node: dict) -> None:
-    """Stamp a node's wall ``time`` and ``end`` now that its call has returned.
+    """Stamp a node's wall ``time``, ``end``, and ``end_timestamp`` now that its call has returned.
 
-    ``end`` is ``start + time`` — the wall-clock moment the call finished —
-    stored alongside ``start`` so a written trace shows both endpoints of the
-    call instead of just start + duration.
+    ``end`` is ``start + time`` — the wall-clock (monotonic) moment the call
+    finished — stored alongside ``start`` so a written trace shows both
+    endpoints of the call instead of just start + duration. ``end_timestamp``
+    is the same instant as an absolute, human-readable wall-clock time.
     """
     node["time"] = perf_counter() - node["start"]
     node["end"] = node["start"] + node["time"]
+    node["end_timestamp"] = _now_iso()
 
 
 def _restart(node: dict) -> None:
-    """Re-stamp a node's ``start`` right before the traced call actually begins.
+    """Re-stamp a node's ``start``/``start_timestamp`` right before the traced call actually begins.
 
     :func:`make_node` stamps ``start`` at node creation, but the ``trace()``
     entry-point wrapper does real setup after that — installing the
     ``sys.setprofile``/``threading.setprofile`` hooks — before the wrapped
     function runs. Left alone, that setup cost would be counted as part of the
     root node's time. Calling this right before invoking the wrapped function
-    moves ``start`` to the true beginning of the call, so setup overhead is
-    excluded the same way capture overhead is excluded by :func:`_finish_node`.
+    moves ``start``/``start_timestamp`` to the true beginning of the call, so
+    setup overhead is excluded the same way capture overhead is excluded by
+    :func:`_finish_node`.
     """
     node["start"] = perf_counter()
+    node["start_timestamp"] = _now_iso()
 
 
 # ── output tuning ──────────────────────────────────────────────────────────
