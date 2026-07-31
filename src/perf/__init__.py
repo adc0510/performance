@@ -18,6 +18,7 @@ Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_DIR``,
 """
 
 import asyncio
+import atexit
 import inspect
 import re
 import signal
@@ -1320,11 +1321,36 @@ def print_tree(root: dict) -> None:
 # ── remote trace shipping ─────────────────────────────────────────────────────
 
 
+_pending_sends: set = set()
+_pending_sends_lock = threading.Lock()
+
+
+@atexit.register
+def _flush_pending_sends() -> None:
+    """Give in-flight trace POSTs a bounded chance to finish before the process dies.
+
+    ``_send_trace`` ships each trace from a daemon thread so a slow/unreachable
+    collector never blocks the traced call. But daemon threads are killed
+    outright — mid-write, no cleanup — the instant the interpreter starts
+    shutting down. If ``trace()``'s wrapper returns right before the program
+    exits (the common case: it's decorating ``main()``), that kill can land
+    mid-POST, and the collector receives a truncated (invalid) JSON body
+    instead of no body at all. Joining here, before shutdown proceeds, lets
+    each pending send either finish or (worst case) time out cleanly.
+    """
+    with _pending_sends_lock:
+        threads = list(_pending_sends)
+    for t in threads:
+        t.join(timeout=30)
+
+
 def _send_trace(root: dict) -> None:
     """POST the raw trace tree to ENDPOINT_URL, wrapped as {status, tags, trace}.
 
     Runs in a daemon thread so a slow/unreachable collector never blocks (or
     crashes) the traced call. A failed send is logged to stderr and swallowed.
+    The thread is tracked in :data:`_pending_sends` so :func:`_flush_pending_sends`
+    can wait for it at process exit instead of it being killed mid-write.
     """
     if not ENDPOINT_URL:
         return
@@ -1350,8 +1376,14 @@ def _send_trace(root: dict) -> None:
                 resp.read()
         except Exception as e:  # never let telemetry break the traced call
             print(f"[perf] failed to POST trace to {ENDPOINT_URL}: {e}", file=sys.stderr)
+        finally:
+            with _pending_sends_lock:
+                _pending_sends.discard(threading.current_thread())
 
-    threading.Thread(target=_post, name="perf-send-trace", daemon=True).start()
+    t = threading.Thread(target=_post, name="perf-send-trace", daemon=True)
+    with _pending_sends_lock:
+        _pending_sends.add(t)
+    t.start()
 
 
 # @trace
