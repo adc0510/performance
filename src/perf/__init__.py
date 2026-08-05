@@ -25,6 +25,7 @@ import signal
 import sys
 import sysconfig
 import threading
+import traceback
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -33,7 +34,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "CAPTURE_IO",
     "ENDPOINT_URL",
@@ -385,13 +386,47 @@ def _record_output(node: dict, result: Any) -> None:
         node["result"] = f"<{type(result).__name__}>" if jv is _SKIP else jv
 
 
+def _exception_origin(exc: BaseException) -> dict | None:
+    """Locate the deepest frame in `exc`'s traceback — where it was actually raised.
+
+    A node's ``exception`` repr says *what* went wrong, but every ancestor node
+    up to the root records the same repr as the exception re-raises through
+    each wrapper — none of them says *where*. This walks ``exc.__traceback__``
+    to its last frame (the innermost one, closest to the ``raise``/failing
+    statement) and returns its file/line/function/source-text, so a node deep
+    in the tree (or the root) can point straight at the origin instead of just
+    naming the function that (eventually) surfaced it.
+
+    Returns:
+        A dict with ``file``, ``line``, ``function``, ``text`` (the source line,
+        if available), or None if the exception carries no traceback.
+    """
+    tb = exc.__traceback__
+    if tb is None:
+        return None
+    frames = traceback.extract_tb(tb)
+    if not frames:
+        return None
+    origin = frames[-1]
+    return {
+        "file": origin.filename,
+        "line": origin.lineno,
+        "function": origin.name,
+        "text": origin.line,
+    }
+
+
 def _record_exception(node: dict, exc: BaseException) -> None:
     """Record, under ``node["exception"]``, the repr of an exception a call raised.
 
     No-op unless :data:`CAPTURE_IO` is on. Uses :func:`_safe_repr` so an
     exception whose own ``__repr__`` misbehaves can't break the trace. The
     presence of this key is also what flips a shipped trace's status to
-    ``"error"`` in :func:`_send_trace`.
+    ``"error"`` in :func:`_send_trace`. Also attaches ``node["exception_origin"]``
+    (see :func:`_exception_origin`) pointing at the actual file/line the
+    exception was raised from — not just which traced function it propagated
+    through — since the raising statement is often several calls below whichever
+    node the reader is looking at.
 
     Args:
         node: The call-tree node to annotate in place.
@@ -399,6 +434,9 @@ def _record_exception(node: dict, exc: BaseException) -> None:
     """
     if CAPTURE_IO:
         node["exception"] = _safe_repr(exc)
+        origin = _exception_origin(exc)
+        if origin is not None:
+            node["exception_origin"] = origin
 
 
 def _is_project_module(module: Any) -> bool:
