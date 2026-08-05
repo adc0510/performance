@@ -1347,18 +1347,30 @@ def _flush_pending_sends() -> None:
 def _send_trace(root: dict) -> None:
     """POST the raw trace tree to ENDPOINT_URL, wrapped as {status, tags, trace}.
 
-    Runs in a daemon thread so a slow/unreachable collector never blocks (or
-    crashes) the traced call. A failed send is logged to stderr and swallowed.
-    The thread is tracked in :data:`_pending_sends` so :func:`_flush_pending_sends`
-    can wait for it at process exit instead of it being killed mid-write.
+    Successful traces are sent from a daemon thread so a slow/unreachable
+    collector never blocks (or crashes) the traced call; the thread is tracked
+    in :data:`_pending_sends` so :func:`_flush_pending_sends` can wait for it at
+    process exit instead of it being killed mid-write.
+
+    Error traces are sent synchronously instead. A process that just errored is
+    the one most likely to die right after — a crash handler calling
+    ``os._exit``, a supervisor SIGKILL, a worker recycle, a segfault in a C
+    extension — and any of those kill daemon threads outright, skipping
+    ``atexit`` entirely. Blocking here, before control returns to whatever
+    might terminate the process next, is what actually gets the error to the
+    collector.
+
+    A failed send is logged to stderr and swallowed either way — telemetry
+    must never break the traced call.
     """
     if not ENDPOINT_URL:
         return
     import json
     import urllib.request
 
+    is_error = bool(root.get("exception"))
     payload = {
-        "status": "error" if root.get("exception") else "ok",
+        "status": "error" if is_error else "ok",
         "tags": TAGS,
         "trace": root,
     }
@@ -1376,11 +1388,19 @@ def _send_trace(root: dict) -> None:
                 resp.read()
         except Exception as e:  # never let telemetry break the traced call
             print(f"[perf] failed to POST trace to {ENDPOINT_URL}: {e}", file=sys.stderr)
+
+    if is_error:
+        _post()
+        return
+
+    def _post_and_untrack() -> None:
+        try:
+            _post()
         finally:
             with _pending_sends_lock:
                 _pending_sends.discard(threading.current_thread())
 
-    t = threading.Thread(target=_post, name="perf-send-trace", daemon=True)
+    t = threading.Thread(target=_post_and_untrack, name="perf-send-trace", daemon=True)
     with _pending_sends_lock:
         _pending_sends.add(t)
     t.start()
