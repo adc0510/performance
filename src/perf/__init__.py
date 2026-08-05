@@ -34,7 +34,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     "CAPTURE_IO",
     "ENDPOINT_URL",
@@ -395,7 +395,8 @@ def _exception_origin(exc: BaseException) -> dict | None:
     to its last frame (the innermost one, closest to the ``raise``/failing
     statement) and returns its file/line/function/source-text, so a node deep
     in the tree (or the root) can point straight at the origin instead of just
-    naming the function that (eventually) surfaced it.
+    naming the function that (eventually) surfaced it. Cheap single-frame
+    summary; see :func:`_exception_debug` for the full picture.
 
     Returns:
         A dict with ``file``, ``line``, ``function``, ``text`` (the source line,
@@ -416,17 +417,60 @@ def _exception_origin(exc: BaseException) -> dict | None:
     }
 
 
+def _exception_debug(exc: BaseException, _seen: frozenset = frozenset()) -> dict:
+    """Full, untruncated debug picture of an exception: every frame plus the chained cause.
+
+    :func:`_exception_origin` gives the one line a reader wants first; this is for when that's
+    not enough and the whole story is needed. Unlike the rest of capture (:data:`MAX_DEPTH`,
+    :data:`MAX_SIZE_CAPTURE`), nothing here is truncated or size-limited — an error is exactly
+    the moment a debugger needs everything, not a trimmed sample.
+
+    Includes:
+
+    * ``frames`` — every frame from the outermost call to the innermost raise, each with
+      file/line/function/source-text (the same info :func:`_exception_origin` gives for just
+      the last one), so the full path to the failure is visible without cross-referencing logs.
+    * ``formatted`` — the exact text ``traceback.print_exception`` would print, for pasting
+      straight into an issue or terminal.
+    * ``caused_by`` — if this exception was raised via ``raise ... from cause`` (``__cause__``)
+      or surfaced while handling another (``__context__``, unless explicitly suppressed via
+      ``from None``), the same breakdown recursed into that exception too, so a chain is
+      fully visible instead of stopping at the outermost wrapper.
+
+    Args:
+        exc: The exception to describe.
+        _seen: Internal — ``id()``s of exceptions already unwrapped in this chain, so a
+            (pathological) exception cycle can't recurse forever.
+
+    Returns:
+        A dict with ``frames``, ``formatted``, and optionally ``caused_by``.
+    """
+    frames = [
+        {"file": f.filename, "line": f.lineno, "function": f.name, "text": f.line}
+        for f in traceback.extract_tb(exc.__traceback__)
+    ]
+    debug = {
+        "frames": frames,
+        "formatted": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    }
+    cause = exc.__cause__ if exc.__cause__ is not None else (None if exc.__suppress_context__ else exc.__context__)
+    if cause is not None and id(cause) not in _seen:
+        debug["caused_by"] = {"exception": _safe_repr(cause), **_exception_debug(cause, _seen | {id(exc)})}
+    return debug
+
+
 def _record_exception(node: dict, exc: BaseException) -> None:
     """Record, under ``node["exception"]``, the repr of an exception a call raised.
 
     No-op unless :data:`CAPTURE_IO` is on. Uses :func:`_safe_repr` so an
     exception whose own ``__repr__`` misbehaves can't break the trace. The
     presence of this key is also what flips a shipped trace's status to
-    ``"error"`` in :func:`_send_trace`. Also attaches ``node["exception_origin"]``
-    (see :func:`_exception_origin`) pointing at the actual file/line the
-    exception was raised from — not just which traced function it propagated
-    through — since the raising statement is often several calls below whichever
-    node the reader is looking at.
+    ``"error"`` in :func:`_send_trace`. Also attaches:
+
+    * ``node["exception_origin"]`` (see :func:`_exception_origin`) — the single deepest
+      frame, for an at-a-glance file/line;
+    * ``node["exception_debug"]`` (see :func:`_exception_debug`) — the full, untruncated
+      frame-by-frame traceback (plus any chained cause), for actually debugging the failure.
 
     Args:
         node: The call-tree node to annotate in place.
@@ -437,6 +481,7 @@ def _record_exception(node: dict, exc: BaseException) -> None:
         origin = _exception_origin(exc)
         if origin is not None:
             node["exception_origin"] = origin
+        node["exception_debug"] = _exception_debug(exc)
 
 
 def _is_project_module(module: Any) -> bool:
