@@ -14,11 +14,12 @@ Basic usage::
 
 Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_DIR``,
 ``perf.OUTPUT_FILE``, ``perf.ENDPOINT_URL``, ``perf.TIMEOUT``,
-``perf.SCAN_VENV`` — see each below.
+``perf.SCAN_VENV``, ``perf.SUPPRESS_ERRORS`` — see each below.
 """
 
 import asyncio
 import atexit
+import dataclasses
 import inspect
 import re
 import signal
@@ -26,6 +27,8 @@ import sys
 import sysconfig
 import threading
 import traceback
+import types
+import typing
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -34,9 +37,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 __all__ = [
     "CAPTURE_IO",
+    "DEFAULT_RETURN",
     "ENDPOINT_URL",
     "HOT_SPOTS",
     "LOG_FUNCTIONS",
@@ -46,6 +50,7 @@ __all__ = [
     "OUTPUT_DIR",
     "OUTPUT_FILE",
     "SCAN_VENV",
+    "SUPPRESS_ERRORS",
     "TAGS",
     "TIMEOUT",
     "fmt",
@@ -208,6 +213,22 @@ TAGS: list = ["dev"]
 # timeout. None disables the watchdog.
 TIMEOUT: float | None = None
 
+# When True, an exception raised by the top-level traced function itself is
+# swallowed (after being recorded/sent like any other exception) instead of
+# propagating to the caller. In its place, a default value derived from the
+# function's return annotation is returned (e.g. "-> list" yields [], "-> int"
+# yields 0). Does not affect exceptions from inner auto-instrumented calls —
+# those still propagate up to the root as before; only the root wrapper built
+# by trace() applies this. Default False preserves the old raise-through
+# behaviour.
+SUPPRESS_ERRORS = False
+# Overrides the auto-detected default value used by SUPPRESS_ERRORS. Leave as
+# _UNSET (the default) to derive the default from the return annotation. If
+# set to a callable, it's invoked with no args per suppressed call to produce
+# a fresh value (e.g. DEFAULT_RETURN=list); otherwise the value is used as-is.
+_UNSET = object()
+DEFAULT_RETURN: Any = _UNSET
+
 
 # ── auto-patch instances created during a trace session ───────────────────────
 
@@ -347,6 +368,138 @@ def _safe_repr(value: Any) -> str:
         return repr(value)
     except Exception as e:  # a __repr__ that raises must not kill the trace
         return f"<unreprable {type(value).__name__}: {e}>"
+
+
+# ── SUPPRESS_ERRORS: type-aware default return values ─────────────────────────
+
+_BUILTIN_EMPTY: dict = {
+    list: list,
+    dict: dict,
+    tuple: tuple,
+    set: set,
+    frozenset: frozenset,
+    str: str,
+    bytes: bytes,
+    int: int,
+    float: float,
+    bool: lambda: False,
+}
+
+
+def _dataclass_default(annotation: Any) -> Any:
+    """Best-effort-construct a dataclass instance, deriving required fields recursively."""
+    kwargs = {}
+    for field in dataclasses.fields(annotation):
+        if field.default is not dataclasses.MISSING:
+            kwargs[field.name] = field.default
+        elif field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+            kwargs[field.name] = field.default_factory()
+        else:
+            kwargs[field.name] = _default_factory_for_annotation(field.type)()
+    return annotation(**kwargs)
+
+
+def _pydantic_v2_default(annotation: Any) -> Any:
+    """Best-effort-construct a pydantic v2 model, deriving required fields recursively."""
+    kwargs = {}
+    for name, field_info in annotation.model_fields.items():
+        default = field_info.default
+        if type(default).__name__ != "PydanticUndefinedType":
+            kwargs[name] = default
+        elif field_info.default_factory is not None:
+            kwargs[name] = field_info.default_factory()
+        else:
+            kwargs[name] = _default_factory_for_annotation(field_info.annotation)()
+    try:
+        return annotation(**kwargs)
+    except Exception:
+        return annotation.model_construct(**kwargs)
+
+
+def _pydantic_v1_default(annotation: Any) -> Any:
+    """Best-effort-construct a pydantic v1 model, deriving required fields recursively."""
+    kwargs = {}
+    for name, field in annotation.__fields__.items():
+        if field.default is not None:
+            kwargs[name] = field.default
+        elif field.default_factory is not None:
+            kwargs[name] = field.default_factory()
+        elif not field.required:
+            kwargs[name] = None
+        else:
+            kwargs[name] = _default_factory_for_annotation(field.outer_type_)()
+    try:
+        return annotation(**kwargs)
+    except Exception:
+        return annotation.construct(**kwargs)
+
+
+def _default_factory_for_annotation(annotation: Any) -> Any:
+    """Return a zero-arg callable that produces a sensible "empty" value for `annotation`.
+
+    Used by SUPPRESS_ERRORS to synthesize a fallback return value when the
+    traced function raises, so the caller's flow isn't broken. Handles bare
+    builtins (list/dict/tuple/set/str/int/float/bool/bytes), their generic
+    aliases (``list[int]``, ``Dict[str, int]``, ...), ``Optional[X]``/``X |
+    None``, dataclasses, and pydantic v1/v2 models (duck-typed — no pydantic
+    import, keeps the package zero-dependency) — recursively deriving values
+    for required fields from their own annotations. Anything unresolvable
+    falls back to ``None``, with a one-line stderr warning, mirroring the
+    "never let telemetry break the traced call" rule used elsewhere.
+    """
+    if annotation is inspect.Signature.empty or annotation is None or annotation is type(None):
+        return lambda: None
+    if annotation is typing.Any:
+        return lambda: None
+
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union or origin is types.UnionType:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return _default_factory_for_annotation(args[0])
+        return lambda: None
+    if origin is not None:
+        # a generic alias like list[int] / Dict[str, int] — dispatch on the runtime origin
+        return _default_factory_for_annotation(origin)
+
+    if annotation in _BUILTIN_EMPTY:
+        return _BUILTIN_EMPTY[annotation]
+
+    if isinstance(annotation, type):
+        if dataclasses.is_dataclass(annotation):
+            builder = _dataclass_default
+        elif hasattr(annotation, "model_fields"):
+            builder = _pydantic_v2_default
+        elif hasattr(annotation, "__fields__"):
+            builder = _pydantic_v1_default
+        else:
+            builder = lambda a: a()  # plain no-arg construction
+
+        def _construct() -> Any:
+            try:
+                return builder(annotation)
+            except Exception as e:
+                print(
+                    f"[perf] SUPPRESS_ERRORS: could not build default for {annotation!r}: {e}",
+                    file=sys.stderr,
+                )
+                return None
+
+        return _construct
+
+    return lambda: None
+
+
+def _compute_default_return(default_factory: Any) -> Any:
+    """Resolve the value to substitute for a suppressed root-level exception.
+
+    Honors a per-call ``DEFAULT_RETURN`` override (a plain value, used as-is,
+    or a callable, invoked fresh each time) over the auto-detected
+    `default_factory` derived from the function's return annotation.
+    """
+    if DEFAULT_RETURN is not _UNSET:
+        return DEFAULT_RETURN() if callable(DEFAULT_RETURN) else DEFAULT_RETURN
+    return default_factory()
 
 
 def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
@@ -856,6 +1009,8 @@ _CONFIG_KEYS = frozenset(
         "CAPTURE_IO",
         "MAX_DEPTH",
         "MAX_SIZE_CAPTURE",
+        "SUPPRESS_ERRORS",
+        "DEFAULT_RETURN",
     }
 )
 
@@ -906,6 +1061,12 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         return partial(trace, **overrides)
     _check_overrides(overrides)
 
+    try:
+        _return_annotation = inspect.signature(func).return_annotation
+    except (ValueError, TypeError):
+        _return_annotation = inspect.Signature.empty
+    _default_factory = _default_factory_for_annotation(_return_annotation)
+
     if inspect.iscoroutinefunction(func):
 
         @wraps(func)
@@ -930,7 +1091,10 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     _finish_node(root)
                     _record_inputs(root, args, kwargs)
                     _record_exception(root, exc)
-                    raise
+                    if not SUPPRESS_ERRORS:
+                        raise
+                    result = _compute_default_return(_default_factory)
+                    _record_output(root, result)
                 finally:
                     sys.setprofile(None)
                     threading.setprofile(None)
@@ -958,7 +1122,10 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     _finish_node(root)
                     _record_inputs(root, args, kwargs)
                     _record_exception(root, exc)
-                    raise
+                    if not SUPPRESS_ERRORS:
+                        raise
+                    result = _compute_default_return(_default_factory)
+                    _record_output(root, result)
                 finally:
                     sys.setprofile(None)
                     threading.setprofile(None)
