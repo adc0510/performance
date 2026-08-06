@@ -37,7 +37,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "CAPTURE_IO",
     "DEFAULT_RETURN",
@@ -500,6 +500,30 @@ def _compute_default_return(default_factory: Any) -> Any:
     if DEFAULT_RETURN is not _UNSET:
         return DEFAULT_RETURN() if callable(DEFAULT_RETURN) else DEFAULT_RETURN
     return default_factory()
+
+
+def _resolve_return_annotation(func: Any) -> Any:
+    """Resolve `func`'s return annotation to an actual type/generic, not a string.
+
+    ``inspect.signature(func).return_annotation`` returns the annotation
+    exactly as written — under ``from __future__ import annotations`` (or any
+    manually-quoted annotation, e.g. ``-> "list"``), that's a plain string
+    like ``"list"``, which :func:`_default_factory_for_annotation` can't
+    dispatch on (it would silently fall back to ``None``). ``typing.get_type_hints``
+    evaluates such strings in the function's own module namespace, resolving
+    forward refs the same way type checkers do. Falls back to the raw
+    (possibly still-a-string) signature annotation if that evaluation fails
+    (e.g. a forward ref to a name not in scope), and to "no annotation" if
+    even that isn't available.
+    """
+    try:
+        return typing.get_type_hints(func).get("return", inspect.Signature.empty)
+    except Exception:
+        pass
+    try:
+        return inspect.signature(func).return_annotation
+    except (ValueError, TypeError):
+        return inspect.Signature.empty
 
 
 def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
@@ -1061,11 +1085,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         return partial(trace, **overrides)
     _check_overrides(overrides)
 
-    try:
-        _return_annotation = inspect.signature(func).return_annotation
-    except (ValueError, TypeError):
-        _return_annotation = inspect.Signature.empty
-    _default_factory = _default_factory_for_annotation(_return_annotation)
+    _default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
 
     if inspect.iscoroutinefunction(func):
 
