@@ -37,7 +37,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __all__ = [
     "CAPTURE_IO",
     "DEFAULT_RETURN",
@@ -213,19 +213,24 @@ TAGS: list = ["dev"]
 # timeout. None disables the watchdog.
 TIMEOUT: float | None = None
 
-# When True, an exception raised by the top-level traced function itself is
-# swallowed (after being recorded/sent like any other exception) instead of
-# propagating to the caller. In its place, a default value derived from the
-# function's return annotation is returned (e.g. "-> list" yields [], "-> int"
-# yields 0). Does not affect exceptions from inner auto-instrumented calls —
-# those still propagate up to the root as before; only the root wrapper built
-# by trace() applies this. Default False preserves the old raise-through
-# behaviour.
+# When True, an exception raised by ANY traced call — the top-level function
+# decorated with @trace, or any nested auto-instrumented call reached under
+# it — is swallowed at the point it happened (after being recorded/sent like
+# any other exception) instead of propagating further up the call stack. In
+# its place, a default value derived from *that call's own* return annotation
+# is returned (e.g. "-> list" yields [], "-> int" yields 0), so a deep failure
+# degrades to an empty/zero result there rather than unwinding the whole
+# chain. This means a bug anywhere in the traced tree can silently turn into
+# an empty default instead of a loud crash — an explicit trade of correctness
+# visibility for resilience. Default False preserves the old raise-through
+# behaviour everywhere.
 SUPPRESS_ERRORS = False
 # Overrides the auto-detected default value used by SUPPRESS_ERRORS. Leave as
-# _UNSET (the default) to derive the default from the return annotation. If
-# set to a callable, it's invoked with no args per suppressed call to produce
-# a fresh value (e.g. DEFAULT_RETURN=list); otherwise the value is used as-is.
+# _UNSET (the default) to derive the default from each call's own return
+# annotation. If set to a callable, it's invoked with no args per suppressed
+# call to produce a fresh value (e.g. DEFAULT_RETURN=list); otherwise the
+# value is used as-is for every suppressed call, regardless of that call's own
+# return type.
 _UNSET = object()
 DEFAULT_RETURN: Any = _UNSET
 
@@ -876,8 +881,13 @@ def _sync_wrap(func: Any, name: str) -> Any:
     node's start stamp and the real call. As soon as `func` returns or raises,
     :func:`_finish_node` stamps ``time``/``end`` immediately — before input/output
     capture, which can be slow (JSON-ifying large args/results) and must not be
-    counted as part of the function's own time. Exceptions are recorded then
-    re-raised, and the previous current-node is always restored.
+    counted as part of the function's own time. Exceptions are always recorded
+    on the node; what happens next depends on :data:`SUPPRESS_ERRORS` — off
+    (the default), they re-raise as before, propagating up the real call stack;
+    on, this call swallows its own exception and returns a default value
+    derived from *its own* return annotation instead, containing the failure at
+    the point it happened rather than unwinding the whole chain. The previous
+    current-node is always restored.
 
     Args:
         func: The original synchronous function/method to time.
@@ -886,6 +896,7 @@ def _sync_wrap(func: Any, name: str) -> Any:
     Returns:
         A ``functools.wraps``-preserving wrapper with the same signature.
     """
+    default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
 
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -904,7 +915,11 @@ def _sync_wrap(func: Any, name: str) -> Any:
             _finish_node(node)
             _record_inputs(node, args, kwargs)
             _record_exception(node, exc)
-            raise
+            if not SUPPRESS_ERRORS:
+                raise
+            result = _compute_default_return(default_factory)
+            _record_output(node, result)
+            return result
         finally:
             _current_node.reset(token)
 
@@ -921,6 +936,9 @@ def _async_wrap(func: Any, name: str) -> Any:
     Because linkage flows through a ``ContextVar``, sibling coroutines running
     concurrently each attach to their own logical parent, and their nodes'
     start/time intervals let the reporter compute overlap-aware wall time.
+    Exceptions are always recorded on the node; per :data:`SUPPRESS_ERRORS`,
+    they either re-raise (default) or are swallowed with a type-derived default
+    returned in their place — see :func:`_sync_wrap` for the full rationale.
 
     Args:
         func: The original coroutine function to time.
@@ -929,6 +947,7 @@ def _async_wrap(func: Any, name: str) -> Any:
     Returns:
         A ``functools.wraps``-preserving async wrapper with the same signature.
     """
+    default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
@@ -947,7 +966,11 @@ def _async_wrap(func: Any, name: str) -> Any:
             _finish_node(node)
             _record_inputs(node, args, kwargs)
             _record_exception(node, exc)
-            raise
+            if not SUPPRESS_ERRORS:
+                raise
+            result = _compute_default_return(default_factory)
+            _record_output(node, result)
+            return result
         finally:
             _current_node.reset(token)
 
