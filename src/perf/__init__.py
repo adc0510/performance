@@ -13,8 +13,9 @@ Basic usage::
         ...
 
 Configuration is done via module-level attributes, e.g. ``perf.OUTPUT_DIR``,
-``perf.OUTPUT_FILE``, ``perf.ENDPOINT_URL``, ``perf.TIMEOUT``,
-``perf.SCAN_VENV``, ``perf.SUPPRESS_ERRORS`` — see each below.
+``perf.OUTPUT_FILE``, ``perf.ENDPOINT_URL``, ``perf.API_KEY``,
+``perf.TIMEOUT``, ``perf.SCAN_VENV``, ``perf.SUPPRESS_ERRORS`` — see each
+below.
 """
 
 import asyncio
@@ -37,8 +38,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = [
+    "API_KEY",
     "CAPTURE_IO",
     "DEFAULT_RETURN",
     "ENDPOINT_URL",
@@ -206,6 +208,9 @@ LOG_FUNCTIONS: list = []
 ENDPOINT_URL: str | None = None
 # Tags attached to every posted trace (e.g. ["prod", "search"]).
 TAGS: list = ["dev"]
+# Pre-shared key for collectors that require API-key auth on their ingestion
+# route (sent as the X-API-Key header on every POST to ENDPOINT_URL).
+API_KEY: str | None = "F-OZcYtZT0H_5FXT5qwm1-Ftaop5AKiVSFIbr_HGvs4"
 # Auto-terminate a traced call that runs longer than this many seconds. The
 # async path cancels the coroutine (asyncio.wait_for); the sync path interrupts
 # via SIGALRM (Unix main thread only — a background thread is left to run and a
@@ -1051,6 +1056,7 @@ _CONFIG_KEYS = frozenset(
         "LOG_FUNCTIONS",
         "ENDPOINT_URL",
         "TAGS",
+        "API_KEY",
         "TIMEOUT",
         "SCAN_VENV",
         "CAPTURE_IO",
@@ -1670,10 +1676,13 @@ def _send_trace(root: dict) -> None:
     data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
 
     def _post() -> None:
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers["X-API-Key"] = API_KEY
         req = urllib.request.Request(
             ENDPOINT_URL,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:

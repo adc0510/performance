@@ -76,6 +76,7 @@ traced function):
 |------------------|---------|---------|
 | `perf.OUTPUT_FILE`  | `None` | Path to write the raw trace tree as JSON (e.g. `"perf.json"`). |
 | `perf.ENDPOINT_URL` | `None` | POST the raw trace tree to this collector URL. |
+| `perf.API_KEY`      | `None` | Pre-shared key sent as the `X-API-Key` header on every POST to `ENDPOINT_URL`, for collectors that require API-key auth on their ingestion route. |
 | `perf.TAGS`         | `["dev"]` | Tags attached to every posted trace. |
 | `perf.TIMEOUT`      | `None` | Auto-terminate a traced call after N seconds. |
 | `perf.CAPTURE_IO`   | `True` | Record each call's arguments and return value. |
