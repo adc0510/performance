@@ -168,7 +168,7 @@ def _restart(node: dict) -> None:
 
     :func:`make_node` stamps ``start`` at node creation, but the ``trace()``
     entry-point wrapper does real setup after that — installing the
-    ``sys.setprofile``/``threading.setprofile`` hooks — before the wrapped
+    ``sys.setprofile`` hook — before the wrapped
     function runs. Left alone, that setup cost would be counted as part of the
     root node's time. Calling this right before invoking the wrapped function
     moves ``start``/``start_timestamp`` to the true beginning of the call, so
@@ -996,8 +996,18 @@ def _make_profiler() -> Any:
     virtually every call).
 
     Returns:
-        A ``profiler(frame, event, arg)`` callable to hand to
-        ``sys.setprofile`` / ``threading.setprofile``.
+        A ``profiler(frame, event, arg)`` callable to hand to ``sys.setprofile``.
+
+    Note:
+        Deliberately not installed via ``threading.setprofile`` — that applies
+        to every thread *started* while it's set, including long-lived threads
+        owned by libraries (e.g. a websocket client's read-loop thread) that
+        outlive this call entirely. Since a thread's profile function can only
+        be cleared from within that thread, such a thread would carry the
+        profiling overhead for the rest of its life, well after this trace has
+        finished. Scoping to ``sys.setprofile`` on the calling thread only means
+        instances first touched on other threads during the call won't be
+        patched, but that's a strictly better trade than an unbounded leak.
     """
 
     def profiler(frame: Any, event: Any, arg: Any) -> None:
@@ -1125,7 +1135,6 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
                 profiler = _make_profiler()
-                threading.setprofile(profiler)
                 sys.setprofile(profiler)
                 _restart(root)  # setup above shouldn't count as the call's own time
                 try:
@@ -1146,7 +1155,6 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     _record_output(root, result)
                 finally:
                     sys.setprofile(None)
-                    threading.setprofile(None)
                     print_tree(root)
                 return result
     else:
@@ -1158,7 +1166,6 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
                 profiler = _make_profiler()
-                threading.setprofile(profiler)
                 sys.setprofile(profiler)
                 try:
                     with _sync_timeout(TIMEOUT, func.__qualname__):
@@ -1177,7 +1184,6 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     _record_output(root, result)
                 finally:
                     sys.setprofile(None)
-                    threading.setprofile(None)
                     print_tree(root)
                 return result
 
