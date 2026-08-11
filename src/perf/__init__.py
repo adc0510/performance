@@ -307,34 +307,47 @@ _SKIP = object()
 _DEFAULT_REPR = re.compile(r"^<[\w.]+ object at 0x[0-9a-fA-F]+>$")
 
 
-def _jsonable(value: Any, depth: int = 0) -> Any:
+def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset()) -> Any:
     """Convert a value to a full, JSON-serializable form (no truncation).
 
     dict/list/tuple/set are recursed into so their contents are preserved
     verbatim; primitives pass through; rich objects are unpacked. Objects with
     only a default repr (``<pkg.Class object at 0x…>``) carry no information and
     return the _SKIP sentinel so the caller can drop them.
+
+    `_seen` tracks the ``id()`` of every container/object currently open on this
+    recursion path (not a global visited-set, so two independent references to
+    the same object are both still captured — only an actual cycle, where a
+    value contains itself, is cut off). Live objects like a connection wrapping
+    its own transport, which back-references the connection, are common enough
+    that without this a single argument could recurse `MAX_DEPTH` layers deep
+    re-expanding the same handful of objects repeatedly.
     """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if depth >= MAX_DEPTH:
         return _safe_repr(value)
+    if id(value) in _seen:
+        return f"<circular {type(value).__name__}>"
     try:
         if isinstance(value, dict):
+            seen = _seen | {id(value)}
             return {
                 (k if isinstance(k, str) else _safe_repr(k)): jv
                 for k, v in value.items()
-                if (jv := _jsonable(v, depth + 1)) is not _SKIP
+                if (jv := _jsonable(v, depth + 1, seen)) is not _SKIP
             }
         if isinstance(value, (list, tuple, set, frozenset)):
-            return [jv for v in value if (jv := _jsonable(v, depth + 1)) is not _SKIP]
+            seen = _seen | {id(value)}
+            return [jv for v in value if (jv := _jsonable(v, depth + 1, seen)) is not _SKIP]
         # pydantic models, dataclasses, and other rich objects
         if hasattr(value, "model_dump"):  # pydantic v2
-            return _jsonable(value.model_dump(), depth + 1)
+            return _jsonable(value.model_dump(), depth + 1, _seen | {id(value)})
         if hasattr(value, "dict") and callable(value.dict):  # pydantic v1
-            return _jsonable(value.dict(), depth + 1)
+            return _jsonable(value.dict(), depth + 1, _seen | {id(value)})
         if hasattr(value, "__dict__") and vars(value):
-            return {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1)}
+            seen = _seen | {id(value)}
+            return {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1, seen)}
     except Exception as e:
         return f"<unconvertible {type(value).__name__}: {e}>"
     r = _safe_repr(value)
