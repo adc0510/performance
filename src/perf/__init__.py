@@ -52,6 +52,7 @@ __all__ = [
     "OUTPUT_DIR",
     "OUTPUT_FILE",
     "SCAN_VENV",
+    "SKIP_FUNCTIONS",
     "SUPPRESS_ERRORS",
     "TAGS",
     "TIMEOUT",
@@ -101,6 +102,10 @@ def fmt(seconds: float) -> str:
 # ── tree ──────────────────────────────────────────────────────────────────────
 
 _current_node: ContextVar[dict | None] = ContextVar("_current_node", default=None)
+# >0 while executing inside a SKIP_FUNCTIONS call (at any nesting depth), so
+# _sync_wrap/_async_wrap can bypass node creation for everything called from
+# within it too, not just the skipped call itself.
+_skip_depth: ContextVar[int] = ContextVar("_skip_depth", default=0)
 
 
 def _now_iso() -> str:
@@ -202,6 +207,15 @@ OUTPUT_FILE: str | None = None
 # the full tree is written, as before. Does not affect what's printed to stdout or
 # sent to ENDPOINT_URL.
 LOG_FUNCTIONS: list = []
+# Blacklist of function names (same format as LOG_FUNCTIONS, e.g. "Class.method"
+# or "module.function") to exclude from tracing entirely. A matched call runs
+# with node creation suppressed for it AND for everything reached underneath it
+# (tracked via _skip_depth) — nested calls under a skipped function are
+# excluded automatically, without needing to be listed themselves. Unlike
+# LOG_FUNCTIONS, this affects instrumentation itself (and therefore overhead
+# and every output: stdout, file, ENDPOINT_URL), not just what's kept when
+# writing the tree out. Empty (the default) disables it.
+SKIP_FUNCTIONS: list = []
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
 # disables it — set it to opt in (e.g. "http://localhost:7999/api/traces").
@@ -918,6 +932,12 @@ def _sync_wrap(func: Any, name: str) -> Any:
 
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
+        if name in SKIP_FUNCTIONS or _skip_depth.get():
+            token = _skip_depth.set(_skip_depth.get() + 1)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _skip_depth.reset(token)
         parent = _current_node.get()
         node = make_node(name)
         if parent is not None:
@@ -969,6 +989,12 @@ def _async_wrap(func: Any, name: str) -> Any:
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
+        if name in SKIP_FUNCTIONS or _skip_depth.get():
+            token = _skip_depth.set(_skip_depth.get() + 1)
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                _skip_depth.reset(token)
         parent = _current_node.get()
         node = make_node(name)
         if parent is not None:
@@ -1085,6 +1111,7 @@ _CONFIG_KEYS = frozenset(
         "CAPTURE_IO",
         "MAX_DEPTH",
         "MAX_SIZE_CAPTURE",
+        "SKIP_FUNCTIONS",
         "SUPPRESS_ERRORS",
         "DEFAULT_RETURN",
     }
