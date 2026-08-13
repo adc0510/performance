@@ -33,6 +33,7 @@ import typing
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from fnmatch import fnmatch
 from functools import partial, wraps
 from pathlib import Path
 from time import perf_counter
@@ -106,6 +107,11 @@ _current_node: ContextVar[dict | None] = ContextVar("_current_node", default=Non
 # _sync_wrap/_async_wrap can bypass node creation for everything called from
 # within it too, not just the skipped call itself.
 _skip_depth: ContextVar[int] = ContextVar("_skip_depth", default=0)
+
+
+def _is_skipped(name: str) -> bool:
+    """Whether ``name`` matches an entry in SKIP_FUNCTIONS (glob-aware via fnmatch)."""
+    return any(fnmatch(name, pattern) for pattern in SKIP_FUNCTIONS)
 
 
 def _now_iso() -> str:
@@ -208,13 +214,15 @@ OUTPUT_FILE: str | None = None
 # sent to ENDPOINT_URL.
 LOG_FUNCTIONS: list = []
 # Blacklist of function names (same format as LOG_FUNCTIONS, e.g. "Class.method"
-# or "module.function") to exclude from tracing entirely. A matched call runs
-# with node creation suppressed for it AND for everything reached underneath it
-# (tracked via _skip_depth) — nested calls under a skipped function are
-# excluded automatically, without needing to be listed themselves. Unlike
-# LOG_FUNCTIONS, this affects instrumentation itself (and therefore overhead
-# and every output: stdout, file, ENDPOINT_URL), not just what's kept when
-# writing the tree out. Empty (the default) disables it.
+# or "module.function") to exclude from tracing entirely. Entries are matched
+# with fnmatch, so glob patterns work too (e.g. "_*" or "Class._*" to skip
+# leading-underscore names). A matched call runs with node creation suppressed
+# for it AND for everything reached underneath it (tracked via _skip_depth) —
+# nested calls under a skipped function are excluded automatically, without
+# needing to be listed themselves. Unlike LOG_FUNCTIONS, this affects
+# instrumentation itself (and therefore overhead and every output: stdout,
+# file, ENDPOINT_URL), not just what's kept when writing the tree out. Empty
+# (the default) disables it.
 SKIP_FUNCTIONS: list = []
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
@@ -932,7 +940,7 @@ def _sync_wrap(func: Any, name: str) -> Any:
 
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
-        if name in SKIP_FUNCTIONS or _skip_depth.get():
+        if _is_skipped(name) or _skip_depth.get():
             token = _skip_depth.set(_skip_depth.get() + 1)
             try:
                 return func(*args, **kwargs)
@@ -989,7 +997,7 @@ def _async_wrap(func: Any, name: str) -> Any:
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
-        if name in SKIP_FUNCTIONS or _skip_depth.get():
+        if _is_skipped(name) or _skip_depth.get():
             token = _skip_depth.set(_skip_depth.get() + 1)
             try:
                 return await func(*args, **kwargs)
