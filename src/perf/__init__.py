@@ -30,6 +30,7 @@ import threading
 import traceback
 import types
 import typing
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
@@ -43,6 +44,8 @@ __version__ = "0.5.0"
 __all__ = [
     "API_KEY",
     "CAPTURE_IO",
+    "DEDUP_CHECKPOINT_EVERY",
+    "DEDUP_INSTANCES",
     "DEFAULT_RETURN",
     "ENDPOINT_URL",
     "HOT_SPOTS",
@@ -54,6 +57,7 @@ __all__ = [
     "OUTPUT_FILE",
     "SCAN_VENV",
     "SKIP_FUNCTIONS",
+    "SPILL_DIR",
     "SUPPRESS_ERRORS",
     "TAGS",
     "TIMEOUT",
@@ -107,6 +111,12 @@ _current_node: ContextVar[dict | None] = ContextVar("_current_node", default=Non
 # _sync_wrap/_async_wrap can bypass node creation for everything called from
 # within it too, not just the skipped call itself.
 _skip_depth: ContextVar[int] = ContextVar("_skip_depth", default=0)
+# The current top-level trace's dedup cache for DEDUP_INSTANCES (see
+# _InstanceCache below) — None when DEDUP_INSTANCES is off, or outside any
+# traced call. Set once per top-level trace() invocation, never shared across
+# traces: a fresh cache every time, so one trace's captured baselines can
+# never depend on (or leak into) another's.
+_current_instances: ContextVar["_InstanceCache | None"] = ContextVar("_current_instances", default=None)
 
 
 def _is_skipped(name: str) -> bool:
@@ -312,12 +322,51 @@ CAPTURE_IO = True
 # Guards against runaway/cyclic objects: max recursion depth when converting a
 # value to JSON. Beyond it, the sub-value falls back to a repr string.
 MAX_DEPTH = 20
-# Only capture a value whose JSON-serialized size (in UTF-8 bytes) is below this
-# limit. A converted arg / kwarg / result at or above it is dropped and replaced
-# with a compact "<TypeName too large: N>" marker, so the node still records that
-# something flowed through without bloating perf.json. None (the default)
-# disables the limit — capture values of any size.
+# Only capture a value whose size (in UTF-8 bytes, enforced WHILE converting —
+# see _jsonable's `_budget` param) is below this limit. A converted arg / kwarg
+# / result at or above it is either spilled to SPILL_DIR (if set) or dropped
+# and replaced with a compact "<TypeName>" marker, so the node still records
+# that something flowed through without bloating perf.json. None (the
+# default) disables the limit — capture values of any size.
 MAX_SIZE_CAPTURE: int | None = None
+# When set (a directory path), a value that exceeds MAX_SIZE_CAPTURE is written
+# in full to its own JSON file in this directory instead of being dropped, and
+# the node holds only a small {"__spilled__": path, "size": N} reference in
+# its place. This preserves full fidelity for large values while keeping peak
+# RAM bounded to roughly the size of the single value being spilled at any one
+# time — that value's full conversion is written to disk and released
+# immediately, not held in the node for the rest of the trace. Ignored when
+# MAX_SIZE_CAPTURE is None (nothing is ever considered "too large"). None (the
+# default) disables spilling — oversize values are dropped, as before.
+#
+# CAUTION: if traced calls repeatedly touch the same large instance (e.g. a
+# service object's `self`), turning this on WITHOUT also enabling
+# DEDUP_INSTANCES means every single call spills that instance's full state
+# to its own file independently — measured ~4x SLOWER wall time than doing no
+# spilling at all, from the repeated disk I/O alone (see the warning emitted
+# by trace() for this exact combination). DEDUP_INSTANCES is what keeps a
+# repeated instance's state from being spilled over and over; the two are
+# meant to be turned on together for that access pattern.
+SPILL_DIR: str | None = None
+# When True, a positional argument that's a rich object (has a non-empty
+# __dict__ — typically `self`, or any other shared/long-lived instance passed
+# into many traced calls) is captured once in full per instance per trace,
+# then only as a diff of the fields that changed on later calls, instead of a
+# full independent snapshot every single time. This is what stops a
+# long-lived service object's state from being serialized over and over across
+# every method call in one trace. Scoped to a single top-level @trace() call
+# (see _current_instances) — a fresh dedup cache every trace, so one trace's
+# captures never depend on another's. Diffed captures replace the affected arg
+# with {"__full__": {...}} or {"__diff__": {...}}, tagged with "instance_seq"
+# (a per-trace, GC-safe identity — see _InstanceCache) instead of the plain
+# object dict. None of this touches kwargs or return values, only positional
+# args. Default False preserves today's behaviour: every arg captured in full,
+# independently, every call.
+DEDUP_INSTANCES = False
+# With DEDUP_INSTANCES on, an instance's full state is re-captured (instead of
+# diffed) every this-many calls, so a truncated/lost record only costs data
+# back to the nearest checkpoint rather than the whole diff chain.
+DEDUP_CHECKPOINT_EVERY = 10
 
 
 # Returned by _jsonable for values with no useful serialization (objects whose
@@ -329,12 +378,12 @@ _SKIP = object()
 _DEFAULT_REPR = re.compile(r"^<[\w.]+ object at 0x[0-9a-fA-F]+>$")
 
 
-def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset()) -> Any:
-    """Convert a value to a full, JSON-serializable form (no truncation).
+def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None) -> Any:
+    """Convert a value to a JSON-serializable form.
 
-    dict/list/tuple/set are recursed into so their contents are preserved
-    verbatim; primitives pass through; rich objects are unpacked. Objects with
-    only a default repr (``<pkg.Class object at 0x…>``) carry no information and
+    dict/list/tuple/set are recursed into so their contents are preserved;
+    primitives pass through; rich objects are unpacked. Objects with only a
+    default repr (``<pkg.Class object at 0x…>``) carry no information and
     return the _SKIP sentinel so the caller can drop them.
 
     `_seen` tracks the ``id()`` of every container/object currently open on this
@@ -344,68 +393,135 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset()) -> Any
     its own transport, which back-references the connection, are common enough
     that without this a single argument could recurse `MAX_DEPTH` layers deep
     re-expanding the same handful of objects repeatedly.
+
+    `_budget`, when given, is a single-element ``[remaining_bytes]`` list shared
+    (mutated in place, not copied per branch) across the whole recursion. It
+    bounds how much this call is allowed to copy *while converting*, instead of
+    building the full structure first and only checking its size afterward —
+    which is what used to let one huge value blow up RAM even when
+    MAX_SIZE_CAPTURE was set, since the full copy (plus a second full copy to
+    measure it) happened before the size was ever checked. Strings/bytes are
+    truncated at the exact point they'd exceed the budget; containers stop
+    recursing into further siblings once it's gone. `_budget[0] <= 0`
+    afterward means the value was at least budget-sized; the caller
+    (:func:`_capture_value`) decides from there whether to spill or drop it.
     """
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, str):
+        if _budget is not None:
+            if len(value) >= _budget[0]:
+                truncated = value[: max(_budget[0], 0)]
+                _budget[0] = 0
+                return truncated
+            _budget[0] -= len(value)
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        if _budget is not None:
+            if len(value) >= _budget[0]:
+                n = max(_budget[0], 0)
+                _budget[0] = 0
+                return _safe_repr(bytes(value[:n]))
+            _budget[0] -= len(value)
+        return _safe_repr(value)
     if depth >= MAX_DEPTH:
         return _safe_repr(value)
     if id(value) in _seen:
         return f"<circular {type(value).__name__}>"
+    if _budget is not None and _budget[0] <= 0:
+        return f"<{type(value).__name__} truncated: size limit reached>"
     try:
         if isinstance(value, dict):
             seen = _seen | {id(value)}
-            return {
-                (k if isinstance(k, str) else _safe_repr(k)): jv
-                for k, v in value.items()
-                if (jv := _jsonable(v, depth + 1, seen)) is not _SKIP
-            }
+            out = {}
+            for k, v in value.items():
+                if _budget is not None and _budget[0] <= 0:
+                    break
+                jv = _jsonable(v, depth + 1, seen, _budget)
+                if jv is not _SKIP:
+                    out[k if isinstance(k, str) else _safe_repr(k)] = jv
+            return out
         if isinstance(value, (list, tuple, set, frozenset)):
             seen = _seen | {id(value)}
-            return [jv for v in value if (jv := _jsonable(v, depth + 1, seen)) is not _SKIP]
+            out = []
+            for v in value:
+                if _budget is not None and _budget[0] <= 0:
+                    break
+                jv = _jsonable(v, depth + 1, seen, _budget)
+                if jv is not _SKIP:
+                    out.append(jv)
+            return out
         # pydantic models, dataclasses, and other rich objects
         if hasattr(value, "model_dump"):  # pydantic v2
-            return _jsonable(value.model_dump(), depth + 1, _seen | {id(value)})
+            return _jsonable(value.model_dump(), depth + 1, _seen | {id(value)}, _budget)
         if hasattr(value, "dict") and callable(value.dict):  # pydantic v1
-            return _jsonable(value.dict(), depth + 1, _seen | {id(value)})
+            return _jsonable(value.dict(), depth + 1, _seen | {id(value)}, _budget)
         if hasattr(value, "__dict__") and vars(value):
             seen = _seen | {id(value)}
-            return {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1, seen)}
+            return {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1, seen, _budget)}
     except Exception as e:
         return f"<unconvertible {type(value).__name__}: {e}>"
     r = _safe_repr(value)
+    if _budget is not None:
+        if len(r) >= _budget[0]:
+            _budget[0] = 0
+        else:
+            _budget[0] -= len(r)
     return _SKIP if _DEFAULT_REPR.match(r) else r
 
 
-def _size_of(jv: Any) -> int:
-    """Approximate the serialized size, in UTF-8 bytes, of a JSON-able value.
+def _spill_value(value: Any) -> Any:
+    """Writes the full conversion of `value` to its own file under
+    :data:`SPILL_DIR`, and returns a small reference in its place.
 
-    Uses the byte length of its compact JSON (UTF-8) encoding as a cheap,
-    structure-aware proxy for how much room the value takes in perf.json. Falls
-    back to the byte length of its repr if it somehow can't be JSON-encoded.
+    Only called once :func:`_capture_value`'s budgeted pass already knows
+    `value` exceeds :data:`MAX_SIZE_CAPTURE` — so the one unbounded conversion
+    this does is paid for exactly one value, written to disk, and released
+    (``del full``) immediately, rather than staying resident in the trace tree
+    for the rest of the call the way every other captured value does. Falls
+    back to dropping the value (_SKIP) if writing fails for any reason —
+    telemetry must never break the traced call.
     """
     import json
+    import uuid
 
     try:
-        return len(json.dumps(jv, ensure_ascii=False, default=str).encode("utf-8"))
-    except Exception:
-        return len(_safe_repr(jv).encode("utf-8"))
+        full = _jsonable(value)
+        Path(SPILL_DIR).mkdir(parents=True, exist_ok=True)
+        path = Path(SPILL_DIR) / f"{uuid.uuid4()}.json"
+        with open(path, "w") as f:
+            json.dump(full, f, ensure_ascii=False, default=str)
+        size = path.stat().st_size
+        del full
+        return {"__spilled__": str(path), "size": size}
+    except Exception as e:  # never let telemetry break the traced call
+        print(f"[perf] failed to spill oversized value to {SPILL_DIR}: {e}", file=sys.stderr)
+        return _SKIP
 
 
 def _capture_value(value: Any) -> Any:
-    """Convert `value` for capture, dropping it if too large.
+    """Convert `value` for capture, spilling or dropping it if too large.
 
-    Returns the JSON-able form from :func:`_jsonable`, unless it is the ``_SKIP``
-    sentinel (no useful serialization) or — when :data:`MAX_SIZE_CAPTURE` is set —
-    its serialized size is at or above the limit. In those cases the ``_SKIP``
-    sentinel is returned so the caller can drop or mark the slot; an oversize
-    value is signalled distinctly via a paired size so callers may annotate it.
+    Returns the JSON-able form from :func:`_jsonable`, unless it is the
+    ``_SKIP`` sentinel (no useful serialization). When :data:`MAX_SIZE_CAPTURE`
+    is set, conversion happens under a byte budget (see `_jsonable`'s
+    `_budget` param), so a huge value is never fully copied into RAM just to
+    be measured and discarded — unlike checking its size only after a full,
+    unbounded conversion. A value that exhausts the budget is spilled to its
+    own file (:func:`_spill_value`) when :data:`SPILL_DIR` is set, or dropped
+    — the same "<TypeName>" marker behaviour as when SPILL_DIR is left unset.
     """
-    jv = _jsonable(value)
+    if MAX_SIZE_CAPTURE is None:
+        return _jsonable(value)
+    budget = [MAX_SIZE_CAPTURE]
+    jv = _jsonable(value, _budget=budget)
     if jv is _SKIP:
         return _SKIP
-    if MAX_SIZE_CAPTURE is not None and _size_of(jv) >= MAX_SIZE_CAPTURE:
-        return _SKIP
-    return jv
+    if budget[0] > 0:
+        return jv
+    if SPILL_DIR:
+        return _spill_value(value)
+    return _SKIP
 
 
 def _safe_repr(value: Any) -> str:
@@ -413,6 +529,125 @@ def _safe_repr(value: Any) -> str:
         return repr(value)
     except Exception as e:  # a __repr__ that raises must not kill the trace
         return f"<unreprable {type(value).__name__}: {e}>"
+
+
+# ── DEDUP_INSTANCES: per-trace instance dedup ──────────────────────────────────
+
+
+class _InstanceCache:
+    """Dedups repeated captures of the same live instance within one trace.
+
+    Used by :func:`_record_inputs` when :data:`DEDUP_INSTANCES` is on: instead
+    of capturing a rich positional argument (`self`, or any other shared
+    object) in full on every call, the first call for a given instance gets a
+    full snapshot and every later call gets only the fields that changed —
+    with a full-snapshot checkpoint every :data:`DEDUP_CHECKPOINT_EVERY` calls
+    so a lost/truncated record only costs data back to the nearest checkpoint,
+    not the whole diff chain.
+
+    Keyed by `id(obj)`, validated via a `weakref.ref` with a death callback
+    that removes the entry the instant the object is actually collected — so
+    a later, unrelated object that happens to reuse the same id (Python does
+    this once the original is garbage collected) can never be mistaken for
+    the original and merged into its history.
+
+    One instance of this class lives for the duration of a single top-level
+    :func:`trace` call (see `_current_instances`) — never shared across
+    traces, so one trace's baselines can't leak into another's.
+    """
+
+    def __init__(self, checkpoint_every: int) -> None:
+        self.checkpoint_every = checkpoint_every
+        self._entries: dict = {}
+        self._next_seq = 0
+
+    def _on_die(self, oid: int):
+        def _cb(_ref: Any) -> None:
+            self._entries.pop(oid, None)
+
+        return _cb
+
+    def needs_full(self, obj: Any) -> bool:
+        """Whether the *next* capture of `obj` will be a full snapshot (first
+        sighting, or this trace's checkpoint interval landing) rather than a
+        diff. Callers check this BEFORE converting `obj`'s state, so they can
+        skip paying for a full, potentially-spillable conversion on the
+        common (diff) case and only pay for it when a full snapshot is
+        actually needed — see :func:`_capture_positional`.
+        """
+        entry = self._entries.get(id(obj))
+        if entry is None or entry["ref"]() is not obj:
+            return True
+        return entry["since_checkpoint"] + 1 >= self.checkpoint_every
+
+    def record_diff(self, obj: Any, snapshot: dict) -> dict:
+        """Records a bounded (cheap, possibly internally-truncated) snapshot
+        as a diff against the last one. Only call when :func:`needs_full`
+        just returned False for the same `obj` — this assumes an entry
+        already exists.
+        """
+        entry = self._entries[id(obj)]
+        diff = {k: v for k, v in snapshot.items() if entry["last"].get(k) != v}
+        entry["since_checkpoint"] += 1
+        entry["last"] = snapshot
+        return {"__diff__": diff, "instance_seq": entry["seq"]}
+
+    def record_full(self, obj: Any, full_output: Any, comparable_snapshot: dict) -> dict:
+        """Records a FULL snapshot — first sighting of `obj`, or a checkpoint.
+
+        Two different representations are involved, deliberately: `full_output`
+        is what's actually returned (and may be a ``{"__spilled__": ...}``
+        reference if `obj`'s state was too large — see
+        :func:`_capture_positional`, which is responsible for producing it via
+        the normal :func:`_capture_value` path, same as any other oversized
+        value). `comparable_snapshot` is a plain per-field dict — the SAME
+        shape :func:`record_diff` produces — stored as the baseline future
+        diffs compare against. These must NOT be conflated: if the spilled
+        reference were stored as the baseline instead, every field would
+        look "changed" on the very next diff (a spill reference dict has none
+        of the real field keys to compare against), defeating dedup right
+        after every full snapshot/checkpoint.
+        """
+        oid = id(obj)
+        entry = self._entries.get(oid)
+        if entry is None or entry["ref"]() is not obj:
+            ref = weakref.ref(obj, self._on_die(oid))
+            seq = self._next_seq
+            self._next_seq += 1
+            self._entries[oid] = {"ref": ref, "last": comparable_snapshot, "since_checkpoint": 0, "seq": seq}
+            return {"__full__": full_output, "instance_seq": seq}
+        entry["since_checkpoint"] = 0
+        entry["last"] = comparable_snapshot
+        return {"__full__": full_output, "instance_seq": entry["seq"]}
+
+
+# Warned at most once per process (not once per trace — a long-running service
+# doing many traces would otherwise spam this on every single one).
+_warned_spill_without_dedup = False
+
+
+def _warn_if_spill_without_dedup() -> None:
+    """Flags a real footgun: SPILL_DIR on without DEDUP_INSTANCES, when calls
+    repeatedly touch the same large instance, spills that instance's full
+    state on EVERY call independently — measured ~4x slower wall time than
+    not spilling at all, purely from the repeated per-call disk I/O. Silently
+    auto-enabling DEDUP_INSTANCES instead would change SPILL_DIR's captured
+    output shape (plain values -> diff/full markers) for anyone who only
+    asked for spilling, which is worse than a loud warning that leaves the
+    decision (and the wire-format change) to the caller.
+    """
+    global _warned_spill_without_dedup
+    if SPILL_DIR and not DEDUP_INSTANCES and not _warned_spill_without_dedup:
+        _warned_spill_without_dedup = True
+        print(
+            "[perf] SPILL_DIR is set but DEDUP_INSTANCES is off. If traced calls "
+            "repeatedly touch the same large instance (e.g. a service object's "
+            "`self`), every call will spill its full state to disk independently "
+            "-- this can be dramatically SLOWER than not spilling at all. "
+            "Consider also setting DEDUP_INSTANCES=True. (This warning is shown "
+            "once per process.)",
+            file=sys.stderr,
+        )
 
 
 # ── SUPPRESS_ERRORS: type-aware default return values ─────────────────────────
@@ -571,14 +806,82 @@ def _resolve_return_annotation(func: Any) -> Any:
         return inspect.Signature.empty
 
 
+def _capture_positional(a: Any) -> Any:
+    """Capture one positional argument, routing rich objects through the
+    current trace's dedup cache when :data:`DEDUP_INSTANCES` is on.
+
+    A positional arg with a non-empty ``__dict__`` (``self``, or any other
+    shared/long-lived instance — not just method receivers specifically) goes
+    through :class:`_InstanceCache` instead of a plain :func:`_capture_value`
+    call, so repeated calls on the same instance within one trace capture its
+    state once in full and only diff it afterward.
+
+    The two cases are deliberately converted differently:
+
+    * **diff** (the common case): each field of ``vars(a)`` is converted with
+      its OWN independent budget, never itself spilled. Two things matter
+      here, both found while verifying this against the actual reported RAM
+      problem: (1) sharing one budget across the whole ``vars(a)`` dict lets
+      one large early field (e.g. a big, mostly-static config dict) starve
+      the budget before later fields are ever even looked at — since dict
+      iteration is insertion-ordered, any field defined after it would then
+      never be captured, so a diff could never detect changes to it, no
+      matter how much it actually changed. Budgeting per-field instead means
+      every field is at least represented (possibly truncated), so change
+      detection isn't blind to whatever happens to come later in `__dict__`.
+      (2) Using the full spillable path here (:func:`_capture_value` on the
+      whole dict at once) would defeat the point of diffing: `self`'s ~200KB
+      __dict__ would exceed MAX_SIZE_CAPTURE on literally every call, so
+      every call would spill instead of just the checkpoints.
+    * **full** (first sighting of this instance, or a checkpoint): goes
+      through the normal :func:`_capture_value` pipeline, so a huge instance
+      dict is still bounded/spillable there, same as any other captured
+      value — full fidelity is preserved for the snapshot that actually needs
+      to carry every field.
+
+    Falls through to plain capture when dedup is off, there's no active
+    trace-scoped cache, or the value isn't dict-shaped.
+    """
+    cache = _current_instances.get() if DEDUP_INSTANCES else None
+    if cache is not None and hasattr(a, "__dict__") and vars(a):
+        # Cheap, per-field-budgeted snapshot -- computed every call, used both
+        # as this call's diff source AND as the comparison baseline stored for
+        # NEXT time (see record_full's docstring for why a full call's
+        # possibly-spilled *output* must never be what's stored for diffing).
+        comparable = {
+            k: _jsonable(v, _budget=([MAX_SIZE_CAPTURE] if MAX_SIZE_CAPTURE is not None else None))
+            for k, v in vars(a).items()
+        }
+        if cache.needs_full(a):
+            full_output = _capture_value(vars(a))
+            if not isinstance(full_output, dict):
+                full_output = {"__value__": full_output}
+            return cache.record_full(a, full_output, comparable)
+        return cache.record_diff(a, comparable)
+    jv = _capture_value(a)
+    return f"<{type(a).__name__}>" if jv is _SKIP else jv
+
+
 def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
     """Attach a JSON-safe snapshot of a call's arguments to its node.
 
     No-op unless :data:`CAPTURE_IO` is on. Positional args keep their index in
     ``node["args"]``; a value with no useful serialization (the ``_SKIP``
     sentinel from :func:`_jsonable`) is replaced by a compact ``"<TypeName>"``
-    marker so the slot is preserved. Keyword args go to ``node["kwargs"]``, where
+    marker so the slot is preserved — unless :data:`DEDUP_INSTANCES` is on and
+    the arg is a rich object, in which case it's captured via
+    :func:`_capture_positional` instead (full snapshot or diff, see
+    :class:`_InstanceCache`). Keyword args go to ``node["kwargs"]``, where
     skipped values are dropped entirely rather than marked.
+
+    Also accumulates onto ``node["capture_time"]`` — the wall time this call
+    spent capturing (as opposed to running). This node's own ``time`` (stamped
+    by :func:`_finish_node` before capture ever runs) never includes it, but a
+    PARENT's ``time`` does: the wrapper around this call doesn't return
+    control to its caller until capture finishes too. Recording it here is
+    what lets :func:`_self_time` subtract it back out of the parent's self
+    time instead of that parent's report silently absorbing time actually
+    spent capturing a child's args/result.
 
     Args:
         node: The call-tree node to annotate in place.
@@ -587,9 +890,10 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
     """
     if not CAPTURE_IO:
         return
-    # positional args keep their slot; skipped/oversize objects become a compact marker
-    node["args"] = [f"<{type(a).__name__}>" if (jv := _capture_value(a)) is _SKIP else jv for a in args]
+    start = perf_counter()
+    node["args"] = [_capture_positional(a) for a in args]
     node["kwargs"] = {k: jv for k, v in kwargs.items() if (jv := _capture_value(v)) is not _SKIP}
+    node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
 
 
 def _record_output(node: dict, result: Any) -> None:
@@ -599,13 +903,18 @@ def _record_output(node: dict, result: Any) -> None:
     ``node["result"]``; an unserializable result (``_SKIP``) becomes a
     ``"<TypeName>"`` marker so the fact that *something* was returned is kept.
 
+    Also accumulates onto ``node["capture_time"]`` — see :func:`_record_inputs`
+    for why.
+
     Args:
         node: The call-tree node to annotate in place.
         result: The value returned by the traced function.
     """
     if CAPTURE_IO:
+        start = perf_counter()
         jv = _capture_value(result)
         node["result"] = f"<{type(result).__name__}>" if jv is _SKIP else jv
+        node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
 
 
 def _exception_origin(exc: BaseException) -> dict | None:
@@ -694,16 +1003,21 @@ def _record_exception(node: dict, exc: BaseException) -> None:
     * ``node["exception_debug"]`` (see :func:`_exception_debug`) — the full, untruncated
       frame-by-frame traceback (plus any chained cause), for actually debugging the failure.
 
+    Also accumulates onto ``node["capture_time"]`` — see :func:`_record_inputs`
+    for why (walking a full traceback/cause chain isn't free either).
+
     Args:
         node: The call-tree node to annotate in place.
         exc: The exception raised out of the traced call (re-raised by the caller).
     """
     if CAPTURE_IO:
+        start = perf_counter()
         node["exception"] = _safe_repr(exc)
         origin = _exception_origin(exc)
         if origin is not None:
             node["exception_origin"] = origin
         node["exception_debug"] = _exception_debug(exc)
+        node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
 
 
 def _is_project_module(module: Any) -> bool:
@@ -1066,6 +1380,97 @@ def _make_profiler() -> Any:
     return profiler
 
 
+_HAS_MONITORING = hasattr(sys, "monitoring")
+
+
+def _try_install_monitoring() -> Any:
+    """Attempts the same instance-discovery hook via ``sys.monitoring`` (PEP
+    669, Python 3.12+) instead of ``sys.setprofile``. Returns a zero-arg
+    uninstall callable on success, or ``None`` if the tool slot can't be
+    claimed (already held by another profiler/coverage tool, or by another
+    concurrently-running perf trace on a different thread — see
+    :func:`_install_profiler` for why that's the graceful-degradation case,
+    not an error).
+
+    Any failure after claiming the tool id (register_callback/set_events
+    raising) frees it before returning ``None``, so a transient failure can't
+    permanently lock every future trace in this process out of the fast path.
+    """
+    m = sys.monitoring
+    tool_id = m.PROFILER_ID
+    try:
+        m.use_tool_id(tool_id, "perf")
+    except ValueError:
+        return None
+
+    def on_start(code: Any, instruction_offset: Any) -> None:
+        # PY_START hands (code, offset), not a frame -- unlike sys.setprofile,
+        # which hands the frame directly. `self` (when there is one) is
+        # already bound in locals by the time the function body starts.
+        self = sys._getframe(1).f_locals.get("self")
+        if self is not None:
+            _patch_instance(self)
+
+    def on_return(code: Any, instruction_offset: Any, retval: Any) -> None:
+        if code.co_name == "__init__":
+            self = sys._getframe(1).f_locals.get("self")
+            if self is not None:
+                _patch_instance(self)
+
+    try:
+        m.register_callback(tool_id, m.events.PY_START, on_start)
+        m.register_callback(tool_id, m.events.PY_RETURN, on_return)
+        m.set_events(tool_id, m.events.PY_START | m.events.PY_RETURN)
+    except Exception:
+        m.free_tool_id(tool_id)
+        return None
+
+    def uninstall() -> None:
+        try:
+            m.set_events(tool_id, 0)
+            m.register_callback(tool_id, m.events.PY_START, None)
+            m.register_callback(tool_id, m.events.PY_RETURN, None)
+        finally:
+            m.free_tool_id(tool_id)
+
+    return uninstall
+
+
+def _install_profiler() -> Any:
+    """Installs whichever instance-discovery hook is available, returning a
+    zero-arg callable that uninstalls it — call exactly once, in a
+    ``finally`` block (mirrors the old unconditional ``sys.setprofile(None)``).
+
+    Prefers ``sys.monitoring`` over ``sys.setprofile``: measured ~0 overhead
+    versus ``sys.setprofile``, whose per-call/return cost dominates a traced
+    call's total wall time even before any value capture happens (see
+    ``lab/research_monitoring*.py``). Falls back to ``sys.setprofile`` when
+    ``sys.monitoring`` isn't available (Python < 3.12) or its tool slot is
+    already claimed.
+
+    Two behavioural differences from ``sys.setprofile``, both accepted
+    trade-offs rather than oversights:
+
+    * ``sys.monitoring``'s tool registration is process-global, not
+      per-thread. Only one perf trace at a time can hold it — a second,
+      concurrently-running trace on another thread will fail to claim it and
+      fall back to ``sys.setprofile`` for itself, exactly today's behaviour,
+      rather than error or silently corrupt the first trace's hook.
+    * While active, it also fires for calls on OTHER threads doing unrelated
+      work, not just the traced call's own thread (unlike ``sys.setprofile``,
+      which is thread-scoped by design — see :func:`_make_profiler`'s note).
+      Harmless in measured practice (near-zero cost, and :func:`_patch_instance`
+      is idempotent/cached), but worth knowing if @trace runs inside one
+      thread of a busy multi-threaded process.
+    """
+    if _HAS_MONITORING:
+        uninstall = _try_install_monitoring()
+        if uninstall is not None:
+            return uninstall
+    sys.setprofile(_make_profiler())
+    return lambda: sys.setprofile(None)
+
+
 # ── timeout watchdog ──────────────────────────────────────────────────────────
 
 
@@ -1119,6 +1524,9 @@ _CONFIG_KEYS = frozenset(
         "CAPTURE_IO",
         "MAX_DEPTH",
         "MAX_SIZE_CAPTURE",
+        "SPILL_DIR",
+        "DEDUP_INSTANCES",
+        "DEDUP_CHECKPOINT_EVERY",
         "SKIP_FUNCTIONS",
         "SUPPRESS_ERRORS",
         "DEFAULT_RETURN",
@@ -1182,8 +1590,11 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                 _patch_all_project_classes()  # ← NEW
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
-                profiler = _make_profiler()
-                sys.setprofile(profiler)
+                # Fresh dedup cache for this trace only (or None to disable) --
+                # see _current_instances and _InstanceCache.
+                _current_instances.set(_InstanceCache(DEDUP_CHECKPOINT_EVERY) if DEDUP_INSTANCES else None)
+                _warn_if_spill_without_dedup()
+                _uninstall_profiler = _install_profiler()
                 _restart(root)  # setup above shouldn't count as the call's own time
                 try:
                     if TIMEOUT is not None:
@@ -1202,7 +1613,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     result = _compute_default_return(_default_factory)
                     _record_output(root, result)
                 finally:
-                    sys.setprofile(None)
+                    _uninstall_profiler()
                     print_tree(root)
                 return result
     else:
@@ -1213,8 +1624,11 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                 _patch_all_project_classes()  # ← NEW
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
-                profiler = _make_profiler()
-                sys.setprofile(profiler)
+                # Fresh dedup cache for this trace only (or None to disable) --
+                # see _current_instances and _InstanceCache.
+                _current_instances.set(_InstanceCache(DEDUP_CHECKPOINT_EVERY) if DEDUP_INSTANCES else None)
+                _warn_if_spill_without_dedup()
+                _uninstall_profiler = _install_profiler()
                 try:
                     with _sync_timeout(TIMEOUT, func.__qualname__):
                         _restart(root)  # setup above shouldn't count as the call's own time
@@ -1231,7 +1645,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     result = _compute_default_return(_default_factory)
                     _record_output(root, result)
                 finally:
-                    sys.setprofile(None)
+                    _uninstall_profiler()
                     print_tree(root)
                 return result
 
@@ -1428,12 +1842,23 @@ def _total(node: dict) -> float:
 
 
 def _self_time(node: dict) -> float:
-    """Wall time spent inside this node excluding its children (exclusive time)."""
+    """Wall time spent inside this node excluding its children (exclusive time).
+
+    Subtracts each child's FULL occupied window — its own execution
+    (``child["time"]``) PLUS its own capture (``child["capture_time"]``), not
+    execution alone. A child's wrapper doesn't return control to this node
+    until the child's own args/kwargs/result have been captured too, so that
+    time elapsed inside THIS node's measured window regardless — without this,
+    it would silently land in this node's self time instead of being
+    recognized as the child's capture cost, inflating every ancestor's
+    apparent "own work" by however much capture its descendants did.
+    """
     children = node["children"]
     t = node["time"] or 0
     if not children:
         return t
-    return max(t - _wall_from_intervals(children), 0.0)
+    occupied = [{"start": c.get("start", 0), "time": (c["time"] or 0) + c.get("capture_time", 0.0)} for c in children]
+    return max(t - _wall_from_intervals(occupied), 0.0)
 
 
 def _aggregate(root: dict) -> dict[str, dict]:
