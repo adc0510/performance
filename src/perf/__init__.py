@@ -454,7 +454,7 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     if _budget is not None and _budget[0] <= 0:
         return f"<{type(value).__name__} truncated: size limit reached>"
     try:
-        if isinstance(value, dict):
+        if isinstance(value, (dict, types.MappingProxyType)):
             seen = _seen | {id(value)}
             out = {}
             for k, v in value.items():
