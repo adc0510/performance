@@ -57,6 +57,7 @@ __all__ = [
     "OUTPUT_FILE",
     "SCAN_VENV",
     "SKIP_FUNCTIONS",
+    "SKIP_VARIABLES",
     "SPILL_DIR",
     "SUPPRESS_ERRORS",
     "TAGS",
@@ -122,6 +123,11 @@ _current_instances: ContextVar["_InstanceCache | None"] = ContextVar("_current_i
 def _is_skipped(name: str) -> bool:
     """Whether ``name`` matches an entry in SKIP_FUNCTIONS (glob-aware via fnmatch)."""
     return any(fnmatch(name, pattern) for pattern in SKIP_FUNCTIONS)
+
+
+def _is_skipped_variable(name: str) -> bool:
+    """Whether ``name`` matches an entry in SKIP_VARIABLES (glob-aware via fnmatch)."""
+    return bool(SKIP_VARIABLES) and any(fnmatch(name, pattern) for pattern in SKIP_VARIABLES)
 
 
 def _now_iso() -> str:
@@ -232,8 +238,25 @@ LOG_FUNCTIONS: list = []
 # needing to be listed themselves. Unlike LOG_FUNCTIONS, this affects
 # instrumentation itself (and therefore overhead and every output: stdout,
 # file, ENDPOINT_URL), not just what's kept when writing the tree out. Empty
-# (the default) disables it.
+# (the default) disables it. For excluding data BY NAME rather than whole
+# calls — e.g. redacting a field/kwarg/positional-arg named "_token" or
+# "password" from captured input/output — see SKIP_VARIABLES below instead.
 SKIP_FUNCTIONS: list = []
+# Blacklist of variable/field names to exclude from captured input/output data
+# (requires CAPTURE_IO). Matched with fnmatch against every dict key
+# encountered while converting a value — kwargs names, an instance's __dict__
+# field names (e.g. "self._token"), and nested dict keys anywhere inside a
+# captured arg/kwarg/result/exception — so glob patterns work too (e.g. "_*"
+# to drop every leading-underscore field, or "*password*", "*secret*"). A
+# matched key's value is dropped entirely (not even converted) rather than
+# replaced with a marker, so redacted data never touches perf.json/stdout/
+# ENDPOINT_URL. Positional (non-keyword) call arguments are matched by their
+# parameter name, resolved from the function's own signature — a positional
+# arg whose name matches is captured as a "<skipped:name>" marker (its slot is
+# kept so later positional args don't shift). Unlike SKIP_FUNCTIONS, this
+# doesn't affect what's instrumented/timed, only what's captured. Empty (the
+# default) disables it.
+SKIP_VARIABLES: list = []
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
 # disables it — set it to opt in (e.g. "http://localhost:7999/api/traces").
@@ -435,6 +458,8 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
             seen = _seen | {id(value)}
             out = {}
             for k, v in value.items():
+                if isinstance(k, str) and _is_skipped_variable(k):
+                    continue
                 if _budget is not None and _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget)
@@ -611,7 +636,16 @@ class _InstanceCache:
         oid = id(obj)
         entry = self._entries.get(oid)
         if entry is None or entry["ref"]() is not obj:
-            ref = weakref.ref(obj, self._on_die(oid))
+            try:
+                ref = weakref.ref(obj, self._on_die(oid))
+            except TypeError:
+                # `obj`'s class doesn't support weak references (e.g. a
+                # __slots__ class with no __weakref__ slot). Dedup can't
+                # safely track this instance's identity across calls, so
+                # skip caching it -- every call for it just gets a full
+                # snapshot, same as DEDUP_INSTANCES being off for this one
+                # object. Telemetry must never break the traced call.
+                return {"__full__": full_output}
             seq = self._next_seq
             self._next_seq += 1
             self._entries[oid] = {"ref": ref, "last": comparable_snapshot, "since_checkpoint": 0, "seq": seq}
@@ -806,6 +840,30 @@ def _resolve_return_annotation(func: Any) -> Any:
         return inspect.Signature.empty
 
 
+def _resolve_param_names(func: Any) -> tuple:
+    """Resolve `func`'s positional parameter names, in call order, for :data:`SKIP_VARIABLES`.
+
+    Used by :func:`_sync_wrap`/:func:`_async_wrap` to precompute (once per
+    wrap, not per call) the names :func:`_record_inputs` matches against
+    positional call arguments — e.g. so a method's ``self`` or a parameter
+    named ``_token`` can be redacted by name the same way a kwarg is.
+    ``VAR_POSITIONAL``/``VAR_KEYWORD``/keyword-only params are excluded since
+    they either don't correspond to a single positional slot or never appear
+    in `args`. Falls back to an empty tuple if the signature can't be read
+    (e.g. some C-defined callables) — SKIP_VARIABLES then simply can't match
+    positional args for that callable, same as before this existed.
+    """
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (ValueError, TypeError):
+        return ()
+    return tuple(
+        p.name
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+
+
 def _capture_positional(a: Any) -> Any:
     """Capture one positional argument, routing rich objects through the
     current trace's dedup cache when :data:`DEDUP_INSTANCES` is on.
@@ -844,25 +902,34 @@ def _capture_positional(a: Any) -> Any:
     """
     cache = _current_instances.get() if DEDUP_INSTANCES else None
     if cache is not None and hasattr(a, "__dict__") and vars(a):
-        # Cheap, per-field-budgeted snapshot -- computed every call, used both
-        # as this call's diff source AND as the comparison baseline stored for
-        # NEXT time (see record_full's docstring for why a full call's
-        # possibly-spilled *output* must never be what's stored for diffing).
-        comparable = {
-            k: _jsonable(v, _budget=([MAX_SIZE_CAPTURE] if MAX_SIZE_CAPTURE is not None else None))
-            for k, v in vars(a).items()
-        }
-        if cache.needs_full(a):
-            full_output = _capture_value(vars(a))
-            if not isinstance(full_output, dict):
-                full_output = {"__value__": full_output}
-            return cache.record_full(a, full_output, comparable)
-        return cache.record_diff(a, comparable)
+        try:
+            # Cheap, per-field-budgeted snapshot -- computed every call, used
+            # both as this call's diff source AND as the comparison baseline
+            # stored for NEXT time (see record_full's docstring for why a
+            # full call's possibly-spilled *output* must never be what's
+            # stored for diffing).
+            comparable = {
+                k: _jsonable(v, _budget=([MAX_SIZE_CAPTURE] if MAX_SIZE_CAPTURE is not None else None))
+                for k, v in vars(a).items()
+                if not (isinstance(k, str) and _is_skipped_variable(k))
+            }
+            if cache.needs_full(a):
+                full_output = _capture_value(vars(a))
+                if not isinstance(full_output, dict):
+                    full_output = {"__value__": full_output}
+                return cache.record_full(a, full_output, comparable)
+            return cache.record_diff(a, comparable)
+        except Exception:
+            # Dedup is an optimization, not a requirement -- e.g. `a`'s
+            # __dict__ being mutated by another task mid-iteration
+            # (RuntimeError) must never surface as if the traced call
+            # itself failed. Fall through to a plain, independent capture.
+            pass
     jv = _capture_value(a)
     return f"<{type(a).__name__}>" if jv is _SKIP else jv
 
 
-def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
+def _record_inputs(node: dict, args: tuple, kwargs: dict, param_names: tuple = ()) -> None:
     """Attach a JSON-safe snapshot of a call's arguments to its node.
 
     No-op unless :data:`CAPTURE_IO` is on. Positional args keep their index in
@@ -873,6 +940,15 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
     :func:`_capture_positional` instead (full snapshot or diff, see
     :class:`_InstanceCache`). Keyword args go to ``node["kwargs"]``, where
     skipped values are dropped entirely rather than marked.
+
+    :data:`SKIP_VARIABLES` redacts by name: a keyword arg whose name matches
+    is dropped from ``node["kwargs"]`` entirely (never even converted). A
+    positional arg's name is looked up via `param_names` (the wrapped
+    function's own signature, resolved once per wrap — see
+    :func:`_sync_wrap`/:func:`_async_wrap`); a match replaces that slot with a
+    ``"<skipped:name>"`` marker instead of omitting it, since positional args
+    are order-sensitive and omitting one would shift every later arg's
+    apparent index.
 
     Also accumulates onto ``node["capture_time"]`` — the wall time this call
     spent capturing (as opposed to running). This node's own ``time`` (stamped
@@ -887,12 +963,26 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict) -> None:
         node: The call-tree node to annotate in place.
         args: The positional arguments the traced function was called with.
         kwargs: The keyword arguments the traced function was called with.
+        param_names: The wrapped function's positional parameter names, in
+            order (as many as could be resolved), used only to match
+            SKIP_VARIABLES against positional args by name.
     """
     if not CAPTURE_IO:
         return
     start = perf_counter()
-    node["args"] = [_capture_positional(a) for a in args]
-    node["kwargs"] = {k: jv for k, v in kwargs.items() if (jv := _capture_value(v)) is not _SKIP}
+    captured = []
+    for i, a in enumerate(args):
+        pname = param_names[i] if i < len(param_names) else None
+        if pname is not None and _is_skipped_variable(pname):
+            captured.append(f"<skipped:{pname}>")
+        else:
+            captured.append(_capture_positional(a))
+    node["args"] = captured
+    node["kwargs"] = {
+        k: jv
+        for k, v in kwargs.items()
+        if not _is_skipped_variable(k) and (jv := _capture_value(v)) is not _SKIP
+    }
     node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
 
 
@@ -1251,6 +1341,7 @@ def _sync_wrap(func: Any, name: str) -> Any:
         A ``functools.wraps``-preserving wrapper with the same signature.
     """
     default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
+    param_names = _resolve_param_names(func)
 
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -1268,12 +1359,12 @@ def _sync_wrap(func: Any, name: str) -> Any:
         try:
             result = func(*args, **kwargs)
             _finish_node(node)
-            _record_inputs(node, args, kwargs)
+            _record_inputs(node, args, kwargs, param_names)
             _record_output(node, result)
             return result
         except BaseException as exc:
             _finish_node(node)
-            _record_inputs(node, args, kwargs)
+            _record_inputs(node, args, kwargs, param_names)
             _record_exception(node, exc)
             if not SUPPRESS_ERRORS:
                 raise
@@ -1308,6 +1399,7 @@ def _async_wrap(func: Any, name: str) -> Any:
         A ``functools.wraps``-preserving async wrapper with the same signature.
     """
     default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
+    param_names = _resolve_param_names(func)
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
@@ -1325,12 +1417,12 @@ def _async_wrap(func: Any, name: str) -> Any:
         try:
             result = await func(*args, **kwargs)
             _finish_node(node)
-            _record_inputs(node, args, kwargs)
+            _record_inputs(node, args, kwargs, param_names)
             _record_output(node, result)
             return result
         except BaseException as exc:
             _finish_node(node)
-            _record_inputs(node, args, kwargs)
+            _record_inputs(node, args, kwargs, param_names)
             _record_exception(node, exc)
             if not SUPPRESS_ERRORS:
                 raise
@@ -1581,6 +1673,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
     _check_overrides(overrides)
 
     _default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
+    _param_names = _resolve_param_names(func)
 
     if inspect.iscoroutinefunction(func):
 
@@ -1602,11 +1695,11 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     else:
                         result = await func(*args, **kwargs)
                     _finish_node(root)
-                    _record_inputs(root, args, kwargs)
+                    _record_inputs(root, args, kwargs, _param_names)
                     _record_output(root, result)
                 except BaseException as exc:
                     _finish_node(root)
-                    _record_inputs(root, args, kwargs)
+                    _record_inputs(root, args, kwargs, _param_names)
                     _record_exception(root, exc)
                     if not SUPPRESS_ERRORS:
                         raise
@@ -1634,11 +1727,11 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                         _restart(root)  # setup above shouldn't count as the call's own time
                         result = func(*args, **kwargs)
                         _finish_node(root)
-                    _record_inputs(root, args, kwargs)
+                    _record_inputs(root, args, kwargs, _param_names)
                     _record_output(root, result)
                 except BaseException as exc:
                     _finish_node(root)
-                    _record_inputs(root, args, kwargs)
+                    _record_inputs(root, args, kwargs, _param_names)
                     _record_exception(root, exc)
                     if not SUPPRESS_ERRORS:
                         raise
