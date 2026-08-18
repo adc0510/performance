@@ -481,6 +481,21 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
             return _jsonable(value.model_dump(), depth + 1, _seen | {id(value)}, _budget)
         if hasattr(value, "dict") and callable(value.dict):  # pydantic v1
             return _jsonable(value.dict(), depth + 1, _seen | {id(value)}, _budget)
+        # functions/methods/builtins: no useful __dict__ to unpack (and a
+        # bound method's __func__ may carry unrelated noise like __wrapped__
+        # from being auto-instrumented) -- describe identity instead of
+        # falling through to a raw "<bound method ... at 0x...>" repr.
+        if inspect.isroutine(value):
+            is_method = inspect.ismethod(value)
+            func = value.__func__ if is_method else value
+            info: dict = {
+                "__type__": "method" if is_method else "function",
+                "qualname": getattr(func, "__qualname__", getattr(func, "__name__", None)),
+                "module": getattr(func, "__module__", None),
+            }
+            if is_method:
+                info["self_type"] = type(value.__self__).__name__
+            return info
         if hasattr(value, "__dict__") and vars(value):
             seen = _seen | {id(value)}
             return {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1, seen, _budget)}
