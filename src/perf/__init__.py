@@ -319,6 +319,7 @@ _SCAN_INCLUDE_PREFIXES: tuple = ()
 # Modules to always skip, even when SCAN_VENV is True. Patching these recurses
 # through the profiler/logging path and produces endless "--- Logging error ---".
 _SKIP_MODULE_PREFIXES = (
+    "_pydev_bundle",
     "_pydevd",
     "pydevd",
     "debugpy",
