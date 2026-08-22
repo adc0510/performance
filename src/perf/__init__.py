@@ -40,7 +40,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.5.0"
+__version__ = "0.6.3"
 __all__ = [
     "API_KEY",
     "CAPTURE_IO",
@@ -304,6 +304,17 @@ _patched_classes: set = set()
 # turns that hot path into one set lookup instead of a per-call filesystem path
 # resolution, which otherwise inflates and destabilises CPU-bound self times.
 _skip_classes: set = set()
+
+# Maps id(original_function) -> (original_function, wrapped_function) for every
+# free function wrapped by _patch_module_functions. A function patched in its
+# defining module stays unwrapped under any name it was re-exported to via
+# ``from module import func`` — that import copies the reference into the
+# importing module's namespace *before* patching runs, so rebinding the name in
+# the defining module never touches the importer's own binding. This map lets
+# _patch_reexported_names find and fix up those other bindings afterwards. The
+# tuple keeps the original alive so its id can't be recycled by an unrelated
+# object while the map is in use.
+_wrapped_originals: dict = {}
 
 # When True, modules living under stdlib/site-packages are also instrumented.
 # Default False: only project code is traced (recommended — patching stdlib
@@ -1226,6 +1237,41 @@ def _patch_module_functions(module: Any) -> None:
                 wrapped = _sync_wrap(attr, f"{module.__name__}.{name}")
             wrapped._perf_wrapped = True  # type: ignore
             setattr(module, name, wrapped)
+            _wrapped_originals[id(attr)] = (attr, wrapped)
+        except (TypeError, AttributeError):
+            continue
+
+
+def _patch_reexported_names(module: Any) -> None:
+    """Fix up bindings of functions re-exported via ``from other import func``.
+
+    :func:`_patch_module_functions` only rebinds a wrapped function in the
+    module that *defines* it. A module that imported the original by name
+    (``from other import func``) holds its own separate reference to the
+    pre-wrap function object, unaffected by that rebind. This walks a module's
+    namespace and, for any attribute that's an original tracked in
+    :data:`_wrapped_originals`, rebinds it to the wrapped version too.
+
+    Must run after every defining module has already been passed through
+    :func:`_patch_module_functions`, so the map is fully populated first.
+
+    Args:
+        module: A module already judged to be project code.
+    """
+    if module.__name__ == __name__:
+        return
+    for name in list(vars(module)):
+        if name.startswith("_"):
+            continue
+        try:
+            attr = vars(module)[name]
+        except Exception:
+            continue
+        entry = _wrapped_originals.get(id(attr))
+        if entry is None or attr is not entry[0]:
+            continue
+        try:
+            setattr(module, name, entry[1])
         except (TypeError, AttributeError):
             continue
 
@@ -1315,9 +1361,8 @@ def _patch_all_project_classes() -> None:
     (:func:`_patch_class`). Instances created *during* the call are picked up
     separately by the ``setprofile`` hook.
     """
-    for module in list(sys.modules.values()):
-        if module is None or not _is_project_module(module):
-            continue
+    project_modules = [m for m in sys.modules.values() if m is not None and _is_project_module(m)]
+    for module in project_modules:
         _patch_module_functions(module)  # ← NEW
         for attr_name in list(vars(module)):
             try:
@@ -1326,6 +1371,11 @@ def _patch_all_project_classes() -> None:
                 continue
             if isinstance(attr, type) and attr.__module__ == module.__name__:
                 _patch_class(attr)
+    # Second pass: fix up `from other import func` bindings now that every
+    # defining module's own functions have been wrapped (see
+    # _patch_reexported_names).
+    for module in project_modules:
+        _patch_reexported_names(module)
 
 
 # ── sync / async node wrappers ────────────────────────────────────────────────
