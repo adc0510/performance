@@ -40,7 +40,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 __all__ = [
     "API_KEY",
     "CAPTURE_IO",
@@ -488,11 +488,17 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                 if jv is not _SKIP:
                     out.append(jv)
             return out
-        # pydantic models, dataclasses, and other rich objects
+        # pydantic models, dataclasses, and other rich objects. exclude_none
+        # drops fields that are unset (Optional[...] = None) rather than
+        # carrying an explicit null for every one of them -- schemas like a
+        # BaseModel with a couple dozen optional fields (e.g. most of them
+        # None on any given instance) would otherwise dump every single field
+        # name every single time the model flows through a traced call,
+        # which is what actually blows up perf.json's size, not depth.
         if hasattr(value, "model_dump"):  # pydantic v2
-            return _jsonable(value.model_dump(), depth + 1, _seen | {id(value)}, _budget)
+            return _jsonable(value.model_dump(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
         if hasattr(value, "dict") and callable(value.dict):  # pydantic v1
-            return _jsonable(value.dict(), depth + 1, _seen | {id(value)}, _budget)
+            return _jsonable(value.dict(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
         # functions/methods/builtins: no useful __dict__ to unpack (and a
         # bound method's __func__ may carry unrelated noise like __wrapped__
         # from being auto-instrumented) -- describe identity instead of
