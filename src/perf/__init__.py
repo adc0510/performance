@@ -2201,7 +2201,7 @@ def _send_trace(root: dict) -> None:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 resp.read()
         except Exception as e:  # never let telemetry break the traced call
             print(f"[perf] failed to POST trace to {ENDPOINT_URL}: {e}", file=sys.stderr)
