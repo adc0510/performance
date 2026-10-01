@@ -39,7 +39,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.6.5"
+__version__ = "0.6.6"
 __all__ = [
     "API_KEY",
     "CAPTURE_IO",
@@ -611,14 +611,18 @@ class _ValuePool:
     pooled values can't leak into another's.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, prefix: str = "") -> None:
+        # `prefix` namespaces this pool's refs -- a worker process's pool
+        # (see _RemoteCall) gets a unique one so its variables can be merged
+        # into the parent trace's pool without colliding with "v0", "v1", ….
         self.ref_by_id: dict[int, str] = {}
         self.variables: dict[str, Any] = {}
         self._keepalive: list = []
+        self._prefix = prefix
         self._next = 0
 
     def register(self, value: Any, converted: Any) -> dict:
-        ref = f"v{self._next}"
+        ref = f"{self._prefix}v{self._next}"
         self._next += 1
         self.ref_by_id[id(value)] = ref
         self.variables[ref] = converted
@@ -1615,6 +1619,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         async def wrapper(*args, **kwargs) -> Any:  # type: ignore
             with _apply_overrides(overrides):
                 _patch_all_project_classes()  # ← NEW
+                _install_executor_hook()
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
                 # Fresh value pool for this trace only -- see _current_pool
@@ -1648,6 +1653,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         def wrapper(*args, **kwargs) -> Any:
             with _apply_overrides(overrides):
                 _patch_all_project_classes()  # ← NEW
+                _install_executor_hook()
                 root = make_node(func.__qualname__)
                 _current_node.set(root)
                 # Fresh value pool for this trace only -- see _current_pool
@@ -1675,6 +1681,227 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                 return result
 
     return wrapper
+
+
+# ── ProcessPoolExecutor: trace work submitted to other processes ──────────────
+# A function handed to ProcessPoolExecutor.submit runs in a worker process,
+# where none of this process's patching or _current_node exists (under
+# "spawn"/"forkserver" the worker re-imports project modules unpatched; even
+# under "fork" its nodes would land in the worker's own memory). So while a
+# trace is active, submit() ships the call wrapped in a _RemoteCall, which
+# traces it inside the worker and sends its subtree back alongside the result;
+# the parent then grafts that subtree under the node that called submit().
+# perf_counter() is system-wide monotonic on Linux/macOS/Windows, so the
+# worker's start/end stamps share the parent's timeline.
+
+# Config the worker needs to instrument/capture the same way the parent does.
+# Output/sending config is deliberately absent: the worker never prints or
+# sends anything itself — its subtree is emitted as part of the parent's trace.
+_REMOTE_CONFIG_KEYS = (
+    "SCAN_VENV",
+    "_SCAN_INCLUDE_PREFIXES",
+    "CAPTURE_IO",
+    "MAX_DEPTH",
+    "MAX_SIZE_CAPTURE",
+    "SPILL_DIR",
+    "SKIP_FUNCTIONS",
+    "SKIP_VARIABLES",
+    "SUPPRESS_ERRORS",
+    "DEFAULT_RETURN",
+)
+
+
+def _remote_config() -> dict:
+    """Snapshot of the config the worker should trace with.
+
+    ``DEFAULT_RETURN`` is left out when unset (``_UNSET`` is a per-process
+    sentinel — a pickled copy would no longer be identical to the worker's)
+    or unpicklable (e.g. a lambda), since one unpicklable value would make
+    the whole submission fail rather than just lose that setting.
+    """
+    import pickle
+
+    config = {}
+    for key in _REMOTE_CONFIG_KEYS:
+        value = globals()[key]
+        if key == "DEFAULT_RETURN":
+            if value is _UNSET:
+                continue
+            try:
+                pickle.dumps(value)
+            except Exception:
+                continue
+        config[key] = value
+    return config
+
+
+def _remote_name(fn: Any) -> str:
+    """The node name the patched wrapper of `fn` would have used locally:
+    ``module.func`` for a free function, ``Class.method`` for a method."""
+    func = fn.__func__ if inspect.ismethod(fn) else fn
+    qualname = getattr(func, "__qualname__", None) or type(fn).__name__
+    if inspect.isfunction(func) and "." not in qualname:
+        return f"{func.__module__}.{qualname}"
+    return qualname
+
+
+class _RemoteOutcome:
+    """What a :class:`_RemoteCall` sends back: the call's real `result` plus
+    the worker-side subtree (`children`) and the pool `variables` it refers
+    to. On failure the same object rides back on the exception instead, as
+    its ``_perf_remote`` attribute."""
+
+    def __init__(self, result: Any, children: list, variables: dict) -> None:
+        self.result = result
+        self.children = children
+        self.variables = variables
+
+
+class _RemoteCall:
+    """Picklable stand-in for `fn` that traces it inside a worker process.
+
+    Pickled by reference (``perf._RemoteCall``) like any module-level class,
+    so the worker just needs ``perf`` importable — which it is, since the
+    parent imported it.
+    """
+
+    def __init__(self, fn: Any, name: str, config: dict) -> None:
+        self.fn = fn
+        self.name = name
+        self.config = config
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "_RemoteOutcome":
+        # A fresh, empty Context: the worker's own state (if it is itself
+        # inside some unrelated trace) can't leak in, and nothing set here
+        # outlives the call.
+        import contextvars
+
+        return contextvars.Context().run(self._run, args, kwargs)
+
+    def _run(self, args: tuple, kwargs: dict) -> "_RemoteOutcome":
+        import uuid
+
+        g = globals()
+        saved = {k: g[k] for k in self.config}
+        g.update(self.config)
+        try:
+            _install_executor_hook()  # nested pools inside the worker get traced too
+            _patch_all_project_classes()
+            holder = make_node(self.name)
+            pool = _ValuePool(prefix=f"{uuid.uuid4().hex[:8]}_") if CAPTURE_IO else None
+            _current_node.set(holder)
+            _current_pool.set(pool)
+            # Unpickled by name, `fn` is the original on this worker's first
+            # task (its module wasn't patched yet) but already the wrapper on
+            # later ones — wrap it only when it isn't, so it gets one node.
+            # Non-function callables (e.g. the functools.partial that
+            # Executor.map submits per chunk) get no node of their own; the
+            # project calls they make attach straight to the parent.
+            fn = self.fn
+            if not getattr(fn, "_perf_wrapped", False) and (inspect.isfunction(fn) or inspect.ismethod(fn)):
+                fn = _sync_wrap(fn, self.name)
+            uninstall_profiler = _install_profiler()
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                try:
+                    exc._perf_remote = _RemoteOutcome(None, holder["children"], pool.variables if pool else {})
+                except Exception:
+                    pass  # an exception type that rejects attributes just loses its subtree
+                raise
+            finally:
+                uninstall_profiler()
+            return _RemoteOutcome(result, holder["children"], pool.variables if pool else {})
+        finally:
+            g.update(saved)
+
+
+def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None") -> None:
+    """Unwraps a finished remote future in place: swaps the
+    :class:`_RemoteOutcome` in its result for the real result (or strips it
+    off its exception), and attaches the worker subtree under `parent`.
+    Runs at most once per future (see :func:`_traced_submit`)."""
+    if future.cancelled():
+        return
+    exc = future._exception
+    if exc is not None:
+        outcome = exc.__dict__.pop("_perf_remote", None)
+    else:
+        outcome = future._result
+        if not isinstance(outcome, _RemoteOutcome):
+            return
+        future._result = outcome.result
+    if not isinstance(outcome, _RemoteOutcome):
+        return
+    if pool is not None:
+        pool.variables.update(outcome.variables)
+    parent["children"].extend(outcome.children)
+
+
+_original_process_submit: Any = None
+
+
+def _traced_submit(self: Any, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Replacement for ``ProcessPoolExecutor.submit``.
+
+    Outside a trace (or under a SKIP_FUNCTIONS call) it's a plain
+    pass-through. Inside one, `fn` is sent as a :class:`_RemoteCall` and the
+    returned future is unwrapped before anyone can observe the
+    :class:`_RemoteOutcome`: by a done-callback as soon as it completes, and
+    — since waiters in ``result()``/``exception()`` can wake before
+    done-callbacks run — by instance-level ``result``/``exception``
+    overrides too. Both paths go through one lock-guarded, run-once
+    :func:`_graft_remote`. Overriding the *reading* side (rather than the
+    executor's ``set_result``) is what makes this race-free: nobody can read
+    the future before submit() returns it.
+    """
+    parent = _current_node.get()
+    if parent is None or _skip_depth.get():
+        return _original_process_submit(self, fn, *args, **kwargs)
+
+    future = _original_process_submit(self, _RemoteCall(fn, _remote_name(fn), _remote_config()), *args, **kwargs)
+    pool = _current_pool.get()
+    lock = threading.Lock()
+    grafted = False
+
+    def absorb(f: Any) -> None:
+        nonlocal grafted
+        with lock:
+            if not grafted:
+                grafted = True
+                _graft_remote(f, parent, pool)
+
+    original_result, original_exception = future.result, future.exception
+
+    def result(timeout: float | None = None) -> Any:
+        original_exception(timeout)  # waits; raises CancelledError/TimeoutError like result()
+        absorb(future)
+        return original_result()
+
+    def exception(timeout: float | None = None) -> Any:
+        original_exception(timeout)
+        absorb(future)
+        return original_exception()
+
+    future.result = result
+    future.exception = exception
+    future.add_done_callback(absorb)
+    return future
+
+
+def _install_executor_hook() -> None:
+    """Route ``ProcessPoolExecutor.submit`` through :func:`_traced_submit`
+    (once per process). Patched on the class, so it covers executors created
+    before the trace started, subclasses, and ``Executor.map`` (built on
+    submit). Deferred until the first trace so merely importing perf doesn't
+    pull in multiprocessing."""
+    global _original_process_submit
+    if _original_process_submit is not None:
+        return
+    from concurrent.futures import ProcessPoolExecutor
+
+    _original_process_submit = ProcessPoolExecutor.submit
+    ProcessPoolExecutor.submit = _traced_submit
 
 
 # ── collapse / merge helpers ─────────────────────────────────────────────────
