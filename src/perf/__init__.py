@@ -20,8 +20,14 @@ below.
 
 import asyncio
 import atexit
+import contextvars
 import dataclasses
+import enum
+import functools
+import hashlib
 import inspect
+import itertools
+import json as _json
 import re
 import signal
 import sys
@@ -39,7 +45,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.6.6"
+__version__ = "0.7.0"
 __all__ = [
     "API_KEY",
     "CAPTURE_IO",
@@ -116,25 +122,130 @@ _skip_depth: ContextVar[int] = ContextVar("_skip_depth", default=0)
 _current_pool: ContextVar["_ValuePool | None"] = ContextVar("_current_pool", default=None)
 
 
+class _TraceState:
+    """Lifecycle of one top-level trace, shared by everything recording into it.
+
+    Work can run on other threads (see the thread hooks) and may still be
+    running when the trace ends and its tree is written out. ``lock`` guards
+    every change to the shared tree and value pool, and once ``open`` is False
+    (set under the lock, right before the trace is emitted) nothing touches
+    them again: a call still running at that moment stays unfinished
+    (``time: null``) in the output — which is exactly what it was.
+    """
+
+    __slots__ = ("lock", "open", "graft_tokens")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.open = True
+        self.graft_tokens: list = []
+
+    def close(self) -> None:
+        with self.lock:
+            self.open = False
+        for token in self.graft_tokens:
+            _pool_grafts.pop(token, None)
+
+    def attach(self, parent: dict, node: dict) -> bool:
+        """Link `node` under `parent` — unless the trace already closed."""
+        with self.lock:
+            if not self.open:
+                return False
+            parent["children"].append(node)
+            return True
+
+    def complete(self, node: dict, fields: dict) -> None:
+        """Apply a finished call's fields to its (already attached) node."""
+        if "capture_time" in fields:
+            fields["capture_time"] = round(fields["capture_time"], _TIME_DECIMALS)
+        with self.lock:
+            if self.open:
+                node.update(fields)
+
+
+# The current top-level trace's state — None outside any trace.
+_current_trace: ContextVar["_TraceState | None"] = ContextVar("_current_trace", default=None)
+
+
+# >0 while perf itself is converting a captured value: user code that runs as
+# a side effect of capture (a property read, __getattr__, a pydantic
+# model_dump) must not be recorded as if the program had called it.
+_capturing: ContextVar[int] = ContextVar("_capturing", default=0)
+
+
+def _recording() -> "tuple[dict, _TraceState] | None":
+    """(current node, trace state) if calls should be recorded right now."""
+    parent = _current_node.get()
+    if parent is None or _capturing.get():
+        return None
+    state = _current_trace.get()
+    if state is None or not state.open:
+        return None
+    return parent, state
+
+
+def _completion(node: dict) -> dict:
+    """The fields a call adds when it ends — built privately, then applied
+    in one step under the trace lock (see :meth:`_TraceState.complete`)."""
+    fields = {"time": round(perf_counter() - node["start"], _TIME_DECIMALS)}
+    if "capture_time" in node:
+        fields["capture_time"] = node["capture_time"]
+    return fields
+
+
+# Per-trace config overrides (``@trace(MIN_PCT=..., OUTPUT_FILE=...)``),
+# context-local so that concurrently running traces -- on other threads, or as
+# other asyncio tasks -- each see only their own overrides. Work a trace hands
+# to a copied context (asyncio tasks, ``to_thread``) inherits them.
+_overrides: ContextVar["dict | None"] = ContextVar("_overrides", default=None)
+_G = globals()
+
+
+class _Config:
+    """Effective config: the current context's override for a setting if any,
+    else the module-level value (``perf.MIN_PCT = ...``). Every config read in
+    this module goes through the ``_cfg`` instance."""
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        overrides = _overrides.get()
+        if overrides is not None and name in overrides:
+            return overrides[name]
+        return _G[name]
+
+
+_cfg = _Config()
+
+
 def _is_skipped(name: str) -> bool:
     """Whether ``name`` matches an entry in SKIP_FUNCTIONS (glob-aware via fnmatch)."""
-    return any(fnmatch(name, pattern) for pattern in SKIP_FUNCTIONS)
+    return any(fnmatch(name, pattern) for pattern in _cfg.SKIP_FUNCTIONS)
 
 
 def _is_skipped_variable(name: str) -> bool:
     """Whether ``name`` matches an entry in SKIP_VARIABLES (glob-aware via fnmatch)."""
-    return bool(SKIP_VARIABLES) and any(fnmatch(name, pattern) for pattern in SKIP_VARIABLES)
+    return bool(_cfg.SKIP_VARIABLES) and any(fnmatch(name, pattern) for pattern in _cfg.SKIP_VARIABLES)
 
 
 def _now_iso() -> str:
     """Current local wall-clock time as an ISO-8601 string with offset and microseconds.
 
-    ``perf_counter()`` (used for ``start``/``end``/``time``) is monotonic but
-    has no meaningful absolute epoch, so it can't tell a reader *when* a call
-    happened — only how long it took. This gives ``start_timestamp``/
-    ``end_timestamp`` an absolute, human-readable wall-clock value instead.
+    ``perf_counter()`` (used for ``start``/``time``) is monotonic but has no
+    meaningful absolute epoch, so it can't tell a reader *when* a call
+    happened — only how long it took. The ROOT node alone carries
+    ``start_timestamp``/``end_timestamp`` from this; any other node's
+    wall-clock start is ``root.start_timestamp + (node.start - root.start)``
+    seconds, so stamping every node would only repeat that (and cost two
+    clock reads + formats per call).
     """
     return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+# Durations and timeline positions are rounded to this many decimals (1 ns):
+# perf_counter() has no meaningful precision beyond it, and the full 17-digit
+# repr of every float was a large share of every written trace.
+_TIME_DECIMALS = 9
 
 
 def make_node(name: str) -> dict:
@@ -144,62 +255,40 @@ def make_node(name: str) -> dict:
     unset (``None``) — the wrapper fills it in with the measured wall duration
     when the call returns — and ``start`` set to the current ``perf_counter()``
     so overlap-aware wall math (:func:`_wall_from_intervals`) can later place it
-    on the timeline. ``start_timestamp`` records the same instant as an
-    absolute, human-readable wall-clock time. Input/output values (``args``,
-    ``kwargs``, ``result``, ``exception``) and aggregate fields (``cumulative``,
-    ``count``) are attached lazily by other helpers and are absent here.
+    on the timeline (its end is ``start + time``). Input/output values
+    (``args``, ``kwargs`` — only when non-empty —, ``result``, ``exception``)
+    and aggregate fields (``cumulative``, ``count``) are attached lazily by
+    other helpers and are absent here. Wall-clock timestamps live on the root
+    only (see :func:`_now_iso`).
 
     Args:
         name: Display label for the node, e.g. ``"Class.method"`` or a
             ``module.function`` qualname.
 
     Returns:
-        A dict with keys ``name``, ``time`` (``None``), ``start``,
-        ``start_timestamp``, ``end`` (``None``), ``end_timestamp`` (``None``),
-        ``children``. ``end``/``end_timestamp`` are pre-seeded here (rather than
-        only added by :func:`_finish_node`) purely to fix their key order in the
-        written JSON: dicts preserve insertion order, so seeding them right
-        after ``start``/``start_timestamp`` keeps the pairs adjacent instead of
-        landing after ``children`` once :func:`_finish_node` later assigns them.
+        A dict with keys ``name``, ``time`` (``None``), ``start``, ``children``.
     """
-    return {
-        "name": name,
-        "time": None,
-        "start": perf_counter(),
-        "start_timestamp": _now_iso(),
-        "end": None,
-        "end_timestamp": None,
-        "children": [],
-    }
+    # `start` is re-stamped (and rounded) by _restart right before the call runs.
+    return {"name": name, "time": None, "start": perf_counter(), "children": []}
 
 
 def _finish_node(node: dict) -> None:
-    """Stamp a node's wall ``time``, ``end``, and ``end_timestamp`` now that its call has returned.
-
-    ``end`` is ``start + time`` — the wall-clock (monotonic) moment the call
-    finished — stored alongside ``start`` so a written trace shows both
-    endpoints of the call instead of just start + duration. ``end_timestamp``
-    is the same instant as an absolute, human-readable wall-clock time.
-    """
-    node["time"] = perf_counter() - node["start"]
-    node["end"] = node["start"] + node["time"]
-    node["end_timestamp"] = _now_iso()
+    """Stamp a node's wall ``time`` now that its call has returned."""
+    node["time"] = round(perf_counter() - node["start"], _TIME_DECIMALS)
 
 
 def _restart(node: dict) -> None:
-    """Re-stamp a node's ``start``/``start_timestamp`` right before the traced call actually begins.
+    """Re-stamp a node's ``start`` right before the traced call actually begins.
 
-    :func:`make_node` stamps ``start`` at node creation, but the ``trace()``
-    entry-point wrapper does real setup after that — installing the
-    ``sys.setprofile`` hook — before the wrapped
-    function runs. Left alone, that setup cost would be counted as part of the
-    root node's time. Calling this right before invoking the wrapped function
-    moves ``start``/``start_timestamp`` to the true beginning of the call, so
-    setup overhead is excluded the same way capture overhead is excluded by
-    :func:`_finish_node`.
+    :func:`make_node` stamps ``start`` at node creation, but there is real work
+    between that and the call itself — input capture in every node wrapper,
+    plus installing the profiler hook for a ``trace()`` root. Left alone, it
+    would be counted as part of the node's own time. Calling this right before
+    invoking the wrapped function moves ``start`` to the true beginning of the
+    call, so that overhead is excluded the same way output capture is excluded
+    by :func:`_finish_node`.
     """
-    node["start"] = perf_counter()
-    node["start_timestamp"] = _now_iso()
+    node["start"] = round(perf_counter(), _TIME_DECIMALS)
 
 
 # ── output tuning ──────────────────────────────────────────────────────────
@@ -253,6 +342,17 @@ SKIP_FUNCTIONS: list = []
 # doesn't affect what's instrumented/timed, only what's captured. Empty (the
 # default) disables it.
 SKIP_VARIABLES: list = []
+# Regular expressions whose matches are replaced by "<redacted>" in EVERY
+# piece of captured text: string args/results/fields (at any depth, dict keys
+# included), reprs, exception messages, and every line of a recorded
+# traceback. Complements SKIP_VARIABLES, which can only drop values by NAME --
+# e.g. a secret inside an exception message ("login failed for
+# password=hunter2") needs a pattern like r"(?<=password=)\w+". Patterns run
+# on the recorded TEXT, reprs included: a greedy \S+ would also swallow the
+# closing quote of a repr like ValueError('...'). Empty (the
+# default) disables it. An invalid pattern fails the trace before the traced
+# function runs, rather than silently leaking what it was meant to hide.
+REDACT_PATTERNS: list = []
 # When set, the raw trace tree is POSTed here at the end of every traced call,
 # wrapped as {"status", "tags", "trace"} (see _send_trace). None (the default)
 # disables it — set it to opt in (e.g. "http://localhost:7999/api/traces").
@@ -300,6 +400,14 @@ _patched_classes: set = set()
 # turns that hot path into one set lookup instead of a per-call filesystem path
 # resolution, which otherwise inflates and destabilises CPU-bound self times.
 _skip_classes: set = set()
+# The (SCAN_VENV, _SCAN_INCLUDE_PREFIXES) the verdicts in _skip_classes were
+# reached under: changing either between traces invalidates them (a class
+# judged "library" before SCAN_VENV was switched on must be re-judged).
+_skip_classes_config: tuple | None = None
+# Serializes patching (module functions, classes): traces may start on several
+# threads at once, and the profiler hook patches classes from any thread.
+# Re-entrant because patching a class can trigger the hook again.
+_patch_lock = threading.RLock()
 
 # Maps id(original_function) -> (original_function, wrapped_function) for every
 # free function wrapped by _patch_module_functions. A function patched in its
@@ -353,8 +461,10 @@ CAPTURE_IO = True
 # Guards against runaway/cyclic objects: max recursion depth when converting a
 # value to JSON. Beyond it, the sub-value falls back to a repr string.
 MAX_DEPTH = 20
-# Only capture a value whose size (in UTF-8 bytes, enforced WHILE converting —
-# see _jsonable's `_budget` param) is below this limit. A converted arg / kwarg
+# Only capture a value whose size is below this limit. Size = characters of
+# content: string/bytes length, the digits of each number, the repr of anything
+# converted to a string -- not dict keys or JSON syntax, and characters rather
+# than UTF-8 bytes. Enforced WHILE converting (see _jsonable's `_budget` param). A converted arg / kwarg
 # / result at or above it is either spilled to SPILL_DIR (if set) or dropped
 # and replaced with a compact "<TypeName>" marker, so the node still records
 # that something flowed through without bloating perf.json. None (the
@@ -370,16 +480,25 @@ MAX_SIZE_CAPTURE: int | None = None
 # MAX_SIZE_CAPTURE is None (nothing is ever considered "too large"). None (the
 # default) disables spilling — oversize values are dropped, as before.
 #
-# Repeated captures of the exact same object (same `id()` — a service `self`,
-# a shared config dict, a big result list passed on to the next stage, a
-# reused tokenizer's vocab, …) never pay for a second conversion or a second
-# spill: every trace has its own value pool (see _ValuePool) that converts a
-# given object once and has every later occurrence, anywhere in the tree,
-# just reference that one converted copy. This is automatic whenever
-# CAPTURE_IO is on — nothing to configure, and it applies to positional args,
-# kwargs, AND return values alike, not just `self`.
+# Every capture is a fresh snapshot of the value at that moment (so a mutated
+# object never shows a stale state), but identical captured CONTENT — a
+# service `self` that didn't change between calls, a shared config dict, a
+# reused tokenizer's vocab, … — is stored only once per trace in the output's
+# top-level "variables" map and referenced from the tree as {"__ref__": ref}
+# (see _ValuePool). Automatic whenever CAPTURE_IO is on.
 SPILL_DIR: str | None = None
 
+# Generators (and async generators): how many of the values a generator
+# yields are recorded on its node, as "yielded" (the total is always in
+# "yields"). Each is captured like any other value, at the moment it is
+# yielded. 0 records none.
+MAX_YIELDS_CAPTURE = 10
+
+
+# Exact types _jsonable returns unchanged (when not budget-limited) -- lets the
+# container loops skip a recursive call per leaf.
+_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
+_NON_STR_LEAF_TYPES = frozenset({int, float, bool, type(None)})  # with REDACT_PATTERNS, strings must be scanned
 
 # Returned by _jsonable for values with no useful serialization (objects whose
 # repr is just the default "<pkg.Class object at 0x…>"). Skipped from the output.
@@ -418,23 +537,19 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     afterward means the value was at least budget-sized; the caller
     (:func:`_capture_value`) decides from there whether to spill or drop it.
 
-    Every dict/list/tuple/set/rich-object/pydantic-model value is also routed
-    through the current trace's :class:`_ValuePool` (see ``_current_pool``),
-    keyed by the *original* Python object's ``id()`` (not its converted
-    form — a pydantic model's ``model_dump()`` allocates a fresh dict every
-    call, so identity has to be checked before conversion, not after). The
-    first time a given object is seen anywhere in the trace it's converted
-    and stored in the pool once; every later occurrence — the same `self`
-    passed down through nested calls, a big result list threaded on to the
-    next stage, a shared tokenizer's vocab — resolves instantly to a small
-    ``{"__ref__": ref}`` instead of being re-serialized (or re-spilled) from
-    scratch. This check happens BEFORE the depth/budget/cycle checks below,
-    since resolving an existing ref is cheap and safe regardless of how deep
-    or how budget-starved this branch is.
+    This is a pure snapshot: it never consults or fills the trace's
+    :class:`_ValuePool`, so every call converts `value` exactly as it is at
+    that moment. Deduplication happens afterwards, on the converted result
+    (see :func:`_capture_value` / :meth:`_ValuePool.intern`).
     """
     if value is None or isinstance(value, (bool, int, float)):
+        if _budget is not None:
+            # Numbers count too: a huge list of ints must hit MAX_SIZE_CAPTURE
+            # just like a huge list of strings does.
+            _budget[0] -= len(repr(value))
         return value
     if isinstance(value, str):
+        value = _redact(value)
         if _budget is not None:
             if len(value) >= _budget[0]:
                 truncated = value[: max(_budget[0], 0)]
@@ -450,40 +565,65 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                 return _safe_repr(bytes(value[:n]))
             _budget[0] -= len(value)
         return _safe_repr(value)
-    pool = _current_pool.get()
-    if pool is not None:
-        ref = pool.ref_by_id.get(id(value))
-        if ref is not None:
-            return {"__ref__": ref}
-    if depth >= MAX_DEPTH:
-        return _safe_repr(value)
+    if depth >= _cfg.MAX_DEPTH:
+        return _charge(_safe_repr(value), _budget)
     if id(value) in _seen:
-        return f"<circular {type(value).__name__}>"
+        return _charge(f"<circular {type(value).__name__}>", _budget)
     if _budget is not None and _budget[0] <= 0:
         return f"<{type(value).__name__} truncated: size limit reached>"
     try:
+        # Compact, unambiguous forms for values whose generic conversion is
+        # noise (a class's whole __dict__) or loses meaning (NamedTuple fields).
+        if isinstance(value, type):
+            return {"__class__": _charge(f"{value.__module__}.{value.__qualname__}", _budget)}
+        if isinstance(value, enum.Enum):
+            return {
+                "__enum__": _charge(f"{type(value).__qualname__}.{value.name}", _budget),
+                "value": _jsonable(value.value, depth + 1, _seen | {id(value)}, _budget),
+            }
+        if isinstance(value, tuple) and isinstance(getattr(type(value), "_fields", None), tuple):
+            seen = _seen | {id(value)}
+            fields = {"__type__": type(value).__name__}
+            for field_name, field_value in zip(type(value)._fields, value):
+                jv = _jsonable(field_value, depth + 1, seen, _budget)
+                if jv is not _SKIP:
+                    fields[field_name] = jv
+            return fields
         if isinstance(value, (dict, types.MappingProxyType)):
             seen = _seen | {id(value)}
             out = {}
+            skip_keys = bool(_cfg.SKIP_VARIABLES)
+            redact = _redactor() is not None
+            leaf_types = _NON_STR_LEAF_TYPES if redact else _LEAF_TYPES
             for k, v in value.items():
-                if isinstance(k, str) and _is_skipped_variable(k):
+                if skip_keys and isinstance(k, str) and _is_skipped_variable(k):
                     continue
-                if _budget is not None and _budget[0] <= 0:
+                key = (_redact(k) if redact else k) if isinstance(k, str) else _safe_repr(k)
+                if _budget is None:
+                    if type(v) in leaf_types:  # fast path: same result as recursing
+                        out[key] = v
+                        continue
+                elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget)
                 if jv is not _SKIP:
-                    out[k if isinstance(k, str) else _safe_repr(k)] = jv
-            return _pool_register(pool, value, out)
+                    out[key] = jv
+            return out
         if isinstance(value, (list, tuple, set, frozenset)):
             seen = _seen | {id(value)}
             out = []
+            leaf_types = _NON_STR_LEAF_TYPES if _redactor() is not None else _LEAF_TYPES
             for v in value:
-                if _budget is not None and _budget[0] <= 0:
+                if _budget is None:
+                    if type(v) in leaf_types:  # fast path: same result as recursing
+                        out.append(v)
+                        continue
+                elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget)
                 if jv is not _SKIP:
                     out.append(jv)
-            return _pool_register(pool, value, out)
+            return out
         # pydantic models, dataclasses, and other rich objects. exclude_none
         # drops fields that are unset (Optional[...] = None) rather than
         # carrying an explicit null for every one of them -- schemas like a
@@ -491,12 +631,14 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
         # None on any given instance) would otherwise dump every single field
         # name every single time the model flows through a traced call,
         # which is what actually blows up perf.json's size, not depth.
-        if hasattr(value, "model_dump"):  # pydantic v2
-            converted = _jsonable(value.model_dump(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
-            return _pool_register(pool, value, converted)
-        if hasattr(value, "dict") and callable(value.dict):  # pydantic v1
-            converted = _jsonable(value.dict(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
-            return _pool_register(pool, value, converted)
+        # Type-level checks: never call a `.dict()` / `.model_dump()` that merely
+        # happens to exist on some user object, and never trigger instance
+        # __getattr__ / properties just to probe for them.
+        vtype = type(value)
+        if hasattr(vtype, "model_fields") and callable(getattr(vtype, "model_dump", None)):  # pydantic v2
+            return _jsonable(value.model_dump(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
+        if hasattr(vtype, "__fields__") and callable(getattr(vtype, "dict", None)):  # pydantic v1
+            return _jsonable(value.dict(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
         # functions/methods/builtins: no useful __dict__ to unpack (and a
         # bound method's __func__ may carry unrelated noise like __wrapped__
         # from being auto-instrumented) -- describe identity instead of
@@ -513,18 +655,36 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                 info["self_type"] = type(value.__self__).__name__
             return info
         if hasattr(value, "__dict__") and vars(value):
-            seen = _seen | {id(value)}
-            converted = {"__type__": type(value).__name__, **_jsonable(vars(value), depth + 1, seen, _budget)}
-            return _pool_register(pool, value, converted)
+            # The object and its __dict__ are ONE level: converting the
+            # __dict__ at the object's own depth puts the fields at depth + 1,
+            # exactly like a dict's values. (Counting the __dict__ as an extra
+            # level made an object just above MAX_DEPTH come out as
+            # "<unconvertible …>", since the cut-off __dict__ was a string.)
+            fields = _jsonable(vars(value), depth, _seen | {id(value)}, _budget)
+            if not isinstance(fields, dict):
+                return fields
+            return {"__type__": type(value).__name__, **fields}
     except Exception as e:
         return f"<unconvertible {type(value).__name__}: {e}>"
     r = _safe_repr(value)
-    if _budget is not None:
-        if len(r) >= _budget[0]:
-            _budget[0] = 0
-        else:
-            _budget[0] -= len(r)
-    return _SKIP if _DEFAULT_REPR.match(r) else r
+    if _DEFAULT_REPR.match(r):
+        return _SKIP
+    return _charge(r, _budget)
+
+
+def _charge(text: str, budget: list | None) -> str:
+    """Counts a string produced during conversion (a repr, a marker) against
+    the MAX_SIZE_CAPTURE budget, truncating it where the budget runs out --
+    every string that ends up in the output is charged, not just the ones the
+    value itself contained."""
+    if budget is None:
+        return text
+    if len(text) >= budget[0]:
+        truncated = text[: max(budget[0], 0)]
+        budget[0] = 0
+        return truncated
+    budget[0] -= len(text)
+    return text
 
 
 def _spill_value(value: Any) -> Any:
@@ -544,15 +704,15 @@ def _spill_value(value: Any) -> Any:
 
     try:
         full = _jsonable(value)
-        Path(SPILL_DIR).mkdir(parents=True, exist_ok=True)
-        path = Path(SPILL_DIR) / f"{uuid.uuid4()}.json"
+        Path(_cfg.SPILL_DIR).mkdir(parents=True, exist_ok=True)
+        path = Path(_cfg.SPILL_DIR) / f"{uuid.uuid4()}.json"
         with open(path, "w") as f:
             json.dump(full, f, ensure_ascii=False, default=str)
         size = path.stat().st_size
         del full
         return {"__spilled__": str(path), "size": size}
     except Exception as e:  # never let telemetry break the traced call
-        print(f"[perf] failed to spill oversized value to {SPILL_DIR}: {e}", file=sys.stderr)
+        print(f"[perf] failed to spill oversized value to {_cfg.SPILL_DIR}: {e}", file=sys.stderr)
         return _SKIP
 
 
@@ -567,78 +727,131 @@ def _capture_value(value: Any) -> Any:
     unbounded conversion. A value that exhausts the budget is spilled to its
     own file (:func:`_spill_value`) when :data:`SPILL_DIR` is set, or dropped
     — the same "<TypeName>" marker behaviour as when SPILL_DIR is left unset.
+
+    Only a value that is kept inline is interned into the trace's pool, and
+    only after its conversion finished — a budget-truncated partial
+    conversion never reaches the pool, and a spilled value's file holds its
+    full content inline, never a ref into a pool that isn't written with it.
     """
-    if MAX_SIZE_CAPTURE is None:
-        return _jsonable(value)
-    budget = [MAX_SIZE_CAPTURE]
+    if _cfg.MAX_SIZE_CAPTURE is None:
+        return _intern(_jsonable(value))
+    budget = [_cfg.MAX_SIZE_CAPTURE]
     jv = _jsonable(value, _budget=budget)
     if jv is _SKIP:
         return _SKIP
     if budget[0] > 0:
-        return jv
-    if SPILL_DIR:
+        return _intern(jv)
+    if _cfg.SPILL_DIR:
         return _spill_value(value)
     return _SKIP
 
 
+def _intern(converted: Any) -> Any:
+    """Dedups a freshly converted value through the current trace's pool (if any)."""
+    pool = _current_pool.get()
+    if pool is None or converted is _SKIP:
+        return converted
+    return pool.intern(converted)
+
+
 def _safe_repr(value: Any) -> str:
     try:
-        return repr(value)
+        text = repr(value)
     except Exception as e:  # a __repr__ that raises must not kill the trace
-        return f"<unreprable {type(value).__name__}: {e}>"
+        text = f"<unreprable {type(value).__name__}: {e}>"
+    return _redact(text)
 
 
-# ── per-trace value pool: dedup repeated captures by object identity ──────────
+_redactor_cache: list = [None, None]  # [patterns tuple, compiled regex or None]
+
+
+def _redactor() -> Any:
+    """The compiled REDACT_PATTERNS (one alternation), or None if unset."""
+    patterns = tuple(_cfg.REDACT_PATTERNS or ())
+    if _redactor_cache[0] != patterns:
+        compiled = re.compile("|".join(f"(?:{pattern})" for pattern in patterns)) if patterns else None
+        _redactor_cache[:] = [patterns, compiled]
+    return _redactor_cache[1]
+
+
+def _redact(text: Any) -> Any:
+    rx = _redactor()
+    if rx is None or not isinstance(text, str):
+        return text
+    return rx.sub("<redacted>", text)
+
+
+# ── per-trace value pool: dedup repeated captures by content ────────────────
 
 
 class _ValuePool:
-    """Converts each distinct object at most once per trace; every later
-    occurrence of the same object anywhere in the tree — a `self` threaded
-    through nested calls, a big result passed on to the next stage, a shared
-    config/tokenizer, … — resolves to a small ``{"__ref__": ref}`` instead of
-    being independently re-serialized (and possibly re-spilled).
+    """Stores each distinct piece of captured *content* once per trace.
 
-    Keyed by `id(value)`. A plain `dict`/`list` can't be weak-referenced, so
-    instead of the weakref-based liveness tracking a per-instance diff cache
-    would need, every pooled object is simply kept alive in `_keepalive` for
-    the rest of this trace — cheap here since the trace already outlives
-    every value flowing through it, and it's what guarantees an id can never
-    be recycled by an unrelated object mid-trace and wrongly resolve to a
-    stale entry.
+    Values are deduplicated by what they converted to, never by the identity
+    of the Python object they came from: identity-based dedup can't tell that
+    an object was mutated between two captures, so it would show a later call
+    a stale snapshot (a `self` whose fields changed, a list appended to). Here
+    every capture is a fresh conversion, and only byte-identical content is
+    shared: the same unchanged tokenizer vocab reached at 13 call depths is
+    still stored once, but two different states of one object are two
+    entries.
+
+    :meth:`intern` walks a converted value bottom-up and replaces every
+    container (and long string) whose serialized form is at least
+    :attr:`MIN_SIZE` bytes with ``{"__ref__": ref}``, where
+    ``variables[ref]`` holds that content (itself possibly containing refs).
+    Smaller content stays inline, where a ref would cost more than it saves.
+    Refs are keyed by a BLAKE2b-256 digest of the serialized content, so two
+    different contents can't share an entry.
 
     One instance lives for the duration of a single top-level :func:`trace`
     call (see `_current_pool`) — never shared across traces, so one trace's
-    pooled values can't leak into another's.
+    pooled values can't leak into another's. Thread-safe: work handed to
+    other threads with a copied context (``asyncio.to_thread``) interns into
+    the same pool.
     """
 
-    def __init__(self, prefix: str = "") -> None:
+    MIN_SIZE = 64
+
+    def __init__(self, prefix: str = "", state: "_TraceState | None" = None) -> None:
         # `prefix` namespaces this pool's refs -- a worker process's pool
         # (see _RemoteCall) gets a unique one so its variables can be merged
         # into the parent trace's pool without colliding with "v0", "v1", ….
-        self.ref_by_id: dict[int, str] = {}
         self.variables: dict[str, Any] = {}
-        self._keepalive: list = []
+        self._ref_by_digest: dict[bytes, str] = {}
+        # Shares the trace's lock + open flag: once the trace closes (and its
+        # variables are being written out), late captures stay inline instead.
+        self._state = state if state is not None else _TraceState()
+        self._lock = self._state.lock
         self._prefix = prefix
         self._next = 0
 
-    def register(self, value: Any, converted: Any) -> dict:
-        ref = f"{self._prefix}v{self._next}"
-        self._next += 1
-        self.ref_by_id[id(value)] = ref
-        self.variables[ref] = converted
-        self._keepalive.append(value)
+    def intern(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            value = {k: v if self._is_small_leaf(v) else self.intern(v) for k, v in value.items()}
+        elif isinstance(value, list):
+            value = [v if self._is_small_leaf(v) else self.intern(v) for v in value]
+        elif not isinstance(value, str) or len(value) < self.MIN_SIZE:
+            return value
+        serialized = _json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(serialized) < self.MIN_SIZE:
+            return value
+        digest = hashlib.blake2b(serialized.encode("utf-8", "surrogatepass"), digest_size=32).digest()
+        with self._lock:
+            if not self._state.open:
+                return value
+            ref = self._ref_by_digest.get(digest)
+            if ref is None:
+                ref = f"{self._prefix}v{self._next}"
+                self._next += 1
+                self._ref_by_digest[digest] = ref
+                self.variables[ref] = value
         return {"__ref__": ref}
 
-
-def _pool_register(pool: "_ValuePool | None", value: Any, converted: Any) -> Any:
-    """Stores `converted` (the freshly-converted form of `value`) in `pool`
-    under a new ref and returns the ``{"__ref__": ref}`` marker in its place
-    — or just returns `converted` unchanged if there's no active pool or
-    nothing useful was produced (`_SKIP`).
-    """
-    if pool is None or converted is _SKIP:
-        return converted
-    return pool.register(value, converted)
+    @classmethod
+    def _is_small_leaf(cls, v: Any) -> bool:
+        t = type(v)
+        return t is int or t is float or t is bool or v is None or (t is str and len(v) < cls.MIN_SIZE)
 
 
 # ── SUPPRESS_ERRORS: type-aware default return values ─────────────────────────
@@ -761,6 +974,16 @@ def _default_factory_for_annotation(annotation: Any) -> Any:
     return lambda: None
 
 
+def _default_return_unrecorded(default_factory: Any) -> Any:
+    """:func:`_compute_default_return` as perf's own work: constructing the
+    fallback value (which may run project constructors) is not recorded."""
+    token = _capturing.set(_capturing.get() + 1)
+    try:
+        return _compute_default_return(default_factory)
+    finally:
+        _capturing.reset(token)
+
+
 def _compute_default_return(default_factory: Any) -> Any:
     """Resolve the value to substitute for a suppressed root-level exception.
 
@@ -768,8 +991,8 @@ def _compute_default_return(default_factory: Any) -> Any:
     or a callable, invoked fresh each time) over the auto-detected
     `default_factory` derived from the function's return annotation.
     """
-    if DEFAULT_RETURN is not _UNSET:
-        return DEFAULT_RETURN() if callable(DEFAULT_RETURN) else DEFAULT_RETURN
+    if _cfg.DEFAULT_RETURN is not _UNSET:
+        return _cfg.DEFAULT_RETURN() if callable(_cfg.DEFAULT_RETURN) else _cfg.DEFAULT_RETURN
     return default_factory()
 
 
@@ -824,10 +1047,9 @@ def _resolve_param_names(func: Any) -> tuple:
 def _capture_positional(a: Any) -> Any:
     """Capture one positional argument.
 
-    Identity-based dedup against repeated captures of the same object (e.g.
-    `self`, passed down through nested calls) happens automatically inside
-    :func:`_jsonable` via the trace's :class:`_ValuePool` — nothing extra to
-    do here.
+    Dedup of repeated content (e.g. an unchanged `self` passed down through
+    nested calls) happens automatically in :func:`_capture_value` via the
+    trace's :class:`_ValuePool` — nothing extra to do here.
     """
     jv = _capture_value(a)
     return f"<{type(a).__name__}>" if jv is _SKIP else jv
@@ -839,7 +1061,7 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict, param_names: tuple = (
     No-op unless :data:`CAPTURE_IO` is on. Positional args keep their index in
     ``node["args"]``; a value with no useful serialization (the ``_SKIP``
     sentinel from :func:`_jsonable`) is replaced by a compact ``"<TypeName>"``
-    marker so the slot is preserved. Keyword args go to ``node["kwargs"]``,
+    marker so the slot is preserved. Keyword args go to ``node["kwargs"]`` (omitted when there are none),
     where skipped values are dropped entirely rather than marked.
 
     :data:`SKIP_VARIABLES` redacts by name: a keyword arg whose name matches
@@ -868,8 +1090,19 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict, param_names: tuple = (
             order (as many as could be resolved), used only to match
             SKIP_VARIABLES against positional args by name.
     """
-    if not CAPTURE_IO:
+    if not _cfg.CAPTURE_IO:
         return
+    # Perf's own capture: user code it triggers (a __repr__, a property) is
+    # not recorded as calls (see _capturing). Set once per call, inline (a
+    # context manager here costs more than the whole guard).
+    token = _capturing.set(1)
+    try:
+        _record_inputs_guarded(node, args, kwargs, param_names)
+    finally:
+        _capturing.reset(token)
+
+
+def _record_inputs_guarded(node: dict, args: tuple, kwargs: dict, param_names: tuple) -> None:
     start = perf_counter()
     captured = []
     for i, a in enumerate(args):
@@ -879,11 +1112,22 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict, param_names: tuple = (
         else:
             captured.append(_capture_positional(a))
     node["args"] = captured
-    node["kwargs"] = {
+    captured_kwargs = {
         k: jv
         for k, v in kwargs.items()
         if not _is_skipped_variable(k) and (jv := _capture_value(v)) is not _SKIP
     }
+    if captured_kwargs:  # omitted when empty, like most calls' kwargs
+        node["kwargs"] = captured_kwargs
+    _add_capture_time(node, start)
+    # Rounded now too: a call still running when its trace closes never
+    # completes, so this is the value it is written out with.
+    node["capture_time"] = round(node["capture_time"], _TIME_DECIMALS)
+
+
+def _add_capture_time(node: dict, start: float) -> None:
+    # Accumulated unrounded; rounded once when the call completes (_completion
+    # / _TraceState.complete, and the trace root before it is emitted).
     node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
 
 
@@ -901,11 +1145,15 @@ def _record_output(node: dict, result: Any) -> None:
         node: The call-tree node to annotate in place.
         result: The value returned by the traced function.
     """
-    if CAPTURE_IO:
-        start = perf_counter()
-        jv = _capture_value(result)
+    if _cfg.CAPTURE_IO:
+        token = _capturing.set(1)
+        try:
+            start = perf_counter()
+            jv = _capture_value(result)
+        finally:
+            _capturing.reset(token)
         node["result"] = f"<{type(result).__name__}>" if jv is _SKIP else jv
-        node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
+        _add_capture_time(node, start)
 
 
 def _exception_origin(exc: BaseException) -> dict | None:
@@ -935,7 +1183,7 @@ def _exception_origin(exc: BaseException) -> dict | None:
         "file": origin.filename,
         "line": origin.lineno,
         "function": origin.name,
-        "text": origin.line,
+        "text": _redact(origin.line),
     }
 
 
@@ -968,12 +1216,12 @@ def _exception_debug(exc: BaseException, _seen: frozenset = frozenset()) -> dict
         A dict with ``frames``, ``formatted``, and optionally ``caused_by``.
     """
     frames = [
-        {"file": f.filename, "line": f.lineno, "function": f.name, "text": f.line}
+        {"file": f.filename, "line": f.lineno, "function": f.name, "text": _redact(f.line)}
         for f in traceback.extract_tb(exc.__traceback__)
     ]
     debug = {
         "frames": frames,
-        "formatted": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        "formatted": _redact("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))),
     }
     cause = exc.__cause__ if exc.__cause__ is not None else (None if exc.__suppress_context__ else exc.__context__)
     if cause is not None and id(cause) not in _seen:
@@ -1001,14 +1249,24 @@ def _record_exception(node: dict, exc: BaseException) -> None:
         node: The call-tree node to annotate in place.
         exc: The exception raised out of the traced call (re-raised by the caller).
     """
-    if CAPTURE_IO:
-        start = perf_counter()
-        node["exception"] = _safe_repr(exc)
-        origin = _exception_origin(exc)
-        if origin is not None:
-            node["exception_origin"] = origin
-        node["exception_debug"] = _exception_debug(exc)
-        node["capture_time"] = node.get("capture_time", 0.0) + (perf_counter() - start)
+    if _cfg.CAPTURE_IO:
+        token = _capturing.set(_capturing.get() + 1)  # repr() of a user exception runs user code
+        try:
+            _record_exception_fields(node, exc)
+        finally:
+            _capturing.reset(token)
+
+
+def _record_exception_fields(node: dict, exc: BaseException) -> None:
+    start = perf_counter()
+    node["exception"] = _safe_repr(exc)
+    origin = _exception_origin(exc)
+    if origin is not None:
+        node["exception_origin"] = origin
+    # Interned: ancestors the exception propagates through share every
+    # identical part (frames, cause chain) instead of repeating it.
+    node["exception_debug"] = _intern(_exception_debug(exc))
+    _add_capture_time(node, start)
 
 
 def _is_project_module(module: Any) -> bool:
@@ -1042,12 +1300,13 @@ def _is_project_module(module: Any) -> bool:
     # C extensions can't be patched
     if filepath.endswith((".so", ".pyd", ".dylib")):
         return False
-    if SCAN_VENV:
-        if _SCAN_INCLUDE_PREFIXES:
-            return any(name.startswith(prefix) for prefix in _SCAN_INCLUDE_PREFIXES)
-        return True
     resolved = Path(filepath).resolve()
-    return not any(resolved.is_relative_to(venv) for venv in _VENV_PATHS)
+    if not any(resolved.is_relative_to(venv) for venv in _VENV_PATHS):
+        return True  # your own code: always (SCAN_VENV only ADDS library code)
+    if not _cfg.SCAN_VENV:
+        return False
+    prefixes = _cfg._SCAN_INCLUDE_PREFIXES
+    return not prefixes or any(name == p or name.startswith(p + ".") for p in prefixes)
 
 
 def _is_project_class(cls: type) -> bool:
@@ -1067,6 +1326,45 @@ def _is_project_class(cls: type) -> bool:
     if module is None:
         return False
     return _is_project_module(module)
+
+
+# Undo log of every patch, keyed by the module the patched code BELONGS to:
+# origin module name -> [(kind, target, name, original, replacement)]. Lets a
+# module that stops counting as project code (SCAN_VENV switched off, a
+# different _SCAN_INCLUDE_PREFIXES) be restored to exactly what it was.
+_undo_log: dict = {}
+
+
+def _set_patched(target: Any, name: str, value: Any, origin: str) -> None:
+    """``setattr(target, name, value)``, recording how to undo it."""
+    original = vars(target).get(name)
+    setattr(target, name, value)
+    _undo_log.setdefault(origin, []).append(("attr", target, name, original, value))
+
+
+def _unpatch_non_project() -> None:
+    """Restore everything patched for modules that are no longer project code
+    under the current config. A binding the program has since replaced
+    (no longer our wrapper) is left alone."""
+    for origin, entries in list(_undo_log.items()):
+        module = sys.modules.get(origin)
+        if module is not None and _is_project_module(module):
+            continue
+        for kind, target, name, original, value in reversed(entries):
+            try:
+                if kind == "register":
+                    target.register(name, original)
+                elif vars(target).get(name) is value:
+                    setattr(target, name, original)
+            except Exception:
+                continue
+            if isinstance(target, type):
+                _patched_classes.discard(target)
+        replaced = {id(e[4]) for e in entries}
+        for key, (orig, wrapped) in list(_wrapped_originals.items()):
+            if id(wrapped) in replaced:
+                del _wrapped_originals[key]
+        del _undo_log[origin]
 
 
 def _patch_module_functions(module: Any) -> None:
@@ -1091,11 +1389,19 @@ def _patch_module_functions(module: Any) -> None:
     if module.__name__ == __name__:
         return
     for name in list(vars(module)):
-        if name.startswith("_"):
-            continue
+        if name.startswith("__"):
+            continue  # dunders (__getattr__/__dir__ of a module, …) stay as they are
         try:
             attr = vars(module)[name]
         except Exception:
+            continue
+        if _is_lru_cache(attr) and getattr(attr, "__module__", None) == module.__name__:
+            try:
+                wrapped = _cache_wrap(attr, f"{module.__name__}.{name}")
+                _set_patched(module, name, wrapped, module.__name__)
+                _wrapped_originals[id(attr)] = (attr, wrapped)
+            except (TypeError, AttributeError):
+                pass
             continue
         if (
             not inspect.isfunction(attr)
@@ -1105,12 +1411,9 @@ def _patch_module_functions(module: Any) -> None:
         ):
             continue
         try:
-            if inspect.iscoroutinefunction(attr):
-                wrapped = _async_wrap(attr, f"{module.__name__}.{name}")
-            else:
-                wrapped = _sync_wrap(attr, f"{module.__name__}.{name}")
+            wrapped = _wrap_any(attr, f"{module.__name__}.{name}")
             wrapped._perf_wrapped = True  # type: ignore
-            setattr(module, name, wrapped)
+            _set_patched(module, name, wrapped, module.__name__)
             _wrapped_originals[id(attr)] = (attr, wrapped)
         except (TypeError, AttributeError):
             continue
@@ -1135,19 +1438,78 @@ def _patch_reexported_names(module: Any) -> None:
     if module.__name__ == __name__:
         return
     for name in list(vars(module)):
-        if name.startswith("_"):
+        if name.startswith("__"):
             continue
         try:
             attr = vars(module)[name]
         except Exception:
             continue
-        entry = _wrapped_originals.get(id(attr))
-        if entry is None or attr is not entry[0]:
-            continue
         try:
-            setattr(module, name, entry[1])
+            if type(attr) is partial:
+                # A module-level partial built at import time holds the
+                # pre-patch function: rebuild it around the wrapper.
+                entry = _wrapped_originals.get(id(attr.func))
+                if entry is not None and attr.func is entry[0]:
+                    _set_patched(module, name, partial(entry[1], *attr.args, **attr.keywords), entry[0].__module__)
+                continue
+            if inspect.isfunction(attr) and callable(getattr(attr, "register", None)) and isinstance(
+                getattr(attr, "registry", None), types.MappingProxyType
+            ):
+                _patch_singledispatch(attr)
+            entry = _wrapped_originals.get(id(attr))
+            if entry is None or attr is not entry[0]:
+                continue
+            _set_patched(module, name, entry[1], entry[0].__module__)
         except (TypeError, AttributeError):
             continue
+
+
+def _patch_singledispatch(dispatcher: Any) -> None:
+    """Re-register a ``functools.singledispatch`` function's implementations
+    with their instrumented versions (the registry captured the originals at
+    import time). The default (``object``) implementation is the dispatcher's
+    own body, already covered by the dispatcher's node."""
+    for cls, impl in list(dispatcher.registry.items()):
+        if cls is object:
+            continue
+        entry = _wrapped_originals.get(id(impl))
+        if entry is not None and impl is entry[0]:
+            dispatcher.register(cls, entry[1])
+            _undo_log.setdefault(impl.__module__, []).append(("register", dispatcher, cls, impl, entry[1]))
+
+
+_LRU_TYPE = type(functools.lru_cache(maxsize=None)(lambda: None))
+
+
+def _is_lru_cache(obj: Any) -> bool:
+    return type(obj) is _LRU_TYPE
+
+
+def _cache_wrap(cached: Any, name: str) -> Any:
+    """Node wrapper for a ``functools.lru_cache`` / ``functools.cache``
+    function. Every call (hit or miss) gets a node; ``cache`` is set to
+    ``"hit"`` / ``"miss"`` when the cache counters prove which one this call
+    was (exactly one counter moved — other threads using the same cache at
+    the same moment make it ambiguous, and then it is left out rather than
+    guessed). ``cache_info`` / ``cache_clear`` / ``cache_parameters`` /
+    ``__wrapped__`` keep working on the wrapper."""
+
+    def counters() -> Any:
+        before = cached.cache_info()
+
+        def finish() -> dict:
+            after = cached.cache_info()
+            hits, misses = after.hits - before.hits, after.misses - before.misses
+            return {"cache": "hit" if hits else "miss"} if hits + misses == 1 else {}
+
+        return finish
+
+    wrapper = _sync_wrap(cached, name, extra=counters)
+    for attr in ("cache_info", "cache_clear", "cache_parameters"):
+        if hasattr(cached, attr):
+            setattr(wrapper, attr, getattr(cached, attr))
+    wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
+    return wrapper
 
 
 def _patch_class(cls: type) -> None:
@@ -1172,43 +1534,291 @@ def _patch_class(cls: type) -> None:
         cls: The class to instrument.
     """
     if cls in _patched_classes or cls in _skip_classes:
-        return
+        return  # hot path: no lock
+    with _patch_lock:
+        _patch_class_locked(cls)
+
+
+def _patch_class_locked(cls: type) -> None:
+    if cls in _patched_classes or cls in _skip_classes:
+        return  # another thread got here first
     if not _is_project_class(cls) or cls.__module__ == __name__:
         _skip_classes.add(cls)  # cache the verdict; never re-resolve this class
         return
     _patched_classes.add(cls)
     for name in list(vars(cls)):
-        if name.startswith("__"):
+        if name.startswith("__") and name.endswith("__") and name not in _TRACED_DUNDERS:
             continue
         try:
             raw = vars(cls)[name]
         except Exception:
             continue
+        if getattr(getattr(raw, "__func__", raw), "_perf_node", False):
+            continue  # already a perf node wrapper (e.g. a patched function assigned onto the class)
         try:
-            if isinstance(raw, staticmethod):
-                inner = raw.__func__
-                wrapped = (
-                    _async_wrap(inner, f"{cls.__name__}.{name}")
-                    if inspect.iscoroutinefunction(inner)
-                    else _sync_wrap(inner, f"{cls.__name__}.{name}")
-                )
-                setattr(cls, name, staticmethod(wrapped))
+            if type(raw) is property:
+                _set_patched(cls, name, property(
+                    _wrap_any(raw.fget, f"{cls.__name__}.{name}"),
+                    _wrap_any(raw.fset, f"{cls.__name__}.{name}.setter"),
+                    _wrap_any(raw.fdel, f"{cls.__name__}.{name}.deleter"),
+                    raw.__doc__,
+                ), cls.__module__)
+            elif type(raw) is functools.cached_property:
+                # Only a cache MISS calls the function, so only misses get a node.
+                cached = functools.cached_property(_wrap_any(raw.func, f"{cls.__name__}.{name}"))
+                cached.__set_name__(cls, name)
+                _set_patched(cls, name, cached, cls.__module__)
+            elif _is_lru_cache(raw):
+                _set_patched(cls, name, _cache_wrap(raw, f"{cls.__name__}.{name}"), cls.__module__)
+            elif isinstance(raw, staticmethod):
+                wrapped = _wrap_any(raw.__func__, f"{cls.__name__}.{name}")
+                _set_patched(cls, name, staticmethod(wrapped), cls.__module__)
             elif isinstance(raw, classmethod):
-                inner = raw.__func__
-                wrapped = (
-                    _async_wrap(inner, f"{cls.__name__}.{name}")
-                    if inspect.iscoroutinefunction(inner)
-                    else _sync_wrap(inner, f"{cls.__name__}.{name}")
-                )
-                setattr(cls, name, classmethod(wrapped))
+                wrapped = _wrap_any(raw.__func__, f"{cls.__name__}.{name}")
+                _set_patched(cls, name, classmethod(wrapped), cls.__module__)
             elif inspect.isfunction(raw):
-                if inspect.iscoroutinefunction(raw):
-                    setattr(cls, name, _async_wrap(raw, f"{cls.__name__}.{name}"))
-                else:
-                    setattr(cls, name, _sync_wrap(raw, f"{cls.__name__}.{name}"))
+                # SUPPRESS_ERRORS never applies to __init__/__call__/__enter__/…:
+                # swallowing a constructor's or protocol method's failure would
+                # hand back a half-built object / a broken `with`.
+                _set_patched(cls, name, _wrap_any(raw, f"{cls.__name__}.{name}", suppress=name not in _TRACED_DUNDERS), cls.__module__)
         except (TypeError, AttributeError):
             # immutable C-extension type — skip it and move on
             continue
+
+
+# Dunder methods that get nodes: they are called by the PROGRAM, never by
+# perf's own value capture (which calls __repr__, __eq__, __hash__, …, so
+# tracing those would record perf's own work — or recurse).
+_TRACED_DUNDERS = frozenset({"__init__", "__call__", "__enter__", "__exit__", "__aenter__", "__aexit__"})
+
+
+def _wrap_any(func: Any, name: str, suppress: bool = True) -> Any:
+    """Node wrapper for any kind of function; None passes through."""
+    if func is None or not inspect.isfunction(func) or getattr(func, "_perf_node", False):
+        return func
+    if getattr(func, "__code__", None) in _CM_HELPER_CODES and inspect.isfunction(getattr(func, "__wrapped__", None)):
+        return _cm_wrap(func, name)
+    if inspect.isasyncgenfunction(func):
+        return _agen_wrap(func, name, suppress=suppress)
+    if inspect.isgeneratorfunction(func):
+        return _gen_wrap(func, name, suppress=suppress)
+    if inspect.iscoroutinefunction(func):
+        return _async_wrap(func, name, suppress=suppress)
+    return _sync_wrap(func, name, suppress=suppress)
+
+
+# ── generators: the node follows the generator's own execution ──────────────
+# A generator function's body doesn't run when it is called -- it runs bit by
+# bit, each time the consumer asks for the next value. Its node therefore
+# starts when the generator STARTS RUNNING (first next()), under whoever does
+# that; each resume runs with the generator's node current (so its calls nest
+# under it) and restores the consumer's node before every yield (so the
+# consumer's own work between values stays under the consumer). The node
+# records: `time` (wall, first resume → end), `active_time` (time actually
+# spent running the generator's code -- used as its own time in the report),
+# `yields` (count), `yielded` (the first MAX_YIELDS_CAPTURE values, captured as
+# they were yielded), the return value as `result`, an exception, or
+# `closed: true` when the consumer stopped early. The wrappers are themselves
+# generator functions, so inspect.isgeneratorfunction() & co. still hold.
+
+
+class _GenRecorder:
+    __slots__ = ("node", "state", "active", "yields", "yielded", "limit")
+
+    def __init__(self, node: dict, state: "_TraceState") -> None:
+        self.node, self.state = node, state
+        self.active, self.yields, self.yielded = 0.0, 0, []
+        self.limit = _cfg.MAX_YIELDS_CAPTURE
+
+    def on_yield(self, value: Any) -> None:
+        self.yields += 1
+        if len(self.yielded) < self.limit and _cfg.CAPTURE_IO:
+            token = _capturing.set(1)
+            try:
+                jv = _capture_value(value)
+            finally:
+                _capturing.reset(token)
+            self.yielded.append(f"<{type(value).__name__}>" if jv is _SKIP else jv)
+
+    def finish(self, **extra: Any) -> dict:
+        done = _completion(self.node)
+        done["active_time"] = round(self.active, _TIME_DECIMALS)
+        done["yields"] = self.yields
+        if self.yielded:
+            done["yielded"] = self.yielded
+        done.update(extra)
+        return done
+
+
+def _start_generator(name: str, args: tuple, kwargs: dict, param_names: tuple) -> "_GenRecorder | None":
+    recording = _recording()
+    if recording is None:
+        return None
+    parent, state = recording
+    node = make_node(name)
+    _record_inputs(node, args, kwargs, param_names)
+    if not state.attach(parent, node):
+        return None
+    _restart(node)
+    return _GenRecorder(node, state)
+
+
+def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
+    _cover(func, name)
+    param_names = _resolve_param_names(func)
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        gen = func(*args, **kwargs)
+        rec = _start_generator(name, args, kwargs, param_names)
+        if rec is None:
+            return (yield from gen)
+        sent: Any = None
+        thrown: Any = None
+        while True:
+            token = _current_node.set(rec.node)
+            t0 = perf_counter()
+            try:
+                value = gen.throw(thrown) if thrown is not None else gen.send(sent)
+            except StopIteration as stop:
+                rec.active += perf_counter() - t0
+                done = rec.finish()
+                _record_output(done, stop.value)
+                rec.state.complete(rec.node, done)
+                return stop.value
+            except BaseException as exc:
+                rec.active += perf_counter() - t0
+                done = rec.finish()
+                _record_exception(done, exc)
+                rec.state.complete(rec.node, done)
+                if suppress and _cfg.SUPPRESS_ERRORS:
+                    return None  # a failed generator just ends
+                raise
+            finally:
+                _current_node.reset(token)
+            rec.active += perf_counter() - t0
+            rec.on_yield(value)
+            thrown = None
+            try:
+                sent = yield value
+            except GeneratorExit:
+                # Consumer stopped early: the generator's own cleanup (finally
+                # blocks, a context manager's teardown) runs inside close().
+                token = _current_node.set(rec.node)
+                t0 = perf_counter()
+                try:
+                    gen.close()
+                finally:
+                    rec.active += perf_counter() - t0
+                    _current_node.reset(token)
+                    rec.state.complete(rec.node, rec.finish(closed=True))
+                raise
+            except BaseException as exc:
+                thrown = exc  # consumer threw into us: forward it
+
+    wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
+    return wrapper
+
+
+def _agen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
+    _cover(func, name)
+    param_names = _resolve_param_names(func)
+
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        agen = func(*args, **kwargs)
+        rec = _start_generator(name, args, kwargs, param_names)
+        if rec is None:
+            async for value in agen:
+                yield value
+            return
+        sent: Any = None
+        thrown: Any = None
+        while True:
+            token = _current_node.set(rec.node)
+            t0 = perf_counter()
+            try:
+                value = await (agen.athrow(thrown) if thrown is not None else agen.asend(sent))
+            except StopAsyncIteration:
+                rec.active += perf_counter() - t0
+                rec.state.complete(rec.node, rec.finish())
+                return
+            except BaseException as exc:
+                rec.active += perf_counter() - t0
+                done = rec.finish()
+                _record_exception(done, exc)
+                rec.state.complete(rec.node, done)
+                if suppress and _cfg.SUPPRESS_ERRORS:
+                    return
+                raise
+            finally:
+                _current_node.reset(token)
+            rec.active += perf_counter() - t0
+            rec.on_yield(value)
+            thrown = None
+            try:
+                sent = yield value
+            except GeneratorExit:
+                token = _current_node.set(rec.node)
+                t0 = perf_counter()
+                try:
+                    await agen.aclose()
+                finally:
+                    rec.active += perf_counter() - t0
+                    _current_node.reset(token)
+                    rec.state.complete(rec.node, rec.finish(closed=True))
+                raise
+            except BaseException as exc:
+                thrown = exc
+
+    wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
+    return wrapper
+
+
+def _cm_wrap(helper: Any, name: str) -> Any:
+    """A ``@contextmanager`` / ``@asynccontextmanager`` function: rebuilt
+    around the instrumented generator, so setup (before ``yield``) and
+    teardown (after it) run under the context manager's own node. The
+    ``with`` body runs while the generator is suspended, so it stays under
+    the code that wrote the ``with``."""
+    import contextlib
+
+    inner = helper.__wrapped__
+    if inspect.isasyncgenfunction(inner):
+        wrapped = contextlib.asynccontextmanager(_agen_wrap(inner, name))
+    else:
+        wrapped = contextlib.contextmanager(_gen_wrap(inner, name))
+    wrapped._perf_wrapped = wrapped._perf_node = True  # type: ignore
+    return wrapped
+
+
+def _cm_helper_codes() -> frozenset:
+    import contextlib
+
+    def gen():
+        yield
+
+    async def agen():
+        yield
+
+    return frozenset({contextlib.contextmanager(gen).__code__, contextlib.asynccontextmanager(agen).__code__})
+
+
+_CM_HELPER_CODES = _cm_helper_codes()
+
+
+def _register_wrapper_codes() -> None:
+    """Code objects of perf's own wrappers: a call made directly from one of
+    them is already recorded by it (see _on_event_start)."""
+
+    def f():
+        return None
+
+    async def af():
+        return None
+
+    for wrapper in (_sync_wrap(f, "f"), _async_wrap(af, "af")):
+        _WRAPPER_CODES.add(wrapper.__code__)
 
 
 def _patch_instance(obj: object) -> None:
@@ -1235,7 +1845,22 @@ def _patch_all_project_classes() -> None:
     (:func:`_patch_class`). Instances created *during* the call are picked up
     separately by the ``setprofile`` hook.
     """
-    project_modules = [m for m in sys.modules.values() if m is not None and _is_project_module(m)]
+    with _patch_lock:
+        _patch_all_project_classes_locked()
+
+
+def _patch_all_project_classes_locked() -> None:
+    global _skip_classes_config
+    config = (_cfg.SCAN_VENV, tuple(_cfg._SCAN_INCLUDE_PREFIXES))
+    if config != _skip_classes_config:
+        _skip_classes.clear()
+        if _skip_classes_config is not None:
+            _unpatch_non_project()
+            _events_config_changed()
+        _skip_classes_config = config
+    # list() snapshots sys.modules atomically: another thread may import
+    # (and so grow sys.modules) while we're walking it.
+    project_modules = [m for m in list(sys.modules.values()) if m is not None and _is_project_module(m)]
     for module in project_modules:
         _patch_module_functions(module)  # ← NEW
         for attr_name in list(vars(module)):
@@ -1255,17 +1880,19 @@ def _patch_all_project_classes() -> None:
 # ── sync / async node wrappers ────────────────────────────────────────────────
 
 
-def _sync_wrap(func: Any, name: str) -> Any:
+def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -> Any:
+    _cover(func, name)
     """Wrap a synchronous callable so each call becomes a timed tree node.
 
     The returned wrapper: creates a node named ``name``, links it under the
     current node (:data:`_current_node`) so the tree mirrors the real call
     stack, and makes it current for the duration via a ``ContextVar`` token —
-    all before invoking `func`, so nothing but that bookkeeping sits between the
-    node's start stamp and the real call. As soon as `func` returns or raises,
-    :func:`_finish_node` stamps ``time``/``end`` immediately — before input/output
-    capture, which can be slow (JSON-ifying large args/results) and must not be
-    counted as part of the function's own time. Exceptions are always recorded
+    all before invoking `func`. Its inputs are snapshotted BEFORE `func` runs
+    (so an argument `func` mutates is recorded as received), after which the
+    node's start is re-stamped so that capture isn't counted as the call's own
+    time. As soon as `func` returns or raises, :func:`_finish_node` stamps
+    ``time``/``end`` immediately — before output capture, for the same reason.
+    Outside any trace (no current node) the wrapper is a pure pass-through. Exceptions are always recorded
     on the node; what happens next depends on :data:`SUPPRESS_ERRORS` — off
     (the default), they re-raise as before, propagating up the real call stack;
     on, this call swallows its own exception and returns a default value
@@ -1291,39 +1918,57 @@ def _sync_wrap(func: Any, name: str) -> Any:
                 return func(*args, **kwargs)
             finally:
                 _skip_depth.reset(token)
-        parent = _current_node.get()
+        recording = _recording()
+        if recording is None:
+            # Not inside an open trace: behave exactly like the original.
+            return func(*args, **kwargs)
+        parent, state = recording
         node = make_node(name)
-        if parent is not None:
-            parent["children"].append(node)
+        # Inputs are snapshotted BEFORE the call, so an argument the call
+        # mutates is recorded as it was received, not as it was left. The
+        # node is still private here, so no lock is needed yet.
+        _record_inputs(node, args, kwargs, param_names)
+        if not state.attach(parent, node):
+            return func(*args, **kwargs)  # the trace closed meanwhile
         token = _current_node.set(node)
+        # `extra` (see _cache_wrap): called before the call, returns a
+        # callable giving extra fields for this node once the call is over.
+        finish_extra = extra() if extra is not None else None
+        done = None
+        _restart(node)  # input capture isn't part of the call's own time
         try:
             result = func(*args, **kwargs)
-            _finish_node(node)
-            _record_inputs(node, args, kwargs, param_names)
-            _record_output(node, result)
+            done = _completion(node)
+            _record_output(done, result)
             return result
         except BaseException as exc:
-            _finish_node(node)
-            _record_inputs(node, args, kwargs, param_names)
-            _record_exception(node, exc)
-            if not SUPPRESS_ERRORS:
+            done = _completion(node)
+            _record_exception(done, exc)
+            if not (suppress and _cfg.SUPPRESS_ERRORS):
                 raise
-            result = _compute_default_return(default_factory)
-            _record_output(node, result)
+            result = _default_return_unrecorded(default_factory)
+            _record_output(done, result)
             return result
         finally:
+            if done is not None:
+                if finish_extra is not None:
+                    done.update(finish_extra())
+                state.complete(node, done)
             _current_node.reset(token)
 
+    wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
     return wrapper
 
 
-def _async_wrap(func: Any, name: str) -> Any:
+def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
+    _cover(func, name)
     """Wrap a coroutine function so each awaited call becomes a timed tree node.
 
     Async analogue of :func:`_sync_wrap`: same node creation, input/output
     capture, parent linking, and current-node bookkeeping, but it ``await``\\ s
-    the inner coroutine. Timing is stamped immediately around the ``await`` —
-    input/output capture happens after — for the same reason as the sync path.
+    the inner coroutine. Inputs are snapshotted before the ``await`` and the
+    output after it, with timing stamped immediately around the ``await`` —
+    for the same reasons as the sync path.
     Because linkage flows through a ``ContextVar``, sibling coroutines running
     concurrently each attach to their own logical parent, and their nodes'
     start/time intervals let the reporter compute overlap-aware wall time.
@@ -1349,29 +1994,40 @@ def _async_wrap(func: Any, name: str) -> Any:
                 return await func(*args, **kwargs)
             finally:
                 _skip_depth.reset(token)
-        parent = _current_node.get()
+        recording = _recording()
+        if recording is None:
+            # Not inside an open trace: behave exactly like the original.
+            return await func(*args, **kwargs)
+        parent, state = recording
         node = make_node(name)
-        if parent is not None:
-            parent["children"].append(node)
+        # Inputs are snapshotted BEFORE the call, so an argument the call
+        # mutates is recorded as it was received, not as it was left. The
+        # node is still private here, so no lock is needed yet.
+        _record_inputs(node, args, kwargs, param_names)
+        if not state.attach(parent, node):
+            return await func(*args, **kwargs)  # the trace closed meanwhile
         token = _current_node.set(node)
+        _restart(node)  # input capture isn't part of the call's own time
         try:
             result = await func(*args, **kwargs)
-            _finish_node(node)
-            _record_inputs(node, args, kwargs, param_names)
-            _record_output(node, result)
+            done = _completion(node)
+            _record_output(done, result)
+            state.complete(node, done)
             return result
         except BaseException as exc:
-            _finish_node(node)
-            _record_inputs(node, args, kwargs, param_names)
-            _record_exception(node, exc)
-            if not SUPPRESS_ERRORS:
+            done = _completion(node)
+            _record_exception(done, exc)
+            if not (suppress and _cfg.SUPPRESS_ERRORS):
+                state.complete(node, done)
                 raise
-            result = _compute_default_return(default_factory)
-            _record_output(node, result)
+            result = _default_return_unrecorded(default_factory)
+            _record_output(done, result)
+            state.complete(node, done)
             return result
         finally:
             _current_node.reset(token)
 
+    wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
     return wrapper
 
 
@@ -1523,16 +2179,51 @@ def _sync_timeout(seconds: float | None, name: str) -> Any:
         yield
         return
 
+    from time import monotonic
+
+    # SIGALRM / ITIMER_REAL are process-wide and may already be in use by the
+    # caller (or an enclosing traced call). Their pending alarm is kept: if it
+    # is due before our deadline it is delivered to their handler on time and
+    # our deadline re-armed; afterwards their handler and remaining time (and
+    # repeat interval) are restored.
+    deadline = monotonic() + seconds
+    prev_delay, prev_interval = signal.getitimer(signal.ITIMER_REAL)
+    prev_due = monotonic() + prev_delay if prev_delay > 0 else None
+
+    def _arm() -> None:
+        due = deadline if prev_due is None else min(deadline, prev_due)
+        signal.setitimer(signal.ITIMER_REAL, max(due - monotonic(), 1e-6))
+
     def _handler(signum: int, frame: Any) -> None:
+        nonlocal prev_due
+        now = monotonic()
+        if prev_due is not None and prev_due <= now + 1e-3 and now < deadline - 1e-3:
+            prev_due = now + prev_interval if prev_interval > 0 else None
+            _arm()
+            _deliver(previous, signum, frame)
+            return
         raise TimeoutError(f"{name} exceeded TIMEOUT of {seconds:g}s")
 
     previous = signal.signal(signal.SIGALRM, _handler)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
+    _arm()
     try:
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+        if prev_due is not None:
+            signal.setitimer(signal.ITIMER_REAL, max(prev_due - monotonic(), 1e-6), prev_interval)
+
+
+def _deliver(handler: Any, signum: int, frame: Any) -> None:
+    """Runs a saved signal disposition for a signal perf intercepted."""
+    if callable(handler):
+        handler(signum, frame)
+    elif handler == signal.SIG_DFL:
+        # The default action (terminate, for SIGALRM): reproduce it faithfully.
+        signal.signal(signum, signal.SIG_DFL)
+        signal.raise_signal(signum)
+    # SIG_IGN / None: nothing to do
 
 
 # ── @trace entry-point decorator ─────────────────────────────────────────────
@@ -1560,6 +2251,10 @@ _CONFIG_KEYS = frozenset(
         "SKIP_FUNCTIONS",
         "SUPPRESS_ERRORS",
         "DEFAULT_RETURN",
+        "SKIP_VARIABLES",
+        "_SCAN_INCLUDE_PREFIXES",
+        "MAX_YIELDS_CAPTURE",
+        "REDACT_PATTERNS",
     }
 )
 
@@ -1575,26 +2270,18 @@ def _check_overrides(overrides: dict) -> None:
 
 @contextmanager
 def _apply_overrides(overrides: dict) -> Any:
-    """Temporarily set module-level config globals from `overrides`, then restore.
-
-    All config is read through module globals, so applying overrides for the
-    duration of the traced call makes every consumer (patching, capture, print,
-    send) honour them without threading a config object through the codebase.
-
-    Note: because it mutates globals, concurrently running traced calls that pass
-    *different* overrides can transiently see each other's values — same caveat
-    that already applies to setting ``perf.MIN_PCT`` etc. directly.
-    """
+    """Apply `overrides` for the dynamic extent of a traced call -- in the
+    current context only (see ``_overrides``), layered over any overrides of
+    an enclosing trace. Module globals are never touched, so concurrent traces
+    with different overrides can't see each other's values."""
     if not overrides:
         yield
         return
-    g = globals()
-    saved = {k: g[k] for k in overrides}
-    g.update(overrides)
+    token = _overrides.set({**(_overrides.get() or {}), **overrides})
     try:
         yield
     finally:
-        g.update(saved)
+        _overrides.reset(token)
 
 
 def trace(func: Any = None, **overrides: Any) -> Any:
@@ -1610,77 +2297,148 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         return partial(trace, **overrides)
     _check_overrides(overrides)
 
+    # A target an earlier trace already instrumented (e.g. `perf.trace(mod.fn)`
+    # after `mod` was patched) would otherwise show up as the root AND as the
+    # root's only child.
+    func = _unwrap_node(func)
+    _cover(func, func.__qualname__)
     _default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
     _param_names = _resolve_param_names(func)
+
+    @contextmanager
+    def _session(args: tuple, kwargs: dict) -> Any:
+        """Set up one traced call: root node + value pool made current (and
+        reset afterwards, so nothing called after this trace — or by an
+        enclosing trace this one is nested in — attaches to a finished
+        root), inputs snapshotted before the call, profiler installed."""
+        with _apply_overrides(overrides):
+            try:
+                _redactor()
+            except re.error as e:
+                raise ValueError(f"perf: invalid REDACT_PATTERNS entry: {e}") from None
+            _patch_all_project_classes()
+            _install_executor_hook()
+            root = make_node(func.__qualname__)
+            root["start_timestamp"] = root["end_timestamp"] = None  # set around the call (see _begin)
+            state = _TraceState()
+            node_token = _current_node.set(root)
+            trace_token = _current_trace.set(state)
+            # Fresh value pool for this trace only -- see _current_pool and _ValuePool.
+            pool_token = _current_pool.set(_ValuePool(state=state) if _cfg.CAPTURE_IO else None)
+            _events_acquire()
+            try:
+                _record_inputs(root, args, kwargs, _param_names)
+                uninstall_profiler = _install_profiler()
+                try:
+                    yield root
+                finally:
+                    root["end_timestamp"] = _now_iso()
+                    if "capture_time" in root:
+                        root["capture_time"] = round(root["capture_time"], _TIME_DECIMALS)
+                    uninstall_profiler()
+                    # Freeze the tree + pool before emitting them: work still
+                    # running on other threads can't change them any more.
+                    state.close()
+                    try:
+                        print_tree(root)
+                    except Exception as e:  # reporting must never change the traced call's outcome
+                        print(f"[perf] failed to report trace {root['name']}: {e!r}", file=sys.stderr)
+            finally:
+                _events_release()
+                _current_pool.reset(pool_token)
+                _current_trace.reset(trace_token)
+                _current_node.reset(node_token)
+
+    def _begin(root: dict) -> None:
+        _restart(root)  # setup above shouldn't count as the call's own time
+        root["start_timestamp"] = _now_iso()
+
+    def _failed(root: dict, exc: BaseException) -> Any:
+        if root["time"] is None:
+            _finish_node(root)
+        _record_exception(root, exc)
+        if not _cfg.SUPPRESS_ERRORS:
+            raise  # called from an `except` block: re-raises `exc` unchanged
+        result = _default_return_unrecorded(_default_factory)
+        _record_output(root, result)
+        return result
 
     if inspect.iscoroutinefunction(func):
 
         @wraps(func)
         async def wrapper(*args, **kwargs) -> Any:  # type: ignore
-            with _apply_overrides(overrides):
-                _patch_all_project_classes()  # ← NEW
-                _install_executor_hook()
-                root = make_node(func.__qualname__)
-                _current_node.set(root)
-                # Fresh value pool for this trace only -- see _current_pool
-                # and _ValuePool.
-                _current_pool.set(_ValuePool() if CAPTURE_IO else None)
-                _uninstall_profiler = _install_profiler()
-                _restart(root)  # setup above shouldn't count as the call's own time
+            with _session(args, kwargs) as root:
+                _begin(root)
                 try:
-                    if TIMEOUT is not None:
-                        result = await asyncio.wait_for(func(*args, **kwargs), TIMEOUT)
+                    if _cfg.TIMEOUT is not None:
+                        result = await asyncio.wait_for(func(*args, **kwargs), _cfg.TIMEOUT)
                     else:
                         result = await func(*args, **kwargs)
                     _finish_node(root)
-                    _record_inputs(root, args, kwargs, _param_names)
                     _record_output(root, result)
                 except BaseException as exc:
-                    _finish_node(root)
-                    _record_inputs(root, args, kwargs, _param_names)
-                    _record_exception(root, exc)
-                    if not SUPPRESS_ERRORS:
-                        raise
-                    result = _compute_default_return(_default_factory)
-                    _record_output(root, result)
-                finally:
-                    _uninstall_profiler()
-                    print_tree(root)
+                    result = _failed(root, exc)
                 return result
     else:
 
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
-            with _apply_overrides(overrides):
-                _patch_all_project_classes()  # ← NEW
-                _install_executor_hook()
-                root = make_node(func.__qualname__)
-                _current_node.set(root)
-                # Fresh value pool for this trace only -- see _current_pool
-                # and _ValuePool.
-                _current_pool.set(_ValuePool() if CAPTURE_IO else None)
-                _uninstall_profiler = _install_profiler()
+            with _session(args, kwargs) as root:
                 try:
-                    with _sync_timeout(TIMEOUT, func.__qualname__):
-                        _restart(root)  # setup above shouldn't count as the call's own time
+                    with _sync_timeout(_cfg.TIMEOUT, func.__qualname__):
+                        _begin(root)
                         result = func(*args, **kwargs)
                         _finish_node(root)
-                    _record_inputs(root, args, kwargs, _param_names)
                     _record_output(root, result)
                 except BaseException as exc:
-                    _finish_node(root)
-                    _record_inputs(root, args, kwargs, _param_names)
-                    _record_exception(root, exc)
-                    if not SUPPRESS_ERRORS:
-                        raise
-                    result = _compute_default_return(_default_factory)
-                    _record_output(root, result)
-                finally:
-                    _uninstall_profiler()
-                    print_tree(root)
+                    result = _failed(root, exc)
                 return result
 
+    # Never auto-instrument the entry point itself (it makes its own root).
+    wrapper._perf_wrapped = True  # type: ignore
+    _WRAPPER_CODES.add(wrapper.__code__)
     return wrapper
+
+
+def _unwrap_node(fn: Any) -> Any:
+    """`fn` without perf's own node wrapper, if it has one (bound methods are
+    re-bound to the unwrapped function)."""
+    if inspect.ismethod(fn) and getattr(fn.__func__, "_perf_node", False):
+        return types.MethodType(fn.__func__.__wrapped__, fn.__self__)
+    if inspect.isfunction(fn) and getattr(fn, "_perf_node", False):
+        return fn.__wrapped__
+    return fn
+
+
+def _instrumented(fn: Any) -> Any:
+    """`fn` as it looks now that this process is patched: an original free
+    function becomes its wrapper, a bound method of a since-patched class
+    becomes the bound wrapper, and a ``functools.partial`` (e.g. the
+    per-chunk partial ``Executor.map`` submits) is rebuilt with its function
+    and arguments resolved the same way. Anything else is returned as-is.
+
+    Needed where a reference was taken BEFORE patching ran — e.g. unpickled
+    in a fresh worker process — and would otherwise bypass instrumentation.
+    """
+    if isinstance(fn, partial):
+        return partial(
+            _instrumented(fn.func),
+            *[_instrumented(a) for a in fn.args],
+            **{k: _instrumented(v) for k, v in fn.keywords.items()},
+        )
+    if inspect.isfunction(fn):
+        entry = _wrapped_originals.get(id(fn))
+        if entry is not None and entry[0] is fn:
+            return entry[1]
+        return fn
+    if inspect.ismethod(fn) and not getattr(fn.__func__, "_perf_node", False):
+        try:
+            current = getattr(fn.__self__, fn.__func__.__name__)
+        except Exception:
+            return fn
+        if inspect.ismethod(current) and getattr(current.__func__, "__wrapped__", None) is fn.__func__:
+            return current
+    return fn
 
 
 # ── ProcessPoolExecutor: trace work submitted to other processes ──────────────
@@ -1708,6 +2466,8 @@ _REMOTE_CONFIG_KEYS = (
     "SKIP_VARIABLES",
     "SUPPRESS_ERRORS",
     "DEFAULT_RETURN",
+    "MAX_YIELDS_CAPTURE",
+    "REDACT_PATTERNS",
 )
 
 
@@ -1723,7 +2483,7 @@ def _remote_config() -> dict:
 
     config = {}
     for key in _REMOTE_CONFIG_KEYS:
-        value = globals()[key]
+        value = getattr(_cfg, key)
         if key == "DEFAULT_RETURN":
             if value is _UNSET:
                 continue
@@ -1751,10 +2511,11 @@ class _RemoteOutcome:
     to. On failure the same object rides back on the exception instead, as
     its ``_perf_remote`` attribute."""
 
-    def __init__(self, result: Any, children: list, variables: dict) -> None:
+    def __init__(self, result: Any, children: list, variables: dict, token: Any = None) -> None:
         self.result = result
         self.children = children
         self.variables = variables
+        self.token = token  # multiprocessing.Pool: where to graft (see _pool_grafts)
 
 
 class _RemoteCall:
@@ -1765,10 +2526,11 @@ class _RemoteCall:
     parent imported it.
     """
 
-    def __init__(self, fn: Any, name: str, config: dict) -> None:
+    def __init__(self, fn: Any, name: str, config: dict, token: Any = None) -> None:
         self.fn = fn
         self.name = name
         self.config = config
+        self.token = token
 
     def __call__(self, *args: Any, **kwargs: Any) -> "_RemoteOutcome":
         # A fresh, empty Context: the worker's own state (if it is itself
@@ -1781,42 +2543,46 @@ class _RemoteCall:
     def _run(self, args: tuple, kwargs: dict) -> "_RemoteOutcome":
         import uuid
 
-        g = globals()
-        saved = {k: g[k] for k in self.config}
-        g.update(self.config)
+        _overrides.set(dict(self.config))  # this call's own fresh Context (see __call__)
+        _install_executor_hook()  # nested pools inside the worker get traced too
+        _patch_all_project_classes()
+        holder = make_node(self.name)
+        state = _TraceState()
+        pool = _ValuePool(prefix=f"{uuid.uuid4().hex[:8]}_", state=state) if _cfg.CAPTURE_IO else None
+        _current_node.set(holder)
+        _current_trace.set(state)
+        _current_pool.set(pool)
+        # Unpickled by name BEFORE the patching above, `fn` (or, for the
+        # functools.partial Executor.map submits per chunk, the function
+        # inside it) is the original on this worker's first task but
+        # already the wrapper on later ones. Resolve it to the patched
+        # version so every task gets exactly one node; a callable that
+        # still isn't instrumented (not project code / not reachable by
+        # name) is wrapped here. Other callables (the partial itself) get
+        # no node of their own; what they call attaches to the parent.
+        fn = _instrumented(self.fn)
+        target = fn.__func__ if inspect.ismethod(fn) else fn
+        if inspect.isfunction(target) and not getattr(target, "_perf_node", False):
+            fn = _sync_wrap(fn, self.name)
+        uninstall_profiler = _install_profiler()
+        _events_acquire()
         try:
-            _install_executor_hook()  # nested pools inside the worker get traced too
-            _patch_all_project_classes()
-            holder = make_node(self.name)
-            pool = _ValuePool(prefix=f"{uuid.uuid4().hex[:8]}_") if CAPTURE_IO else None
-            _current_node.set(holder)
-            _current_pool.set(pool)
-            # Unpickled by name, `fn` is the original on this worker's first
-            # task (its module wasn't patched yet) but already the wrapper on
-            # later ones — wrap it only when it isn't, so it gets one node.
-            # Non-function callables (e.g. the functools.partial that
-            # Executor.map submits per chunk) get no node of their own; the
-            # project calls they make attach straight to the parent.
-            fn = self.fn
-            if not getattr(fn, "_perf_wrapped", False) and (inspect.isfunction(fn) or inspect.ismethod(fn)):
-                fn = _sync_wrap(fn, self.name)
-            uninstall_profiler = _install_profiler()
+            result = fn(*args, **kwargs)
+        except BaseException as exc:
+            state.close()  # freeze before pickling: threads the call started may still run
             try:
-                result = fn(*args, **kwargs)
-            except BaseException as exc:
-                try:
-                    exc._perf_remote = _RemoteOutcome(None, holder["children"], pool.variables if pool else {})
-                except Exception:
-                    pass  # an exception type that rejects attributes just loses its subtree
-                raise
-            finally:
-                uninstall_profiler()
-            return _RemoteOutcome(result, holder["children"], pool.variables if pool else {})
+                exc._perf_remote = _RemoteOutcome(None, holder["children"], pool.variables if pool else {}, self.token)
+            except Exception:
+                pass  # an exception type that rejects attributes just loses its subtree
+            raise
         finally:
-            g.update(saved)
+            _events_release()
+            uninstall_profiler()
+        state.close()
+        return _RemoteOutcome(result, holder["children"], pool.variables if pool else {}, self.token)
 
 
-def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None") -> None:
+def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None", state: "_TraceState") -> None:
     """Unwraps a finished remote future in place: swaps the
     :class:`_RemoteOutcome` in its result for the real result (or strips it
     off its exception), and attaches the worker subtree under `parent`.
@@ -1833,9 +2599,12 @@ def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None") -> None:
         future._result = outcome.result
     if not isinstance(outcome, _RemoteOutcome):
         return
-    if pool is not None:
-        pool.variables.update(outcome.variables)
-    parent["children"].extend(outcome.children)
+    with state.lock:
+        if not state.open:
+            return  # finished after the trace ended: not part of it
+        if pool is not None:
+            pool.variables.update(outcome.variables)
+        parent["children"].extend(outcome.children)
 
 
 _original_process_submit: Any = None
@@ -1855,9 +2624,10 @@ def _traced_submit(self: Any, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
     executor's ``set_result``) is what makes this race-free: nobody can read
     the future before submit() returns it.
     """
-    parent = _current_node.get()
-    if parent is None or _skip_depth.get():
+    recording = _recording()
+    if recording is None or _skip_depth.get():
         return _original_process_submit(self, fn, *args, **kwargs)
+    parent, state = recording
 
     future = _original_process_submit(self, _RemoteCall(fn, _remote_name(fn), _remote_config()), *args, **kwargs)
     pool = _current_pool.get()
@@ -1869,7 +2639,7 @@ def _traced_submit(self: Any, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
         with lock:
             if not grafted:
                 grafted = True
-                _graft_remote(f, parent, pool)
+                _graft_remote(f, parent, pool, state)
 
     original_result, original_exception = future.result, future.exception
 
@@ -1889,19 +2659,408 @@ def _traced_submit(self: Any, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
     return future
 
 
+# ── multiprocessing.Pool (and ThreadPool) ─────────────────────────────────────
+# Same idea as ProcessPoolExecutor: while a trace is open, the function handed
+# to apply/map/starmap/imap (and their _async forms) is sent as a _RemoteCall
+# that traces it in the worker and ships the subtree back. A Pool delivers
+# results through its own result objects (on its result-handler thread), so
+# the graft target is registered under a token BEFORE the task is queued and
+# travels with the call -- a worker that finishes before submit() returns can't
+# race past it. Every outcome is unwrapped before the program can see it.
+
+_pool_grafts: dict = {}  # token -> (parent node, value pool, trace state)
+_pool_tokens = itertools.count(1)
+_original_pool_methods: dict = {}
+_original_pool_sets: dict = {}
+
+
+def _pool_hook(original: Any) -> Any:
+    def hooked(self: Any, func: Any, *args: Any, **kwargs: Any) -> Any:
+        recording = _recording()
+        if recording is None or _skip_depth.get():
+            return original(self, func, *args, **kwargs)
+        parent, state = recording
+        token = next(_pool_tokens)  # an int: survives the pickle round trip to the worker
+        _pool_grafts[token] = (parent, _current_pool.get(), state)
+        state.graft_tokens.append(token)
+        return original(self, _RemoteCall(func, _remote_name(func), _remote_config(), token), *args, **kwargs)
+
+    return hooked
+
+
+def _graft_outcome(outcome: "_RemoteOutcome") -> Any:
+    entry = _pool_grafts.get(outcome.token)
+    if entry is not None:
+        parent, pool, state = entry
+        with state.lock:
+            if state.open:
+                if pool is not None:
+                    pool.variables.update(outcome.variables)
+                parent["children"].extend(outcome.children)
+    return outcome.result
+
+
+def _unwrap_pool_result(obj: Any) -> Any:
+    """``(success, value)`` as a Pool worker reported it, with every
+    _RemoteOutcome grafted and replaced by the real result."""
+    try:
+        success, value = obj
+    except (TypeError, ValueError):
+        return obj
+    if success:
+        if isinstance(value, _RemoteOutcome):
+            value = _graft_outcome(value)
+        elif isinstance(value, list) and any(isinstance(v, _RemoteOutcome) for v in value):
+            value = [_graft_outcome(v) if isinstance(v, _RemoteOutcome) else v for v in value]
+    else:
+        outcome = getattr(value, "__dict__", {}).pop("_perf_remote", None)
+        if isinstance(outcome, _RemoteOutcome):
+            _graft_outcome(outcome)
+    return (success, value)
+
+
+def _pool_set_hook(original: Any) -> Any:
+    def _set(self: Any, i: Any, obj: Any) -> Any:
+        return original(self, i, _unwrap_pool_result(obj))
+
+    return _set
+
+
+def _install_pool_hooks() -> None:
+    from multiprocessing import pool as mp_pool
+
+    for name in ("apply_async", "_map_async", "imap", "imap_unordered"):
+        original = getattr(mp_pool.Pool, name)
+        _original_pool_methods[name] = original
+        setattr(mp_pool.Pool, name, _pool_hook(original))
+    for cls in (mp_pool.ApplyResult, mp_pool.MapResult, mp_pool.IMapIterator, mp_pool.IMapUnorderedIterator):
+        if "_set" in vars(cls):
+            _original_pool_sets[cls] = vars(cls)["_set"]
+            cls._set = _pool_set_hook(vars(cls)["_set"])
+
+
+# ── threads: carry the trace onto other threads ───────────────────────────────
+# A new thread starts with an empty context, so before these hooks every call
+# made on another thread was silently dropped. While a trace is open:
+#
+# * ThreadPoolExecutor.submit (and so .map and loop.run_in_executor) runs each
+#   JOB in a copy of the submitter's context. The pool's worker THREADS never
+#   inherit a trace -- they are long-lived and also run jobs submitted later,
+#   from outside the trace or from another trace, which must not be recorded
+#   into this one.
+# * Thread.start gives the new thread a copy of the starter's context -- but
+#   only for a thread whose entry point is project code (the same rule as for
+#   instrumentation). Library/stdlib-internal threads (executor workers,
+#   connection-pool keepalives, ...) are long-lived workers too.
+#
+# Work that is still running when the trace ends stops being recorded at that
+# moment (see _TraceState). A thread started during a trace keeps a reference
+# to that trace's data until the thread itself exits.
+
+_original_thread_submit: Any = None
+_original_thread_start: Any = None
+
+
+def _traced_thread_submit(self: Any, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Replacement for ``ThreadPoolExecutor.submit``: inside an open trace,
+    the job runs in a copy of the submitter's context."""
+    if _recording() is None:
+        return _original_thread_submit(self, fn, *args, **kwargs)
+    return _original_thread_submit(self, contextvars.copy_context().run, fn, *args, **kwargs)
+
+
+def _thread_entry(thread: Any) -> Any:
+    """The callable a Thread will run: its target, a Timer's function, or an
+    overridden ``run``."""
+    for attr in ("_target", "function"):  # Thread(target=...), threading.Timer
+        entry = getattr(thread, attr, None)
+        if entry is not None:
+            return entry
+    run = type(thread).run
+    return None if run is threading.Thread.run else run
+
+
+def _is_project_callable(fn: Any) -> bool:
+    while isinstance(fn, partial):
+        fn = fn.func
+    fn = getattr(fn, "__func__", fn)
+    module = sys.modules.get(getattr(fn, "__module__", None) or "")
+    return module is not None and module.__name__ != __name__ and _is_project_module(module)
+
+
+def _traced_thread_start(self: Any) -> Any:
+    """Replacement for ``Thread.start``: inside an open trace, a thread whose
+    entry point is project code runs in a copy of the starter's context."""
+    if _recording() is not None and _is_project_callable(_thread_entry(self)):
+        ctx = contextvars.copy_context()
+        run = self.run
+        self.run = lambda: ctx.run(run)
+    return _original_thread_start(self)
+
+
+# ── unwrapped project functions: nodes from sys.monitoring events (3.12+) ────
+# Instrumentation by rebinding names can't reach a function nobody looks up
+# by name: nested defs, closures, lambdas, functions held in dicts / registries
+# / instance attributes since before the trace, or swapped in mid-trace. On
+# Python 3.12+, PY_START / PY_RETURN / PY_UNWIND events give such calls nodes
+# too (same capture, timing and naming as wrapped calls):
+#
+# * only plain project functions -- not generator/coroutine bodies (their
+#   suspension can't be tracked from these events), class bodies, or dunders;
+#   events for everything else are switched off per code object (DISABLE), so
+#   library code costs nothing after its first call;
+# * a call made directly by one of perf's own wrappers is skipped (the wrapper
+#   already records it), as is a same-named call directly under a wrapped call
+#   (the original function behind a decorator);
+# * events are only enabled while at least one trace is running.
+#
+# SUPPRESS_ERRORS can't apply to these calls (an event can't change what the
+# function does); their failures are recorded and propagate as usual.
+
+_NODE_TOOL_ID = 4
+_events_available = hasattr(sys, "monitoring")
+_events_users = 0
+_events_lock = threading.Lock()
+_events_ready = False
+_event_names: dict = {}  # code object -> node name, or None (not traced)
+_event_tls = threading.local()  # .stack: [(id(frame), node, token, state)]
+_WRAPPER_CODES: set = set()
+# node name -> code objects that node's call already covers: the layers of a
+# decorated function (and the original behind them), found via __wrapped__
+# and closure cells when perf wraps it. Calls of those codes made directly
+# under such a node are folded into it instead of becoming nested nodes.
+_COVERED_CODES: dict = {}
+
+
+def _cover(func: Any, name: str) -> None:
+    codes, todo, seen = set(), [func], set()
+    while todo and len(seen) < 16:
+        f = todo.pop()
+        if id(f) in seen:
+            continue
+        seen.add(id(f))
+        f = getattr(f, "__func__", f)
+        code = getattr(f, "__code__", None)
+        if code is not None:
+            codes.add(code)
+        inner = getattr(f, "__wrapped__", None)
+        if inner is not None:
+            todo.append(inner)
+        for cell in getattr(f, "__closure__", None) or ():
+            try:
+                content = cell.cell_contents
+            except ValueError:  # empty cell
+                continue
+            if inspect.isfunction(content) or inspect.ismethod(content):
+                todo.append(content)
+    if codes:
+        _COVERED_CODES[name] = _COVERED_CODES.get(name, frozenset()) | frozenset(codes)
+_CO_SKIP = 0x20 | 0x80 | 0x100 | 0x200  # GENERATOR | COROUTINE | ITERABLE_COROUTINE | ASYNC_GENERATOR
+_CO_OPTIMIZED = 0x1
+
+
+def _event_name(code: Any, frame: Any) -> Any:
+    """Node name for a call of `code`, or None if it shouldn't get one."""
+    name = code.co_name
+    if not code.co_flags & _CO_OPTIMIZED or code.co_flags & _CO_SKIP or (name.startswith("__") and name.endswith("__")):
+        return None
+    module_name = frame.f_globals.get("__name__")
+    module = sys.modules.get(module_name) if module_name else None
+    if module is None or module_name == __name__ or not _is_project_module(module):
+        return None
+    qualname = getattr(code, "co_qualname", name)
+    local = qualname.rsplit("<locals>.", 1)[-1]
+    if "." in local and not local.startswith("<"):
+        return local  # a method: `Class.method`, like wrapped methods
+    return f"{module_name}.{qualname}"
+
+
+def _on_event_start(code: Any, offset: int) -> Any:
+    try:
+        name = _event_names.get(code, _SKIP)
+        frame = sys._getframe(1)
+        if name is _SKIP:
+            name = _event_names[code] = _event_name(code, frame)
+        if name is None:
+            return sys.monitoring.DISABLE
+        caller = frame.f_back
+        if caller is not None and caller.f_code in _WRAPPER_CODES:
+            return None  # perf's wrapper records this call
+        recording = _recording()
+        if recording is None or _skip_depth.get() or _is_skipped(name):
+            return None
+        parent, state = recording
+        stack = getattr(_event_tls, "stack", None)
+        if stack is None:
+            stack = _event_tls.stack = []
+        if not (stack and stack[-1][1] is parent) and (
+            parent["name"] == name or code in _COVERED_CODES.get(parent["name"], ())
+        ):
+            return None  # a decorator layer / the original behind a wrapped call
+        node = make_node(name)
+        _record_frame_inputs(node, code, frame)
+        if not state.attach(parent, node):
+            return None
+        stack.append((id(frame), node, _current_node.set(node), state))
+        _restart(node)
+    except Exception:
+        pass  # instrumentation must never break the program
+    return None
+
+
+def _event_end(code: Any, value: Any, failed: bool) -> Any:
+    try:
+        name = _event_names.get(code, _SKIP)
+        if name is None:
+            return sys.monitoring.DISABLE
+        stack = getattr(_event_tls, "stack", None)
+        if not stack or stack[-1][0] != id(sys._getframe(2)):
+            return None
+        _, node, token, state = stack.pop()
+        done = _completion(node)
+        if failed:
+            _record_exception(done, value)
+        else:
+            _record_output(done, value)
+        state.complete(node, done)
+        _current_node.reset(token)
+    except Exception:
+        pass
+    return None
+
+
+def _on_event_return(code: Any, offset: int, retval: Any) -> Any:
+    return _event_end(code, retval, False)
+
+
+def _on_event_unwind(code: Any, offset: int, exc: BaseException) -> Any:
+    _event_end(code, exc, True)
+    return None  # DISABLE isn't allowed for PY_UNWIND
+
+
+def _record_frame_inputs(node: dict, code: Any, frame: Any) -> None:
+    """The call's arguments, read from its frame before its body runs:
+    positional(-or-keyword) parameters in order (then *args) as `args`,
+    keyword-only parameters (then **kwargs) as `kwargs`."""
+    names = code.co_varnames
+    f_locals = frame.f_locals
+    n_pos, n_kw = code.co_argcount, code.co_kwonlyargcount
+    positional = names[:n_pos]
+    args = [f_locals[p] for p in positional if p in f_locals]
+    kwargs = {k: f_locals[k] for k in names[n_pos:n_pos + n_kw] if k in f_locals}
+    i = n_pos + n_kw
+    if code.co_flags & 0x04:  # *args
+        args.extend(f_locals.get(names[i], ()))
+        i += 1
+    if code.co_flags & 0x08:  # **kwargs
+        kwargs.update(f_locals.get(names[i], {}))
+    _record_inputs(node, tuple(args), kwargs, positional)
+
+
+def _events_acquire() -> None:
+    """Enable the node events while a trace runs (refcounted across traces)."""
+    global _events_users, _events_ready
+    if not _events_available:
+        return
+    with _events_lock:
+        if not _events_ready:
+            m = sys.monitoring
+            try:
+                m.use_tool_id(_NODE_TOOL_ID, "perf-nodes")
+            except ValueError:
+                return  # slot taken by another tool: just no event nodes
+            m.register_callback(_NODE_TOOL_ID, m.events.PY_START, _on_event_start)
+            m.register_callback(_NODE_TOOL_ID, m.events.PY_RETURN, _on_event_return)
+            m.register_callback(_NODE_TOOL_ID, m.events.PY_UNWIND, _on_event_unwind)
+            _events_ready = True
+        _events_users += 1
+        if _events_users == 1:
+            m = sys.monitoring
+            m.set_events(_NODE_TOOL_ID, m.events.PY_START | m.events.PY_RETURN | m.events.PY_UNWIND)
+
+
+def _events_release() -> None:
+    global _events_users
+    if not _events_available or not _events_ready:
+        return
+    with _events_lock:
+        _events_users -= 1
+        if _events_users == 0:
+            sys.monitoring.set_events(_NODE_TOOL_ID, 0)
+
+
+def _events_config_changed() -> None:
+    """Project-ness may have changed (SCAN_VENV …): re-decide every code object."""
+    _event_names.clear()
+    if _events_available and _events_ready:
+        sys.monitoring.restart_events()
+
+
+# ── code created during a trace: patch it as it comes into existence ─────────
+# Patching at trace start only sees what already exists. A module imported (or
+# reloaded) mid-trace, or a class defined while the trace runs (inside a
+# function, or in that new module), used to be invisible -- or patched lazily
+# on its first call, which by then was already running unwrapped. These hooks
+# instrument such code the moment it is created, while a trace is recording.
+
+_original_build_class: Any = None
+_original_exec_module: Any = None
+
+
+def _traced_build_class(func: Any, name: str, *bases: Any, **kwargs: Any) -> Any:
+    """Replacement for ``builtins.__build_class__`` (every ``class`` statement)."""
+    cls = _original_build_class(func, name, *bases, **kwargs)
+    if isinstance(cls, type) and _recording() is not None:
+        try:
+            _patch_class(cls)
+        except Exception:
+            pass  # instrumentation must never break class creation
+    return cls
+
+
+def _traced_exec_module(self: Any, module: Any) -> None:
+    """Replacement for ``SourceFileLoader.exec_module`` (import / import_module /
+    reload of a .py module)."""
+    _original_exec_module(self, module)
+    if _recording() is not None:
+        try:
+            with _patch_lock:
+                if _is_project_module(module):
+                    _patch_module_functions(module)
+                    _patch_reexported_names(module)
+        except Exception:
+            pass  # instrumentation must never break an import
+
+
 def _install_executor_hook() -> None:
-    """Route ``ProcessPoolExecutor.submit`` through :func:`_traced_submit`
-    (once per process). Patched on the class, so it covers executors created
-    before the trace started, subclasses, and ``Executor.map`` (built on
+    """Install the cross-thread / cross-process hooks (once per process):
+    ``ProcessPoolExecutor.submit`` → :func:`_traced_submit`,
+    ``ThreadPoolExecutor.submit`` → :func:`_traced_thread_submit`,
+    ``Thread.start`` → :func:`_traced_thread_start`. Patched on the classes,
+    so they cover executors/threads created before the trace started,
+    subclasses, ``Executor.map`` and ``loop.run_in_executor`` (built on
     submit). Deferred until the first trace so merely importing perf doesn't
     pull in multiprocessing."""
-    global _original_process_submit
+    global _original_process_submit, _original_thread_submit, _original_thread_start
+    global _original_build_class, _original_exec_module
     if _original_process_submit is not None:
         return
-    from concurrent.futures import ProcessPoolExecutor
+    import builtins
+    import importlib.machinery
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
+    _original_build_class = builtins.__build_class__
+    builtins.__build_class__ = _traced_build_class
+    _original_exec_module = importlib.machinery.SourceFileLoader.exec_module
+    importlib.machinery.SourceFileLoader.exec_module = _traced_exec_module
+
+    _original_thread_submit = ThreadPoolExecutor.submit
+    ThreadPoolExecutor.submit = _traced_thread_submit
+    _original_thread_start = threading.Thread.start
+    threading.Thread.start = _traced_thread_start
     _original_process_submit = ProcessPoolExecutor.submit
     ProcessPoolExecutor.submit = _traced_submit
+    _install_pool_hooks()
 
 
 # ── collapse / merge helpers ─────────────────────────────────────────────────
@@ -1937,6 +3096,8 @@ def _merge_children(nodes: list) -> list:
         merged[name]["count"] += node.get("count", 1)
         merged[name]["children"].extend(node["children"])
         merged[name]["_intervals"].append({"start": node.get("start", 0), "time": node_wall})
+        if "active_time" in node:
+            merged[name]["active_time"] = merged[name].get("active_time", 0.0) + node["active_time"]
 
     for name in order:
         merged[name]["time"] = _wall_from_intervals(merged[name].pop("_intervals"))
@@ -2106,7 +3267,9 @@ def _self_time(node: dict) -> float:
     apparent "own work" by however much capture its descendants did.
     """
     children = node["children"]
-    t = node["time"] or 0
+    # A generator's node spans first resume → end, including the consumer's
+    # work between yields (which is NOT its child); its own time is active_time.
+    t = node.get("active_time", node["time"] or 0)
     if not children:
         return t
     occupied = [{"start": c.get("start", 0), "time": (c["time"] or 0) + c.get("capture_time", 0.0)} for c in children]
@@ -2147,12 +3310,12 @@ def _aggregate(root: dict) -> dict[str, dict]:
 
 
 def _format_hot_spots(root: dict, total: float) -> str:
-    if not HOT_SPOTS:
+    if not _cfg.HOT_SPOTS:
         return ""
     stats = _aggregate(root)
     if not stats:
         return ""
-    ranked = sorted(stats.items(), key=lambda kv: kv[1]["self"], reverse=True)[:HOT_SPOTS]
+    ranked = sorted(stats.items(), key=lambda kv: kv[1]["self"], reverse=True)[:_cfg.HOT_SPOTS]
     rows = []
     for name, s in ranked:
         wall = s["wall"]
@@ -2229,30 +3392,39 @@ def _write_output(root: dict) -> None:
     ``{"__ref__": ref}``, instead of being duplicated inline at every
     occurrence.
     """
-    if not OUTPUT_DIR and not OUTPUT_FILE:
+    if not _cfg.OUTPUT_DIR and not _cfg.OUTPUT_FILE:
         return
 
     import json
 
-    tree = {**root, "children": _filter_by_names(root["children"], set(LOG_FUNCTIONS))} if LOG_FUNCTIONS else root
+    tree = {**root, "children": _filter_by_names(root["children"], set(_cfg.LOG_FUNCTIONS))} if _cfg.LOG_FUNCTIONS else root
     pool = _current_pool.get()
     payload = {"variables": pool.variables if pool is not None else {}, "trace": tree}
 
-    if OUTPUT_DIR:
-        directory = Path(OUTPUT_DIR)
-        directory.mkdir(parents=True, exist_ok=True)
-        if OUTPUT_FILE:
-            filename = OUTPUT_FILE if OUTPUT_FILE.endswith(".json") else f"{OUTPUT_FILE}.json"
+    if _cfg.OUTPUT_DIR:
+        directory = Path(_cfg.OUTPUT_DIR)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[perf] failed to write trace to {directory}: {e}", file=sys.stderr)
+            return
+        if _cfg.OUTPUT_FILE:
+            filename = _cfg.OUTPUT_FILE if _cfg.OUTPUT_FILE.endswith(".json") else f"{_cfg.OUTPUT_FILE}.json"
         else:
             import uuid
 
             filename = f"{uuid.uuid4()}.json"
         path = directory / filename
     else:
-        path = Path(OUTPUT_FILE)
+        path = Path(_cfg.OUTPUT_FILE)
 
-    with open(path, "w") as f:
-        f.write(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    try:
+        with open(path, "w") as f:
+            # Compact: indentation was ~97% of a deep trace's bytes. Pretty-print
+            # for reading with `python -m json.tool perf.json` (or `jq .`).
+            f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str))
+    except Exception as e:  # never let telemetry change the traced call's result/exception
+        print(f"[perf] failed to write trace to {path}: {e}", file=sys.stderr)
 
 
 # ── printer ───────────────────────────────────────────────────────────────────
@@ -2281,7 +3453,7 @@ def print_tree(root: dict) -> None:
     """
     lines: list[tuple[str, str, str, str, str]] = []
     total = root["time"] or 1
-    threshold = total * MIN_PCT
+    threshold = total * _cfg.MIN_PCT
 
     def pct_of_parent(node: dict, parent_total: float) -> str:
         if not parent_total:
@@ -2321,7 +3493,7 @@ def print_tree(root: dict) -> None:
             h_total = sum(_total(c) for c in hidden)
             lines.append(
                 (
-                    f"{child_prefix}└─ … {len(hidden)} hidden < {MIN_PCT * 100:g}%",
+                    f"{child_prefix}└─ … {len(hidden)} hidden < {_cfg.MIN_PCT * 100:g}%",
                     fmt(ht),
                     "—",
                     f"{ht / total * 100:4.0f}%",
@@ -2338,8 +3510,22 @@ def print_tree(root: dict) -> None:
     lines.append(("─ " + root["name"], root_time_str, fmt(_self_time(root)), "100%", "  —"))
     children = _collapse(root["children"])
     root_total = _total(root)
-    for i, child in enumerate(children):
-        walk(child, "", i == len(children) - 1, root_total)
+    visible = [c for c in children if (c["time"] or 0) >= threshold]
+    hidden = [c for c in children if (c["time"] or 0) < threshold]
+    for i, child in enumerate(visible):
+        walk(child, "", i == len(visible) - 1 and not hidden, root_total)
+    if hidden:
+        ht = sum(c["time"] or 0 for c in hidden)
+        h_total = sum(_total(c) for c in hidden)
+        lines.append(
+            (
+                f"└─ … {len(hidden)} hidden < {_cfg.MIN_PCT * 100:g}%",
+                fmt(ht),
+                "—",
+                f"{ht / total * 100:4.0f}%",
+                f"{min(h_total / root_total, 1.0) * 100:4.0f}%" if root_total else "   —",
+            )
+        )
 
     name_w = max(len(n) for n, *_ in lines) + 2
     time_w = max(len(t) for _, t, *_ in lines) + 2
@@ -2402,7 +3588,7 @@ def _send_trace(root: dict) -> None:
     A failed send is logged to stderr and swallowed either way — telemetry
     must never break the traced call.
     """
-    if not ENDPOINT_URL:
+    if not _cfg.ENDPOINT_URL:
         return
     import json
     import urllib.request
@@ -2411,18 +3597,21 @@ def _send_trace(root: dict) -> None:
     pool = _current_pool.get()
     payload = {
         "status": "error" if is_error else "ok",
-        "tags": TAGS,
+        "tags": _cfg.TAGS,
         "variables": pool.variables if pool is not None else {},
         "trace": root,
     }
-    data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    # Resolved NOW, in the trace's context: the send may run on a background
+    # thread after the trace (and its per-trace overrides) has ended.
+    url, api_key = _cfg.ENDPOINT_URL, _cfg.API_KEY
 
     def _post() -> None:
         headers = {"Content-Type": "application/json"}
-        if API_KEY:
-            headers["X-API-Key"] = API_KEY
+        if api_key:
+            headers["X-API-Key"] = api_key
         req = urllib.request.Request(
-            ENDPOINT_URL,
+            url,
             data=data,
             headers=headers,
             method="POST",
@@ -2431,7 +3620,7 @@ def _send_trace(root: dict) -> None:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 resp.read()
         except Exception as e:  # never let telemetry break the traced call
-            print(f"[perf] failed to POST trace to {ENDPOINT_URL}: {e}", file=sys.stderr)
+            print(f"[perf] failed to POST trace to {url}: {e}", file=sys.stderr)
 
     if is_error:
         _post()
@@ -2453,3 +3642,6 @@ def _send_trace(root: dict) -> None:
 # @trace
 # def a() -> None:
 #     print(1)
+
+
+_register_wrapper_codes()
