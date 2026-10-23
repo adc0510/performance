@@ -149,10 +149,13 @@ def outlives():
 
 
 STOP = threading.Event()
+STARTED = threading.Semaphore(0)
 
 
 def busy(i):
     payload = {"worker": i, "data": list(range(40))}
+    leaf(payload)
+    STARTED.release()  # this worker is running inside the trace
     while not STOP.is_set():
         leaf(payload)
 
@@ -161,7 +164,11 @@ def busy(i):
 def stress():
     for i in range(8):
         threading.Thread(target=busy, args=(i,), daemon=True).start()
-    time.sleep(0.1)
+    # A worker whose function only starts after the trace ended is (correctly)
+    # not part of it -- so make sure all 8 are running before the trace closes.
+    for _ in range(8):
+        STARTED.acquire(timeout=10)
+    time.sleep(0.05)
 
 
 def stress_ok():
@@ -174,7 +181,10 @@ def stress_ok():
     d = json.load(open(f"{perf.OUTPUT_DIR}/stress.json"))
     workers = [c for c in d["trace"]["children"] if c["name"] == "__main__.busy"]
     calls = sum(len(w["children"]) for w in workers)
-    return len(workers) == 8 and calls > 100 and "Traceback" not in err.getvalue() and "[perf]" not in err.getvalue()
+    ok = len(workers) == 8 and calls > 100 and "Traceback" not in err.getvalue() and "[perf]" not in err.getvalue()
+    if not ok:
+        print(f"stress detail: workers={len(workers)} calls={calls} stderr={err.getvalue()[-800:]!r}")
+    return ok
 
 
 if __name__ == "__main__":

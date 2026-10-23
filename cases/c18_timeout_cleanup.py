@@ -14,7 +14,7 @@ EXPECT = {
         {"status": "works", "desc": "timeout inside nested calls: every open node on the stack records the TimeoutError",
          "file": "nested", "path": ["nested", "__main__.outer", "__main__.inner_hang"]},
         {"status": "works", "desc": "...the innermost open call records it", "file": "nested",
-         "node": "__main__.inner_hang", "exception": "TimeoutError(*exceeded TIMEOUT*"},
+         "node": "__main__.inner_hang", "exception": "TraceTimeout(*exceeded TIMEOUT*"},
         {"status": "works", "desc": "...calls completed before the timeout are kept", "file": "nested",
          "node": "__main__.step", "result": 1, "lacks": ["exception"]},
         {"status": "works", "desc": "the timed-out code's `finally` blocks run (and calls made in them are traced)",
@@ -27,6 +27,14 @@ EXPECT = {
         {"status": "works", "desc": "a trace after a timed-out trace is clean: no leftover nodes, no spurious timeout",
          "file": "after", "node": "after", "result": 3, "lacks": ["exception"]},
         {"status": "works", "desc": "...its tree has only its own calls", "file": "after", "count": "*", "n": 2},
+        {"status": "works", "new": True, "fixes": "TIMEOUT could be swallowed by perf's own defensive error handling when the alarm interrupted perf's code — a hot loop of calls with a large argument (spending most of its time in perf's capture) never timed out",
+         "desc": "TIMEOUT in a hot loop that spends most of its time inside perf's capture code: stops on time in every one of 10 runs",
+         "stdout": "*hot loop timeouts on time: 10/10*"},
+        {"status": "works", "new": True, "fixes": "with SUPPRESS_ERRORS on, perf's own TimeoutError could be suppressed like any other error, letting a timed-out program carry on",
+         "desc": "SUPPRESS_ERRORS never swallows a TIMEOUT: the trace still stops",
+         "stdout": "*suppressed trace timed out: True*"},
+        {"status": "works", "new": True, "desc": "the timeout is a perf.TraceTimeout, a TimeoutError subclass: `except TimeoutError` keeps working",
+         "stdout": "*caught as TimeoutError: TraceTimeout*"},
         {"status": "works", "desc": "async: after a timed-out trace, another traced coroutine runs fine on the same event loop",
          "file": "async_after", "node": "async_after", "result": "fine", "lacks": ["exception"]},
     ],
@@ -60,6 +68,31 @@ def add(a, b):
 @perf.trace(TIMEOUT=0.2, OUTPUT_FILE="nested")
 def nested():
     outer()
+
+
+class Heavy:
+    def __init__(self):
+        self.data = {f"k{i}": i for i in range(300)}  # each capture of it takes a while
+
+
+def touch(obj):
+    return obj
+
+
+def hot_loop():
+    obj = Heavy()
+    while True:
+        touch(obj)
+
+
+@perf.trace(TIMEOUT=0.1, OUTPUT_FILE="hot")
+def hot():
+    hot_loop()
+
+
+@perf.trace(TIMEOUT=0.1, SUPPRESS_ERRORS=True, OUTPUT_FILE="hot_suppressed")
+def hot_suppressed():
+    hot_loop()
 
 
 @perf.trace(TIMEOUT=5, OUTPUT_FILE="after")
@@ -115,3 +148,19 @@ if __name__ == "__main__":
     time.sleep(1.0)
     print("user alarm fired:", fired == [signal.SIGALRM])
     asyncio.run(both())
+    on_time = 0
+    for _ in range(10):
+        t0 = time.perf_counter()
+        try:
+            hot()
+        except TimeoutError:
+            pass
+        on_time += time.perf_counter() - t0 < 1.0
+    print(f"hot loop timeouts on time: {on_time}/10")
+    t0 = time.perf_counter()
+    try:
+        hot_suppressed()
+        print("suppressed trace timed out: False (returned normally)")
+    except TimeoutError as exc:
+        print("suppressed trace timed out:", time.perf_counter() - t0 < 1.0)
+        print("caught as TimeoutError:", type(exc).__name__)

@@ -143,7 +143,7 @@ def run_check(check, traces, output):
         )
         if node is None:
             return False, "node not found"
-        for key in ("args", "kwargs", "result"):
+        for key in ("args", "kwargs", "result", "locals_dropped"):
             if key in check:
                 actual = node.get(key, "<missing>")
                 if not check.get("raw"):
@@ -166,8 +166,10 @@ def run_case(path: Path):
     expect = load_expect(path)
     out_dir = OUT / path.stem
     shutil.rmtree(out_dir, ignore_errors=True)
+    # -X faulthandler: if a case ever crashes the interpreter, its output.txt
+    # holds the stack of every thread at the crash.
     proc = subprocess.run(
-        [sys.executable, path.name], cwd=HERE, capture_output=True, text=True, timeout=120
+        [sys.executable, "-X", "faulthandler", path.name], cwd=HERE, capture_output=True, text=True, timeout=120
     )
     output = proc.stdout + proc.stderr
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +209,7 @@ def describe(check):
         text = f"exactly {check['n']} node(s) matching `{check['count']}`{where}"
     elif "node" in check:
         parts = [f"first `{check['node']}`{where}"]
-        for key in ("args", "kwargs", "result"):
+        for key in ("args", "kwargs", "result", "locals_dropped"):
             if key in check:
                 parts.append(f"{key} = {code(check[key])}")
         if "exception" in check:

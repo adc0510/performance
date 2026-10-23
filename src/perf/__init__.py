@@ -27,6 +27,7 @@ import functools
 import hashlib
 import inspect
 import itertools
+import linecache
 import json as _json
 import re
 import signal
@@ -45,8 +46,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 __all__ = [
+    "TraceTimeout",
     "API_KEY",
     "CAPTURE_IO",
     "DEFAULT_RETURN",
@@ -136,7 +138,10 @@ class _TraceState:
     __slots__ = ("lock", "open", "graft_tokens")
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        # Re-entrant: an asynchronous exception perf can't defer (Ctrl-C)
+        # landing between acquire and release must not deadlock the thread
+        # the next time it records something.
+        self.lock = threading.RLock()
         self.open = True
         self.graft_tokens: list = []
 
@@ -165,6 +170,46 @@ class _TraceState:
 
 # The current top-level trace's state — None outside any trace.
 _current_trace: ContextVar["_TraceState | None"] = ContextVar("_current_trace", default=None)
+
+
+# Depth of perf's own hook code on this thread (monitoring callbacks, class /
+# import hooks). Together with _capturing it tells the TIMEOUT handler that the
+# alarm interrupted perf itself -- whose defensive `except Exception` blocks
+# would swallow the TimeoutError -- so it retries a moment later instead.
+_hook_state = threading.local()
+
+
+# A TIMEOUT that fired while perf's own code was running (where raising is
+# unsafe: perf's defensive handlers would swallow it, a lock could be left
+# held, a sys.monitoring callback could be interrupted mid-way). Holds the
+# message until a safe point raises it: a node wrapper about to call into the
+# program (_raise_pending_timeout), or a retry alarm landing in program code.
+_timeout_pending: list = []
+
+
+class TraceTimeout(TimeoutError):
+    """Raised when a traced call exceeds TIMEOUT. A TimeoutError subclass, so
+    `except TimeoutError` still catches it -- but SUPPRESS_ERRORS never
+    swallows it (that would let a timed-out program keep running)."""
+
+
+def _raise_pending_timeout() -> None:
+    if _timeout_pending:
+        message = _timeout_pending[0]
+        _timeout_pending.clear()
+        raise TraceTimeout(message)
+
+
+def _in_perf_internals() -> bool:
+    return bool(_capturing.get() or getattr(_hook_state, "depth", 0))
+
+
+def _hook_enter() -> None:
+    _hook_state.depth = getattr(_hook_state, "depth", 0) + 1
+
+
+def _hook_exit() -> None:
+    _hook_state.depth -= 1
 
 
 # >0 while perf itself is converting a captured value: user code that runs as
@@ -342,6 +387,20 @@ SKIP_FUNCTIONS: list = []
 # doesn't affect what's instrumented/timed, only what's captured. Empty (the
 # default) disables it.
 SKIP_VARIABLES: list = []
+# Functions whose LOCAL VARIABLES are traced line by line (fnmatch patterns
+# on node names, e.g. ["__main__.func", "Cart.*"]). Each matching call's node
+# gets a "locals" list -- one entry per executed line that changed something:
+# {"line": <file line>, "text": <source>, "set": {name: value}, "deleted": [..]}
+# -- covering rebinding (a = 3) and in-place mutation (items.append(x),
+# self.count += 1). Arguments aren't repeated (they're in "args"). Costly:
+# every line of a matching function compares its locals, so scope it to the
+# functions you are debugging. Python 3.12+ (sys.monitoring line events);
+# ignored with a warning on older versions. Empty (the default) disables it.
+TRACE_LOCALS: list = []
+# Cap on "locals" entries per call (a loop can produce one per iteration);
+# beyond it, the rest are counted in "locals_dropped".
+MAX_LOCALS_EVENTS = 1000
+
 # Regular expressions whose matches are replaced by "<redacted>" in EVERY
 # piece of captured text: string args/results/fields (at any depth, dict keys
 # included), reprs, exception messages, and every line of a recorded
@@ -506,7 +565,7 @@ _SKIP = object()
 
 # Matches Python's default object repr, e.g.
 #   <qdrant_client.http.api_client.BaseAsyncMiddleware object at 0x7fd8bc2d4d70>
-_DEFAULT_REPR = re.compile(r"^<[\w.]+ object at 0x[0-9a-fA-F]+>$")
+_DEFAULT_REPR = re.compile(r"^<[\w.<>]+ object at 0x[0-9a-fA-F]+>$")  # <> : local classes (f.<locals>.C)
 
 
 def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None) -> Any:
@@ -654,6 +713,29 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
             if is_method:
                 info["self_type"] = type(value.__self__).__name__
             return info
+        # Slotted objects: expand their slots -- but only when the class has no
+        # repr of its own (UUID, Path, … define a readable one; their slots
+        # are private, version-specific internals).
+        slot_names = _slot_names(type(value)) if type(value).__repr__ is object.__repr__ else ()
+        if slot_names:
+            fields = {"__type__": type(value).__name__}
+            if hasattr(value, "__dict__"):
+                more = _jsonable(vars(value), depth, _seen | {id(value)}, _budget)
+                if isinstance(more, dict):
+                    fields.update(more)
+            seen = _seen | {id(value)}
+            for slot in slot_names:
+                if _is_skipped_variable(slot):
+                    continue
+                try:
+                    slot_value = getattr(value, slot)
+                except AttributeError:
+                    continue  # slot never assigned
+                jv = _jsonable(slot_value, depth + 1, seen, _budget)
+                if jv is not _SKIP:
+                    fields[slot] = jv
+            if len(fields) > 1:
+                return fields
         if hasattr(value, "__dict__") and vars(value):
             # The object and its __dict__ are ONE level: converting the
             # __dict__ at the object's own depth puts the fields at depth + 1,
@@ -685,6 +767,30 @@ def _charge(text: str, budget: list | None) -> str:
         return truncated
     budget[0] -= len(text)
     return text
+
+
+_slot_cache: dict = {}
+
+
+def _slot_names(cls: type) -> tuple:
+    """Data slots declared through the class hierarchy (``__slots__``), in
+    declaration order — the fields of an object that has no (or not only a)
+    ``__dict__``."""
+    cached = _slot_cache.get(cls)
+    if cached is not None:
+        return cached
+    names: list = []
+    try:
+        for klass in reversed(cls.__mro__):
+            slots = vars(klass).get("__slots__", ())
+            for name in (slots,) if isinstance(slots, str) else slots:
+                if name not in ("__dict__", "__weakref__") and name not in names:
+                    names.append(name)
+    except Exception:
+        names = []
+    result = tuple(names)
+    _slot_cache[cls] = result
+    return result
 
 
 def _spill_value(value: Any) -> Any:
@@ -1367,6 +1473,12 @@ def _unpatch_non_project() -> None:
         del _undo_log[origin]
 
 
+def _module_label(name: str) -> str:
+    """Module name as shown in node names: a spawned worker re-imports the
+    main script as ``__mp_main__``; it is the same code as ``__main__``."""
+    return "__main__" if name == "__mp_main__" else name
+
+
 def _patch_module_functions(module: Any) -> None:
     """Wrap the module-level (free) functions defined in a project module.
 
@@ -1397,7 +1509,7 @@ def _patch_module_functions(module: Any) -> None:
             continue
         if _is_lru_cache(attr) and getattr(attr, "__module__", None) == module.__name__:
             try:
-                wrapped = _cache_wrap(attr, f"{module.__name__}.{name}")
+                wrapped = _cache_wrap(attr, f"{_module_label(module.__name__)}.{name}")
                 _set_patched(module, name, wrapped, module.__name__)
                 _wrapped_originals[id(attr)] = (attr, wrapped)
             except (TypeError, AttributeError):
@@ -1411,7 +1523,7 @@ def _patch_module_functions(module: Any) -> None:
         ):
             continue
         try:
-            wrapped = _wrap_any(attr, f"{module.__name__}.{name}")
+            wrapped = _wrap_any(attr, f"{_module_label(module.__name__)}.{name}")
             wrapped._perf_wrapped = True  # type: ignore
             _set_patched(module, name, wrapped, module.__name__)
             _wrapped_originals[id(attr)] = (attr, wrapped)
@@ -1592,6 +1704,15 @@ def _patch_class_locked(cls: type) -> None:
 _TRACED_DUNDERS = frozenset({"__init__", "__call__", "__enter__", "__exit__", "__aenter__", "__aexit__"})
 
 
+def _inner_code(func: Any) -> Any:
+    """Code object of the function a wrapper ultimately runs (through
+    __wrapped__ chains), for TRACE_LOCALS."""
+    try:
+        return getattr(inspect.unwrap(getattr(func, "__func__", func)), "__code__", None)
+    except Exception:
+        return None
+
+
 def _wrap_any(func: Any, name: str, suppress: bool = True) -> Any:
     """Node wrapper for any kind of function; None passes through."""
     if func is None or not inspect.isfunction(func) or getattr(func, "_perf_node", False):
@@ -1650,7 +1771,7 @@ class _GenRecorder:
         return done
 
 
-def _start_generator(name: str, args: tuple, kwargs: dict, param_names: tuple) -> "_GenRecorder | None":
+def _start_generator(name: str, args: tuple, kwargs: dict, param_names: tuple, code: Any = None) -> "_GenRecorder | None":
     recording = _recording()
     if recording is None:
         return None
@@ -1659,18 +1780,21 @@ def _start_generator(name: str, args: tuple, kwargs: dict, param_names: tuple) -
     _record_inputs(node, args, kwargs, param_names)
     if not state.attach(parent, node):
         return None
+    if _locals_users and _locals_wanted(name):
+        _locals_enable(code, node)
     _restart(node)
     return _GenRecorder(node, state)
 
 
 def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
     _cover(func, name)
+    inner_code = _inner_code(func)
     param_names = _resolve_param_names(func)
 
     @wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         gen = func(*args, **kwargs)
-        rec = _start_generator(name, args, kwargs, param_names)
+        rec = _start_generator(name, args, kwargs, param_names, inner_code)
         if rec is None:
             return (yield from gen)
         sent: Any = None
@@ -1679,6 +1803,8 @@ def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
             token = _current_node.set(rec.node)
             t0 = perf_counter()
             try:
+                if _timeout_pending:
+                    _raise_pending_timeout()
                 value = gen.throw(thrown) if thrown is not None else gen.send(sent)
             except StopIteration as stop:
                 rec.active += perf_counter() - t0
@@ -1691,7 +1817,7 @@ def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
                 done = rec.finish()
                 _record_exception(done, exc)
                 rec.state.complete(rec.node, done)
-                if suppress and _cfg.SUPPRESS_ERRORS:
+                if suppress and _cfg.SUPPRESS_ERRORS and not isinstance(exc, TraceTimeout):
                     return None  # a failed generator just ends
                 raise
             finally:
@@ -1722,12 +1848,13 @@ def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
 
 def _agen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
     _cover(func, name)
+    inner_code = _inner_code(func)
     param_names = _resolve_param_names(func)
 
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         agen = func(*args, **kwargs)
-        rec = _start_generator(name, args, kwargs, param_names)
+        rec = _start_generator(name, args, kwargs, param_names, inner_code)
         if rec is None:
             async for value in agen:
                 yield value
@@ -1748,7 +1875,7 @@ def _agen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
                 done = rec.finish()
                 _record_exception(done, exc)
                 rec.state.complete(rec.node, done)
-                if suppress and _cfg.SUPPRESS_ERRORS:
+                if suppress and _cfg.SUPPRESS_ERRORS and not isinstance(exc, TraceTimeout):
                     return
                 raise
             finally:
@@ -1882,6 +2009,7 @@ def _patch_all_project_classes_locked() -> None:
 
 def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -> Any:
     _cover(func, name)
+    inner_code = _inner_code(func)
     """Wrap a synchronous callable so each call becomes a timed tree node.
 
     The returned wrapper: creates a node named ``name``, links it under the
@@ -1930,6 +2058,8 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
         _record_inputs(node, args, kwargs, param_names)
         if not state.attach(parent, node):
             return func(*args, **kwargs)  # the trace closed meanwhile
+        if _locals_users and _locals_wanted(name):
+            _locals_enable(inner_code, node)
         token = _current_node.set(node)
         # `extra` (see _cache_wrap): called before the call, returns a
         # callable giving extra fields for this node once the call is over.
@@ -1937,6 +2067,8 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
         done = None
         _restart(node)  # input capture isn't part of the call's own time
         try:
+            if _timeout_pending:
+                _raise_pending_timeout()  # a TIMEOUT that fired inside perf's code
             result = func(*args, **kwargs)
             done = _completion(node)
             _record_output(done, result)
@@ -1944,7 +2076,7 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
         except BaseException as exc:
             done = _completion(node)
             _record_exception(done, exc)
-            if not (suppress and _cfg.SUPPRESS_ERRORS):
+            if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
                 raise
             result = _default_return_unrecorded(default_factory)
             _record_output(done, result)
@@ -1962,6 +2094,7 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
 
 def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
     _cover(func, name)
+    inner_code = _inner_code(func)
     """Wrap a coroutine function so each awaited call becomes a timed tree node.
 
     Async analogue of :func:`_sync_wrap`: same node creation, input/output
@@ -2006,9 +2139,13 @@ def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
         _record_inputs(node, args, kwargs, param_names)
         if not state.attach(parent, node):
             return await func(*args, **kwargs)  # the trace closed meanwhile
+        if _locals_users and _locals_wanted(name):
+            _locals_enable(inner_code, node)
         token = _current_node.set(node)
         _restart(node)  # input capture isn't part of the call's own time
         try:
+            if _timeout_pending:
+                _raise_pending_timeout()
             result = await func(*args, **kwargs)
             done = _completion(node)
             _record_output(done, result)
@@ -2017,7 +2154,7 @@ def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
         except BaseException as exc:
             done = _completion(node)
             _record_exception(done, exc)
-            if not (suppress and _cfg.SUPPRESS_ERRORS):
+            if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
                 state.complete(node, done)
                 raise
             result = _default_return_unrecorded(default_factory)
@@ -2194,21 +2331,42 @@ def _sync_timeout(seconds: float | None, name: str) -> Any:
         due = deadline if prev_due is None else min(deadline, prev_due)
         signal.setitimer(signal.ITIMER_REAL, max(due - monotonic(), 1e-6))
 
+    deferrals = 0
+
+    message = f"{name} exceeded TIMEOUT of {seconds:g}s"
+
     def _handler(signum: int, frame: Any) -> None:
-        nonlocal prev_due
+        nonlocal prev_due, deferrals
         now = monotonic()
         if prev_due is not None and prev_due <= now + 1e-3 and now < deadline - 1e-3:
             prev_due = now + prev_interval if prev_interval > 0 else None
             _arm()
             _deliver(previous, signum, frame)
             return
-        raise TimeoutError(f"{name} exceeded TIMEOUT of {seconds:g}s")
+        in_perf = frame is not None and frame.f_code.co_filename == __file__
+        if in_perf or (_in_perf_internals() and deferrals < 300):
+            # Never raise inside perf's own code: its defensive handlers would
+            # swallow the TimeoutError, an exception between a lock's acquire
+            # and its `with` block would leave it held (deadlock), and one
+            # escaping a sys.monitoring callback can destabilise CPython.
+            # Mark it pending -- the next node wrapper raises it right before
+            # calling into the program -- and retry 10 ms later in case no
+            # traced call comes first. (Program code run BY perf, e.g. a
+            # __repr__, is raised into after ~3 s, so it can't hang forever.)
+            deferrals += 1
+            if not _timeout_pending:
+                _timeout_pending.append(message)
+            signal.setitimer(signal.ITIMER_REAL, 0.01)
+            return
+        _timeout_pending.clear()
+        raise TraceTimeout(message)
 
     previous = signal.signal(signal.SIGALRM, _handler)
     _arm()
     try:
         yield
     finally:
+        _timeout_pending.clear()
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
         if prev_due is not None:
@@ -2255,6 +2413,8 @@ _CONFIG_KEYS = frozenset(
         "_SCAN_INCLUDE_PREFIXES",
         "MAX_YIELDS_CAPTURE",
         "REDACT_PATTERNS",
+        "TRACE_LOCALS",
+        "MAX_LOCALS_EVENTS",
     }
 )
 
@@ -2302,6 +2462,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
     # root's only child.
     func = _unwrap_node(func)
     _cover(func, func.__qualname__)
+    _root_code = _inner_code(func)
     _default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
     _param_names = _resolve_param_names(func)
 
@@ -2326,6 +2487,9 @@ def trace(func: Any = None, **overrides: Any) -> Any:
             # Fresh value pool for this trace only -- see _current_pool and _ValuePool.
             pool_token = _current_pool.set(_ValuePool(state=state) if _cfg.CAPTURE_IO else None)
             _events_acquire()
+            locals_held = _locals_acquire()
+            if locals_held and _locals_wanted(root["name"]):
+                _locals_enable(_root_code, root)
             try:
                 _record_inputs(root, args, kwargs, _param_names)
                 uninstall_profiler = _install_profiler()
@@ -2344,6 +2508,8 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                     except Exception as e:  # reporting must never change the traced call's outcome
                         print(f"[perf] failed to report trace {root['name']}: {e!r}", file=sys.stderr)
             finally:
+                if locals_held:
+                    _locals_release()
                 _events_release()
                 _current_pool.reset(pool_token)
                 _current_trace.reset(trace_token)
@@ -2357,7 +2523,7 @@ def trace(func: Any = None, **overrides: Any) -> Any:
         if root["time"] is None:
             _finish_node(root)
         _record_exception(root, exc)
-        if not _cfg.SUPPRESS_ERRORS:
+        if not _cfg.SUPPRESS_ERRORS or isinstance(exc, TraceTimeout):
             raise  # called from an `except` block: re-raises `exc` unchanged
         result = _default_return_unrecorded(_default_factory)
         _record_output(root, result)
@@ -2370,7 +2536,19 @@ def trace(func: Any = None, **overrides: Any) -> Any:
             with _session(args, kwargs) as root:
                 _begin(root)
                 try:
-                    if _cfg.TIMEOUT is not None:
+                    if _cfg.TIMEOUT is not None and hasattr(asyncio, "timeout"):
+                        # asyncio.timeout (3.11+) tells OUR deadline apart from a
+                        # TimeoutError the program raised itself: only ours
+                        # becomes a TraceTimeout (never suppressed, like sync).
+                        deadline = asyncio.timeout(_cfg.TIMEOUT)
+                        try:
+                            async with deadline:
+                                result = await func(*args, **kwargs)
+                        except TimeoutError as exc:
+                            if not deadline.expired():
+                                raise
+                            raise TraceTimeout(f"{func.__qualname__} exceeded TIMEOUT of {_cfg.TIMEOUT:g}s") from exc
+                    elif _cfg.TIMEOUT is not None:
                         result = await asyncio.wait_for(func(*args, **kwargs), _cfg.TIMEOUT)
                     else:
                         result = await func(*args, **kwargs)
@@ -2468,6 +2646,8 @@ _REMOTE_CONFIG_KEYS = (
     "DEFAULT_RETURN",
     "MAX_YIELDS_CAPTURE",
     "REDACT_PATTERNS",
+    "TRACE_LOCALS",
+    "MAX_LOCALS_EVENTS",
 )
 
 
@@ -2501,7 +2681,7 @@ def _remote_name(fn: Any) -> str:
     func = fn.__func__ if inspect.ismethod(fn) else fn
     qualname = getattr(func, "__qualname__", None) or type(fn).__name__
     if inspect.isfunction(func) and "." not in qualname:
-        return f"{func.__module__}.{qualname}"
+        return f"{_module_label(func.__module__)}.{qualname}"
     return qualname
 
 
@@ -2566,6 +2746,7 @@ class _RemoteCall:
             fn = _sync_wrap(fn, self.name)
         uninstall_profiler = _install_profiler()
         _events_acquire()
+        locals_held = _locals_acquire()
         try:
             result = fn(*args, **kwargs)
         except BaseException as exc:
@@ -2576,6 +2757,8 @@ class _RemoteCall:
                 pass  # an exception type that rejects attributes just loses its subtree
             raise
         finally:
+            if locals_held:
+                _locals_release()
             _events_release()
             uninstall_profiler()
         state.close()
@@ -2872,13 +3055,21 @@ def _event_name(code: Any, frame: Any) -> Any:
     local = qualname.rsplit("<locals>.", 1)[-1]
     if "." in local and not local.startswith("<"):
         return local  # a method: `Class.method`, like wrapped methods
-    return f"{module_name}.{qualname}"
+    return f"{_module_label(module_name)}.{qualname}"
 
 
 def _on_event_start(code: Any, offset: int) -> Any:
+    _hook_enter()
+    try:
+        return _on_event_start_body(code, offset)
+    finally:
+        _hook_exit()
+
+
+def _on_event_start_body(code: Any, offset: int) -> Any:
     try:
         name = _event_names.get(code, _SKIP)
-        frame = sys._getframe(1)
+        frame = sys._getframe(2)  # the monitored function (callback → body → here)
         if name is _SKIP:
             name = _event_names[code] = _event_name(code, frame)
         if name is None:
@@ -2902,6 +3093,8 @@ def _on_event_start(code: Any, offset: int) -> Any:
         if not state.attach(parent, node):
             return None
         stack.append((id(frame), node, _current_node.set(node), state))
+        if _locals_users and _locals_wanted(name):
+            _locals_enable(code, node)
         _restart(node)
     except Exception:
         pass  # instrumentation must never break the program
@@ -2909,12 +3102,21 @@ def _on_event_start(code: Any, offset: int) -> Any:
 
 
 def _event_end(code: Any, value: Any, failed: bool) -> Any:
+    _hook_enter()
+    try:
+        return _event_end_body(code, value, failed)
+    finally:
+        _hook_exit()
+
+
+def _event_end_body(code: Any, value: Any, failed: bool) -> Any:
     try:
         name = _event_names.get(code, _SKIP)
         if name is None:
             return sys.monitoring.DISABLE
         stack = getattr(_event_tls, "stack", None)
-        if not stack or stack[-1][0] != id(sys._getframe(2)):
+        # sys._getframe(3): the monitored function (callback → _event_end → body → here)
+        if not stack or stack[-1][0] != id(sys._getframe(3)):
             return None
         _, node, token, state = stack.pop()
         done = _completion(node)
@@ -2996,6 +3198,315 @@ def _events_config_changed() -> None:
         sys.monitoring.restart_events()
 
 
+# ── local variables, line by line (TRACE_LOCALS, Python 3.12+) ───────────────
+# Line events are switched on only for the code objects of functions matching
+# TRACE_LOCALS (sys.monitoring.set_local_events), and only while a trace that
+# asks for them is running. A LINE event fires BEFORE a line runs, so the
+# locals that changed since the previous event were changed by the previous
+# line: each event diffs the frame's locals against the last snapshot and
+# attributes the difference to that line. A value is "changed" if it was
+# rebound (different object), or -- for mutable objects -- if its captured
+# form differs from last time (in-place mutation). The final diff runs at
+# PY_RETURN / PY_UNWIND, and the list is attached to the call's node then.
+
+_LOCALS_TOOL_ID = 3
+_locals_ready = False
+_locals_users = 0  # traces currently running with TRACE_LOCALS set
+_locals_codes: set = set()  # code objects with line events switched on
+_locals_frames: dict = {}  # id(frame) -> _LocalsState
+# id(node) -> code object: the function a just-created node is for. A frame is
+# only tracked for the node made for ITS function -- never for whatever node
+# happens to be current (e.g. its caller's, when it was called without a node).
+_locals_expected: dict = {}
+_IMMUTABLE_TYPES = (int, float, complex, str, bytes, bool, type(None), frozenset, range)
+
+
+class _LocalsState:
+    __slots__ = ("frame", "node", "state", "snapshot", "global_names", "global_snapshot", "last_line", "events",
+                 "dropped", "limit", "overhead")
+
+    def __init__(self, frame: Any, node: dict, state: "_TraceState") -> None:
+        self.frame, self.node, self.state = frame, node, state
+        self.snapshot: dict = {}  # name -> (value, comparable form or None)
+        self.global_names = _stored_globals(frame.f_code)  # `global x` names this function assigns
+        self.global_snapshot: dict = {}
+        self.last_line = None
+        self.events: list = []
+        self.dropped = 0
+        self.limit = _cfg.MAX_LOCALS_EVENTS
+        self.overhead = 0.0
+
+
+def _locals_comparable(value: Any) -> Any:
+    """What a mutable value is compared by between lines (None for immutables,
+    which can only change by rebinding)."""
+    if isinstance(value, _IMMUTABLE_TYPES):
+        return None
+    # Full conversion, no size budget: a budget-truncated form would hide a
+    # change past the cut-off (MAX_SIZE_CAPTURE only limits what is STORED).
+    return _jsonable(value)
+
+
+def _locals_read(frame: Any) -> dict:
+    return {k: v for k, v in frame.f_locals.items() if k.isidentifier()}
+
+
+def _globals_read(st: "_LocalsState", frame: Any) -> dict:
+    g = frame.f_globals
+    return {name: g[name] for name in st.global_names if name in g}
+
+
+_stored_globals_cache: dict = {}
+
+
+def _stored_globals(code: Any) -> tuple:
+    """Names the function assigns or deletes through a `global` statement."""
+    names = _stored_globals_cache.get(code)
+    if names is None:
+        import dis
+
+        names = tuple(sorted({i.argval for i in dis.get_instructions(code) if i.opname in ("STORE_GLOBAL", "DELETE_GLOBAL")}))
+        _stored_globals_cache[code] = names
+    return names
+
+
+def _changes(snapshot: dict, current: dict) -> tuple:
+    """(changed {name: value}, deleted [names]) between a snapshot and now;
+    updates the snapshot."""
+    changed: dict = {}
+    for name, value in current.items():
+        previous = snapshot.get(name)
+        if previous is not None and previous[0] is value:
+            if previous[1] is None:
+                continue  # same immutable object: unchanged
+            comparable = _locals_comparable(value)
+            if comparable == previous[1]:
+                continue
+        else:
+            comparable = _locals_comparable(value)
+        snapshot[name] = (value, comparable)
+        changed[name] = value
+    deleted = [name for name in snapshot if name not in current]
+    for name in deleted:
+        del snapshot[name]
+    return changed, deleted
+
+
+def _capture_named(values: dict) -> dict:
+    captured = {}
+    for name, value in values.items():
+        if _is_skipped_variable(name):
+            captured[name] = f"<skipped:{name}>"
+            continue
+        jv = _capture_value(value)
+        captured[name] = f"<{type(value).__name__}>" if jv is _SKIP else jv
+    return captured
+
+
+def _locals_diff(st: "_LocalsState", frame: Any) -> None:
+    changed, deleted = _changes(st.snapshot, _locals_read(frame))
+    g_changed, g_deleted = _changes(st.global_snapshot, _globals_read(st, frame)) if st.global_names else ({}, [])
+    if not (changed or deleted or g_changed or g_deleted):
+        return
+    if len(st.events) >= st.limit:
+        st.dropped += 1
+        return
+    event: dict = {"line": st.last_line}
+    text = _statement_text(frame.f_code.co_filename, st.last_line) if st.last_line else ""
+    if text:
+        event["text"] = _redact(text)
+    if changed:
+        event["set"] = _capture_named(changed)
+    if deleted:
+        event["deleted"] = deleted
+    if g_changed:
+        event["globals"] = _capture_named(g_changed)
+    if g_deleted:
+        event["deleted_globals"] = g_deleted
+    st.events.append(event)
+
+
+_statement_spans: dict = {}  # filename -> {first line: last line of that statement's own text}
+
+
+def _statement_text(filename: str, line: int) -> str:
+    """Source of the statement starting at `line` -- all of its lines for a
+    multi-line statement, the header only for a compound one (if/for/with…)."""
+    spans = _statement_spans.get(filename)
+    if spans is None:
+        spans = {}
+        try:
+            import ast
+
+            tree = ast.parse("".join(linecache.getlines(filename)))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.stmt):
+                    end = node.end_lineno or node.lineno
+                    body = getattr(node, "body", None)
+                    if isinstance(body, list) and body and isinstance(body[0], ast.AST):
+                        end = max(node.lineno, body[0].lineno - 1)
+                    spans[node.lineno] = max(spans.get(node.lineno, node.lineno), end)
+        except Exception:
+            pass
+        _statement_spans[filename] = spans
+    end = spans.get(line, line)
+    lines = [linecache.getline(filename, n).strip() for n in range(line, min(end, line + 50) + 1)]
+    text = " ".join(part for part in lines if part)
+    return text if len(text) <= 500 else text[:497] + "..."
+
+
+def _locals_begin(code: Any, frame: Any) -> "_LocalsState | None":
+    """Start tracking a frame of a TRACE_LOCALS function, if it belongs to the
+    node that is current right now (the call perf just recorded)."""
+    recording = _recording()
+    if recording is None:
+        return None
+    node, state = recording
+    if not _locals_wanted(node["name"]):
+        return None
+    if _locals_expected.get(id(node)) is not code:
+        return None  # this frame isn't the call the current node was made for
+    del _locals_expected[id(node)]
+    st = _LocalsState(frame, node, state)
+    token = _capturing.set(1)  # converting values may run user code (__repr__)
+    try:
+        for name, value in _locals_read(frame).items():  # the arguments: baseline, not events
+            st.snapshot[name] = (value, _locals_comparable(value))
+        for name, value in _globals_read(st, frame).items():
+            st.global_snapshot[name] = (value, _locals_comparable(value))
+    finally:
+        _capturing.reset(token)
+    _locals_frames[id(frame)] = st
+    return st
+
+
+def _on_locals_line(code: Any, line: int) -> Any:
+    _hook_enter()
+    try:
+        result = _on_locals_line_body(code, line)
+    finally:
+        _hook_exit()
+    if _timeout_pending:
+        # A safe point for a TIMEOUT that fired inside perf's own code: this
+        # callback's work is complete, and an exception raised here surfaces
+        # in the monitored function at this line (a tight loop with no traced
+        # calls would otherwise never reach a wrapper's safe point).
+        _raise_pending_timeout()
+    return result
+
+
+def _on_locals_line_body(code: Any, line: int) -> Any:
+    try:
+        frame = sys._getframe(2)  # the monitored function (callback → body → here)
+        st = _locals_frames.get(id(frame))
+        if st is None or st.frame is not frame:
+            if _capturing.get():
+                return None  # a line of user code run by perf's own capture
+            st = _locals_begin(code, frame)
+            if st is not None:
+                st.last_line = line
+            return None
+        t0 = perf_counter()
+        token = _capturing.set(1)
+        try:
+            _locals_diff(st, frame)
+        finally:
+            _capturing.reset(token)
+        st.last_line = line
+        st.overhead += perf_counter() - t0
+    except Exception:
+        pass  # instrumentation must never break the program
+    return None
+
+
+def _on_locals_end(code: Any, offset: int, value: Any) -> Any:
+    _hook_enter()
+    try:
+        return _on_locals_end_body(code, offset, value)
+    finally:
+        _hook_exit()
+
+
+def _on_locals_end_body(code: Any, offset: int, value: Any) -> Any:
+    token = _capturing.set(1)
+    try:
+        frame = sys._getframe(2)  # the monitored function (callback → body → here)
+        st = _locals_frames.pop(id(frame), None)
+        if st is None or st.frame is not frame:
+            return None
+        t0 = perf_counter()
+        _locals_diff(st, frame)
+        st.overhead += perf_counter() - t0
+        fields: dict = {"locals": st.events, "locals_capture_time": round(st.overhead, _TIME_DECIMALS)}
+        if st.dropped:
+            fields["locals_dropped"] = st.dropped
+        st.state.complete(st.node, fields)
+    except Exception:
+        pass
+    finally:
+        _capturing.reset(token)
+    return None
+
+
+def _locals_wanted(name: str) -> bool:
+    patterns = _cfg.TRACE_LOCALS
+    return bool(patterns) and any(fnmatch(name, pattern) for pattern in patterns)
+
+
+def _locals_enable(code: Any, node: dict) -> None:
+    """Switch on line events for `code` (a function whose call perf is about
+    to record as `node`, and whose name matches TRACE_LOCALS)."""
+    if code is None or not _locals_ready:
+        return
+    _locals_expected[id(node)] = code
+    if code in _locals_codes:
+        return
+    m = sys.monitoring
+    # PY_UNWIND can't be a local event: it is enabled globally while any
+    # TRACE_LOCALS trace runs (see _locals_acquire).
+    m.set_local_events(_LOCALS_TOOL_ID, code, m.events.LINE | m.events.PY_RETURN)
+    _locals_codes.add(code)
+
+
+def _locals_acquire() -> bool:
+    """A trace with TRACE_LOCALS starts. Returns whether it holds a reference
+    (to pass back to _locals_release)."""
+    global _locals_users, _locals_ready
+    if not _cfg.TRACE_LOCALS:
+        return False
+    if not _events_available:
+        print("[perf] TRACE_LOCALS needs Python 3.12+ (sys.monitoring): ignored", file=sys.stderr)
+        return False
+    with _events_lock:
+        if not _locals_ready:
+            m = sys.monitoring
+            try:
+                m.use_tool_id(_LOCALS_TOOL_ID, "perf-locals")
+            except ValueError:
+                print("[perf] TRACE_LOCALS: sys.monitoring tool slot in use: ignored", file=sys.stderr)
+                return False
+            m.register_callback(_LOCALS_TOOL_ID, m.events.LINE, _on_locals_line)
+            m.register_callback(_LOCALS_TOOL_ID, m.events.PY_RETURN, _on_locals_end)
+            m.register_callback(_LOCALS_TOOL_ID, m.events.PY_UNWIND, _on_locals_end)
+            _locals_ready = True
+        _locals_users += 1
+        if _locals_users == 1:
+            sys.monitoring.set_events(_LOCALS_TOOL_ID, sys.monitoring.events.PY_UNWIND)
+    return True
+
+
+def _locals_release() -> None:
+    global _locals_users
+    with _events_lock:
+        _locals_users -= 1
+        if _locals_users == 0:
+            sys.monitoring.set_events(_LOCALS_TOOL_ID, 0)
+            for code in _locals_codes:
+                sys.monitoring.set_local_events(_LOCALS_TOOL_ID, code, 0)
+            _locals_codes.clear()
+            _locals_expected.clear()
+
+
 # ── code created during a trace: patch it as it comes into existence ─────────
 # Patching at trace start only sees what already exists. A module imported (or
 # reloaded) mid-trace, or a class defined while the trace runs (inside a
@@ -3011,10 +3522,13 @@ def _traced_build_class(func: Any, name: str, *bases: Any, **kwargs: Any) -> Any
     """Replacement for ``builtins.__build_class__`` (every ``class`` statement)."""
     cls = _original_build_class(func, name, *bases, **kwargs)
     if isinstance(cls, type) and _recording() is not None:
+        _hook_enter()
         try:
             _patch_class(cls)
         except Exception:
             pass  # instrumentation must never break class creation
+        finally:
+            _hook_exit()
     return cls
 
 
@@ -3023,6 +3537,7 @@ def _traced_exec_module(self: Any, module: Any) -> None:
     reload of a .py module)."""
     _original_exec_module(self, module)
     if _recording() is not None:
+        _hook_enter()
         try:
             with _patch_lock:
                 if _is_project_module(module):
@@ -3030,6 +3545,8 @@ def _traced_exec_module(self: Any, module: Any) -> None:
                     _patch_reexported_names(module)
         except Exception:
             pass  # instrumentation must never break an import
+        finally:
+            _hook_exit()
 
 
 def _install_executor_hook() -> None:
@@ -3041,10 +3558,22 @@ def _install_executor_hook() -> None:
     subclasses, ``Executor.map`` and ``loop.run_in_executor`` (built on
     submit). Deferred until the first trace so merely importing perf doesn't
     pull in multiprocessing."""
-    global _original_process_submit, _original_thread_submit, _original_thread_start
-    global _original_build_class, _original_exec_module
-    if _original_process_submit is not None:
+    if _hooks_installed:
         return
+    # Under the patching lock: several first traces may start at once on
+    # different threads, and installing twice would make each hook wrap the
+    # other (`original` = the first hook) -- infinite recursion.
+    with _patch_lock:
+        if not _hooks_installed:
+            _install_hooks_locked()
+
+
+_hooks_installed = False
+
+
+def _install_hooks_locked() -> None:
+    global _original_process_submit, _original_thread_submit, _original_thread_start
+    global _original_build_class, _original_exec_module, _hooks_installed
     import builtins
     import importlib.machinery
     from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -3061,6 +3590,7 @@ def _install_executor_hook() -> None:
     _original_process_submit = ProcessPoolExecutor.submit
     ProcessPoolExecutor.submit = _traced_submit
     _install_pool_hooks()
+    _hooks_installed = True
 
 
 # ── collapse / merge helpers ─────────────────────────────────────────────────
@@ -3269,9 +3799,9 @@ def _self_time(node: dict) -> float:
     children = node["children"]
     # A generator's node spans first resume → end, including the consumer's
     # work between yields (which is NOT its child); its own time is active_time.
-    t = node.get("active_time", node["time"] or 0)
+    t = node.get("active_time", node["time"] or 0) - node.get("locals_capture_time", 0.0)
     if not children:
-        return t
+        return max(t, 0.0)
     occupied = [{"start": c.get("start", 0), "time": (c["time"] or 0) + c.get("capture_time", 0.0)} for c in children]
     return max(t - _wall_from_intervals(occupied), 0.0)
 
