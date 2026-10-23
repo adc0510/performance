@@ -46,7 +46,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 __all__ = [
     "TraceTimeout",
     "API_KEY",
@@ -568,7 +568,8 @@ _SKIP = object()
 _DEFAULT_REPR = re.compile(r"^<[\w.<>]+ object at 0x[0-9a-fA-F]+>$")  # <> : local classes (f.<locals>.C)
 
 
-def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None) -> Any:
+def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None,
+              _memo: dict | None = None) -> Any:
     """Convert a value to a JSON-serializable form.
 
     dict/list/tuple/set are recursed into so their contents are preserved;
@@ -600,7 +601,22 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     :class:`_ValuePool`, so every call converts `value` exactly as it is at
     that moment. Deduplication happens afterwards, on the converted result
     (see :func:`_capture_value` / :meth:`_ValuePool.intern`).
+
+    Within ONE conversion, `_memo` converts each shared container/object once
+    per depth and reuses the result wherever else it is referenced: an object
+    graph where the same sub-objects are reachable along many paths would
+    otherwise be re-expanded along every path -- exponential in MAX_DEPTH.
+    (Not with a size budget: there every occurrence must be charged.)
+
+    Only objects of PROJECT classes (see _is_project_module; SCAN_VENV opts
+    libraries in) are expanded field by field, plus dataclasses and pydantic
+    models from anywhere. A library object (an engine, a client, a session…)
+    is its repr when it has one, else a "<Type>" marker: its internals are
+    not the program's data, and walking them reaches modules, registries and
+    whole connection pools. Modules are never expanded.
     """
+    if _memo is None and _budget is None and depth == 0:
+        _memo = {"circular": 0}
     if value is None or isinstance(value, (bool, int, float)):
         if _budget is not None:
             # Numbers count too: a huge list of ints must hit MAX_SIZE_CAPTURE
@@ -627,24 +643,47 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     if depth >= _cfg.MAX_DEPTH:
         return _charge(_safe_repr(value), _budget)
     if id(value) in _seen:
+        if _memo is not None:
+            _memo["circular"] += 1
         return _charge(f"<circular {type(value).__name__}>", _budget)
     if _budget is not None and _budget[0] <= 0:
         return f"<{type(value).__name__} truncated: size limit reached>"
+    if _memo is not None:
+        key = (id(value), depth)
+        entry = _memo.get(key)
+        if entry is not None and entry[0] is value:
+            return entry[1]
+        circular_before = _memo["circular"]
+        converted = _jsonable_uncached(value, depth, _seen, _budget, _memo)
+        # A subtree that cut a cycle depends on the path it was reached by:
+        # reusing it elsewhere could show "<circular>" where there is none.
+        # The value itself is kept in the entry so its id can't be reused by
+        # another (temporary) object during this conversion.
+        if _memo["circular"] == circular_before:
+            _memo[key] = (value, converted)
+        return converted
+    return _jsonable_uncached(value, depth, _seen, _budget, _memo)
+
+
+def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list | None, _memo: dict | None) -> Any:
+    """Containers and objects (see _jsonable)."""
     try:
         # Compact, unambiguous forms for values whose generic conversion is
         # noise (a class's whole __dict__) or loses meaning (NamedTuple fields).
         if isinstance(value, type):
             return {"__class__": _charge(f"{value.__module__}.{value.__qualname__}", _budget)}
+        if isinstance(value, types.ModuleType):
+            return {"__module__": _charge(value.__name__, _budget)}
         if isinstance(value, enum.Enum):
             return {
                 "__enum__": _charge(f"{type(value).__qualname__}.{value.name}", _budget),
-                "value": _jsonable(value.value, depth + 1, _seen | {id(value)}, _budget),
+                "value": _jsonable(value.value, depth + 1, _seen | {id(value)}, _budget, _memo),
             }
         if isinstance(value, tuple) and isinstance(getattr(type(value), "_fields", None), tuple):
             seen = _seen | {id(value)}
             fields = {"__type__": type(value).__name__}
             for field_name, field_value in zip(type(value)._fields, value):
-                jv = _jsonable(field_value, depth + 1, seen, _budget)
+                jv = _jsonable(field_value, depth + 1, seen, _budget, _memo)
                 if jv is not _SKIP:
                     fields[field_name] = jv
             return fields
@@ -664,7 +703,7 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                         continue
                 elif _budget[0] <= 0:
                     break
-                jv = _jsonable(v, depth + 1, seen, _budget)
+                jv = _jsonable(v, depth + 1, seen, _budget, _memo)
                 if jv is not _SKIP:
                     out[key] = jv
             return out
@@ -679,7 +718,7 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                         continue
                 elif _budget[0] <= 0:
                     break
-                jv = _jsonable(v, depth + 1, seen, _budget)
+                jv = _jsonable(v, depth + 1, seen, _budget, _memo)
                 if jv is not _SKIP:
                     out.append(jv)
             return out
@@ -695,9 +734,9 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
         # __getattr__ / properties just to probe for them.
         vtype = type(value)
         if hasattr(vtype, "model_fields") and callable(getattr(vtype, "model_dump", None)):  # pydantic v2
-            return _jsonable(value.model_dump(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
+            return _jsonable(value.model_dump(exclude_none=True), depth + 1, _seen | {id(value)}, _budget, _memo)
         if hasattr(vtype, "__fields__") and callable(getattr(vtype, "dict", None)):  # pydantic v1
-            return _jsonable(value.dict(exclude_none=True), depth + 1, _seen | {id(value)}, _budget)
+            return _jsonable(value.dict(exclude_none=True), depth + 1, _seen | {id(value)}, _budget, _memo)
         # functions/methods/builtins: no useful __dict__ to unpack (and a
         # bound method's __func__ may carry unrelated noise like __wrapped__
         # from being auto-instrumented) -- describe identity instead of
@@ -716,11 +755,13 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
         # Slotted objects: expand their slots -- but only when the class has no
         # repr of its own (UUID, Path, … define a readable one; their slots
         # are private, version-specific internals).
+        if not _expandable(vtype) and not dataclasses.is_dataclass(value):
+            raise _NotExpanded  # a library object: its repr, or a <Type> marker (below)
         slot_names = _slot_names(type(value)) if type(value).__repr__ is object.__repr__ else ()
         if slot_names:
             fields = {"__type__": type(value).__name__}
             if hasattr(value, "__dict__"):
-                more = _jsonable(vars(value), depth, _seen | {id(value)}, _budget)
+                more = _jsonable(vars(value), depth, _seen | {id(value)}, _budget, _memo)
                 if isinstance(more, dict):
                     fields.update(more)
             seen = _seen | {id(value)}
@@ -731,7 +772,7 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                     slot_value = getattr(value, slot)
                 except AttributeError:
                     continue  # slot never assigned
-                jv = _jsonable(slot_value, depth + 1, seen, _budget)
+                jv = _jsonable(slot_value, depth + 1, seen, _budget, _memo)
                 if jv is not _SKIP:
                     fields[slot] = jv
             if len(fields) > 1:
@@ -742,16 +783,36 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
             # exactly like a dict's values. (Counting the __dict__ as an extra
             # level made an object just above MAX_DEPTH come out as
             # "<unconvertible …>", since the cut-off __dict__ was a string.)
-            fields = _jsonable(vars(value), depth, _seen | {id(value)}, _budget)
+            fields = _jsonable(vars(value), depth, _seen | {id(value)}, _budget, _memo)
             if not isinstance(fields, dict):
                 return fields
             return {"__type__": type(value).__name__, **fields}
+    except _NotExpanded:
+        pass
     except Exception as e:
         return f"<unconvertible {type(value).__name__}: {e}>"
     r = _safe_repr(value)
     if _DEFAULT_REPR.match(r):
         return _SKIP
     return _charge(r, _budget)
+
+
+class _NotExpanded(Exception):
+    pass
+
+
+_expandable_cache: dict = {}  # class -> bool; cleared when the scan config changes
+
+
+def _expandable(cls: type) -> bool:
+    """Whether instances of `cls` are expanded field by field: classes from
+    project code only (the same rule as instrumentation)."""
+    verdict = _expandable_cache.get(cls)
+    if verdict is None:
+        module = sys.modules.get(getattr(cls, "__module__", None) or "")
+        verdict = module is not None and module.__name__ != __name__ and _is_project_module(module)
+        _expandable_cache[cls] = verdict
+    return verdict
 
 
 def _charge(text: str, budget: list | None) -> str:
@@ -932,13 +993,29 @@ class _ValuePool:
         self._prefix = prefix
         self._next = 0
 
-    def intern(self, value: Any) -> Any:
-        if isinstance(value, dict):
-            value = {k: v if self._is_small_leaf(v) else self.intern(v) for k, v in value.items()}
-        elif isinstance(value, list):
-            value = [v if self._is_small_leaf(v) else self.intern(v) for v in value]
-        elif not isinstance(value, str) or len(value) < self.MIN_SIZE:
+    def intern(self, value: Any, _memo: dict | None = None) -> Any:
+        # A converted value can share sub-structures (_jsonable reuses the
+        # conversion of an object referenced from many places): intern each
+        # shared dict/list once per call, or a DAG is walked as a tree.
+        if _memo is None:
+            _memo = {}
+        if isinstance(value, (dict, list)):
+            done = _memo.get(id(value))
+            if done is not None:
+                return done
+            original = value
+            if isinstance(value, dict):
+                value = {k: v if self._is_small_leaf(v) else self.intern(v, _memo) for k, v in value.items()}
+            else:
+                value = [v if self._is_small_leaf(v) else self.intern(v, _memo) for v in value]
+            result = self._store(value)
+            _memo[id(original)] = result
+            return result
+        if not isinstance(value, str) or len(value) < self.MIN_SIZE:
             return value
+        return self._store(value)
+
+    def _store(self, value: Any) -> Any:
         serialized = _json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
         if len(serialized) < self.MIN_SIZE:
             return value
@@ -1981,6 +2058,7 @@ def _patch_all_project_classes_locked() -> None:
     config = (_cfg.SCAN_VENV, tuple(_cfg._SCAN_INCLUDE_PREFIXES))
     if config != _skip_classes_config:
         _skip_classes.clear()
+        _expandable_cache.clear()
         if _skip_classes_config is not None:
             _unpatch_non_project()
             _events_config_changed()
