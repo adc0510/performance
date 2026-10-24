@@ -31,6 +31,8 @@ EXPECT = {
         {"status": "works", "fixes": "TRACE_LOCALS was not applied inside process-pool workers, and a spawned worker named the main script's functions `__mp_main__.f` instead of `__main__.f`",
          "min_python": [3, 12], "desc": "process-pool workers: matched functions record their locals in the worker, named as in the parent",
          "file": "workers", "node": "__main__.in_worker", "has": ["locals"], "result": 14},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "...and the worker's source lines are merged into the parent trace's `sources` (under an id of its own, so workers can't collide)",
+         "stdout": "*worker source: merged=True file=True prefixed=True*"},
         {"status": "works", "min_python": [3, 12], "desc": "...entries", "stdout": "*worker: [(1, 'w = x * 2', {'w': 14})]*"},
         {"status": "works", "min_python": [3, 12], "desc": "pattern forms: `Class.*` matches its methods, `*<lambda>` matches lambdas, unmatched functions get nothing",
          "stdout": "*patterns: method=True lambda=True unmatched=False*"},
@@ -155,6 +157,10 @@ def untraced(stop, counter, errors):
 
 
 if __name__ == "__main__":
+    import json
+
+    from run_all import walk
+
     setup(__file__)
     main()
     nodes = trace_nodes(f"{perf.OUTPUT_DIR}/main.json")
@@ -181,6 +187,10 @@ if __name__ == "__main__":
     run_workers()
     worker = next(n for n in trace_nodes(f"{perf.OUTPUT_DIR}/workers.json") if n["name"] == "__main__.in_worker")
     print("worker:", locals_entries(worker, in_worker))
+    raw = json.load(open(f"{perf.OUTPUT_DIR}/workers.json"))
+    sid = next(n for n in walk(raw["trace"]) if n["name"] == "__main__.in_worker").get("source", "")
+    src = raw.get("sources", {}).get(sid, {})
+    print(f"worker source: merged={bool(src.get('lines'))} file={src.get('file') == __file__} prefixed={'_' in sid}")
 
     stop, counter, errors = threading.Event(), [], []
     t = threading.Thread(target=untraced, args=(stop, counter, errors))

@@ -45,7 +45,7 @@ def trace_nodes(path: str) -> list:
     """Every node of a written trace, with {__ref__} values resolved."""
     import json
 
-    from run_all import resolve, walk
+    from run_all import resolve, walk, with_text
 
-    d = json.load(open(path))
+    d = with_text(json.load(open(path)))
     return [resolve(n, d["variables"]) for n in walk(d["trace"])]

@@ -39,6 +39,14 @@ EXPECT = {
          "stdout": "*nested locals: [(2, 'z = y + 1', {'z': 6})]*"},
         {"status": "works", "min_python": [3, 12], "desc": "SKIP_VARIABLES applies to locals; REDACT_PATTERNS applies to the recorded source text and values",
          "stdout": "*secret locals: [(1, 'password = <redacted>', {'password': '<skipped:password>'}), (2, 'user = \"ann\"', {'user': 'ann'})]*"},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "entries hold the line number only: the source text of each line is stored once per trace, in the top-level `sources` map",
+         "stdout": "*format: entries without text: True*"},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "...`sources` maps an id to {file, lines}: the file is this script and each line's text is right",
+         "stdout": "*format: source file is this script: True func lines: {1: 'a = 1', 2: 'b = 2', 3: 'a = 3'}*"},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "...each line appears once however often it ran (the loop's lines ran 3 times, both calls of func share them)",
+         "stdout": "*format: each line stored once: True both func calls share one source: True*"},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "...a node with locals names its file's id as `source`",
+         "node": "__main__.func", "raw": True, "source": "s*"},
         {"status": "works", "min_python": [3, 12], "desc": "functions that don't match TRACE_LOCALS get no locals",
          "node": "__main__.not_matched", "lacks": ["locals"]},
         {"status": "works", "min_python": [3, 12], "desc": "the time spent tracking locals is reported (locals_capture_time) and excluded from the function's self time in the report",
@@ -46,6 +54,11 @@ EXPECT = {
         {"status": "works", "min_python": [3, 12], "desc": "the trace's ROOT function can be matched too",
          "file": "root", "node": "root_locals", "has": ["locals"], "result": 7},
         {"status": "works", "min_python": [3, 12], "desc": "...its entries", "stdout": "*root locals: [(2, 'x = 3', {'x': 3}), (3, 'y = x + 4', {'y': 7})]*"},
+        {"status": "works", "new": True, "min_python": [3, 12], "fixes": "a plain string was read one character per pattern, so \"*\" in it tracked every function",
+         "desc": "TRACE_LOCALS can be a single string (TRACE_LOCALS=\"__main__.func\"): it is one pattern",
+         "file": "single", "node": "__main__.func", "has": ["locals"]},
+        {"status": "works", "new": True, "min_python": [3, 12], "desc": "...and other functions in that trace get no locals",
+         "file": "single", "node": "single_pattern", "lacks": ["locals"]},
         {"status": "limitation", "max_python": [3, 11], "desc": "TRACE_LOCALS needs Python 3.12+ (sys.monitoring line events): on older versions it is ignored with a warning",
          "stdout": "*TRACE_LOCALS needs Python 3.12+*"},
     ],
@@ -175,6 +188,12 @@ def root_locals():
     return y
 
 
+@perf.trace(TRACE_LOCALS="__main__.func", OUTPUT_FILE="single")
+def single_pattern():
+    total = func()
+    return total
+
+
 def entries(node, fn):
     """(line relative to the function's `def`, source text, change) — the trace
     itself holds real file line numbers; relative ones keep this test stable."""
@@ -193,12 +212,26 @@ def entries(node, fn):
 if __name__ == "__main__":
     import json
 
-    from run_all import resolve, walk
+    from run_all import resolve, walk, with_text
 
     setup(__file__)
     main()
     capped()
-    d = json.load(open(f"{perf.OUTPUT_DIR}/main.json"))
+    single_pattern()
+    raw = json.load(open(f"{perf.OUTPUT_DIR}/main.json"))
+    raw_entries = [e for n in walk(raw["trace"]) for e in n.get("locals", [])]
+    funcs = [n for n in walk(raw["trace"]) if n["name"] == "__main__.func"]
+    src = raw.get("sources", {}).get(funcs[0].get("source"), {"file": None, "lines": {}})  # none before Python 3.12
+    print("format: entries without text:", bool(raw_entries) and not any("text" in e for e in raw_entries))
+    import inspect
+
+    first = inspect.unwrap(func).__code__.co_firstlineno  # relative line numbers keep this check stable when the file is edited
+    func_lines = {int(k) - first: v for k, v in src["lines"].items() if first < int(k) <= first + 3}
+    print("format: source file is this script:", src["file"] == __file__, "func lines:", func_lines)
+    stored = [(sid, line) for sid, s in raw.get("sources", {}).items() for line in s["lines"]]
+    print("format: each line stored once:", len(stored) == len(set(stored)) < len(raw_entries),
+          "both func calls share one source:", len({n.get("source") for n in funcs}) == 1 and len(funcs) == 2)
+    d = with_text(json.load(open(f"{perf.OUTPUT_DIR}/main.json")))
     variables = d["variables"]
     nodes = [resolve(n, variables) for n in walk(d["trace"]) if n["name"] != "main"]
 
@@ -225,5 +258,5 @@ if __name__ == "__main__":
     show("nested", first("__main__.outer.<locals>.inner"), outer)
     show("secret", first("__main__.secret"), secret)
     root_locals()
-    root = json.load(open(f"{perf.OUTPUT_DIR}/root.json"))
+    root = with_text(json.load(open(f"{perf.OUTPUT_DIR}/root.json")))
     show("root", resolve(root["trace"], root["variables"]), root_locals)
