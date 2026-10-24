@@ -20,6 +20,13 @@ EXPECT = {
          "file": "skip_var_override", "node": "__main__.login", "args": ["ann", "<skipped:password>", {"__type__": "Conn", "host": "db", "port": 1, "secret_token": "abc"}]},
         {"status": "works", "new": True, "desc": "...and doesn't leak into other traces (the module-level setting is untouched)",
          "file": "no_io", "count": "*", "n": 2},
+        {"status": "works", "new": True, "fixes": "a plain string was read one character per pattern, so \"*.noisy*\" also meant \"*\" and skipped every call",
+         "desc": "a single string where a list is expected (SKIP_FUNCTIONS=\"*.noisy*\") is one pattern: only the matching call is skipped",
+         "file": "skip_fn_str", "node": "__main__.useful", "result": 1},
+        {"status": "works", "new": True, "desc": "...and the matching call is still skipped",
+         "file": "skip_fn_str", "absent": "__main__.noisy*"},
+        {"status": "works", "new": True, "desc": "...the same for the module-level setting (perf.SKIP_FUNCTIONS = \"*.noisy*\")",
+         "file": "skip_fn_str_global", "node": "__main__.useful", "result": 1},
         {"status": "works", "desc": "LOG_FUNCTIONS: the written file keeps only matching nodes + their ancestors",
          "file": "log_fn", "absent": "__main__.useful"},
         {"status": "works", "desc": "LOG_FUNCTIONS: the kept path survives",
@@ -93,6 +100,18 @@ def skip_fn():
     return useful()
 
 
+@perf.trace(SKIP_FUNCTIONS="*.noisy*", OUTPUT_FILE="skip_fn_str")
+def skip_fn_str():
+    noisy_poll()
+    return useful()
+
+
+@perf.trace(OUTPUT_FILE="skip_fn_str_global")
+def skip_fn_str_global():
+    noisy_poll()
+    return useful()
+
+
 @perf.trace(OUTPUT_FILE="skip_var")
 def skip_var():
     return login("ann", "hunter2", Conn(), api_key="k")
@@ -144,6 +163,10 @@ def depth():
 if __name__ == "__main__":
     setup(__file__)
     skip_fn()
+    skip_fn_str()
+    perf.SKIP_FUNCTIONS = "*.noisy*"
+    skip_fn_str_global()
+    perf.SKIP_FUNCTIONS = []
     perf.SKIP_VARIABLES = ["password", "*token*", "api_key"]
     skip_var()
     perf.SKIP_VARIABLES = []

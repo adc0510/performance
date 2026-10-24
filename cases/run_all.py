@@ -103,6 +103,22 @@ def matches(actual, expected):
     return actual == expected
 
 
+def with_text(trace):
+    """A written trace with each TRACE_LOCALS entry's source text filled back
+    in (``entry["text"]``) from the top-level "sources" map, and its "changed"
+    edits replayed into full "set" values (perf.expand_locals), in place."""
+    import perf
+
+    perf.expand_locals(trace)
+    sources = trace.get("sources", {})
+    for node in walk(trace["trace"]):
+        lines = sources.get(node.get("source"), {}).get("lines", {})
+        for entry in node.get("locals", []):
+            if str(entry.get("line")) in lines:
+                entry["text"] = lines[str(entry["line"])]
+    return trace
+
+
 def walk(node):
     yield node
     for child in node.get("children", []):

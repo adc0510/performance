@@ -46,7 +46,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 __all__ = [
     "TraceTimeout",
     "API_KEY",
@@ -67,6 +67,7 @@ __all__ = [
     "SUPPRESS_ERRORS",
     "TAGS",
     "TIMEOUT",
+    "expand_locals",
     "fmt",
     "print_tree",
     "trace",
@@ -135,21 +136,43 @@ class _TraceState:
     (``time: null``) in the output — which is exactly what it was.
     """
 
-    __slots__ = ("lock", "open", "graft_tokens")
+    __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix")
 
-    def __init__(self) -> None:
+    def __init__(self, source_prefix: str = "") -> None:
         # Re-entrant: an asynchronous exception perf can't defer (Ctrl-C)
         # landing between acquire and release must not deadlock the thread
         # the next time it records something.
         self.lock = threading.RLock()
         self.open = True
         self.graft_tokens: list = []
+        # TRACE_LOCALS source text, each line stored once per trace:
+        # {source id: {"file": path, "lines": {"<line>": text}}}. A node with
+        # locals names its file's id as "source"; its entries carry only the
+        # line number. `source_prefix` keeps a worker process's ids distinct
+        # when its table is merged into the parent's (as with _ValuePool).
+        self.sources: dict = {}
+        self._source_ids: dict = {}
+        self._source_prefix = source_prefix
 
     def close(self) -> None:
         with self.lock:
             self.open = False
         for token in self.graft_tokens:
             _pool_grafts.pop(token, None)
+
+    def source_line(self, filename: str, line: int, text: str) -> "str | None":
+        """Record `text` as `filename`'s line `line` (once) and return the
+        file's source id -- or None once the trace has closed."""
+        with self.lock:
+            if not self.open:
+                return None
+            sid = self._source_ids.get(filename)
+            if sid is None:
+                sid = f"{self._source_prefix}s{len(self._source_ids)}"
+                self._source_ids[filename] = sid
+                self.sources[sid] = {"file": filename, "lines": {}}
+            self.sources[sid]["lines"].setdefault(str(line), text)
+            return sid
 
     def attach(self, parent: dict, node: dict) -> bool:
         """Link `node` under `parent` — unless the trace already closed."""
@@ -216,6 +239,9 @@ def _hook_exit() -> None:
 # a side effect of capture (a property read, __getattr__, a pydantic
 # model_dump) must not be recorded as if the program had called it.
 _capturing: ContextVar[int] = ContextVar("_capturing", default=0)
+# >0 while converting a value only to COMPARE it between lines (TRACE_LOCALS
+# change detection, see _locals_comparable), never to store it.
+_comparing: ContextVar[int] = ContextVar("_comparing", default=0)
 
 
 def _recording() -> "tuple[dict, _TraceState] | None":
@@ -245,6 +271,13 @@ def _completion(node: dict) -> dict:
 _overrides: ContextVar["dict | None"] = ContextVar("_overrides", default=None)
 _G = globals()
 
+# Settings that hold a list of names/patterns. A plain string given for one
+# (TRACE_LOCALS="*helper") means that single entry -- iterated as-is it would
+# be one pattern per character, and its "*" would match every function.
+_LIST_KEYS = frozenset(
+    {"LOG_FUNCTIONS", "SKIP_FUNCTIONS", "SKIP_VARIABLES", "TRACE_LOCALS", "REDACT_PATTERNS", "TAGS", "_SCAN_INCLUDE_PREFIXES"}
+)
+
 
 class _Config:
     """Effective config: the current context's override for a setting if any,
@@ -256,8 +289,12 @@ class _Config:
     def __getattr__(self, name: str) -> Any:
         overrides = _overrides.get()
         if overrides is not None and name in overrides:
-            return overrides[name]
-        return _G[name]
+            value = overrides[name]
+        else:
+            value = _G[name]
+        if type(value) is str and name in _LIST_KEYS:
+            return (value,)
+        return value
 
 
 _cfg = _Config()
@@ -389,12 +426,35 @@ SKIP_FUNCTIONS: list = []
 SKIP_VARIABLES: list = []
 # Functions whose LOCAL VARIABLES are traced line by line (fnmatch patterns
 # on node names, e.g. ["__main__.func", "Cart.*"]). Each matching call's node
-# gets a "locals" list -- one entry per executed line that changed something:
-# {"line": <file line>, "text": <source>, "set": {name: value}, "deleted": [..]}
+# gets a "locals" list -- one entry per executed line that changed something,
+# written positionally (0 = empty part; trailing empty parts are left out):
+#   [line, set, changed, deleted, globals, deleted_globals]
+# e.g. [12, {"i": 3}] or [14, 0, {"rows": [["+", [], [{"id": 3}]]]}]
 # -- covering rebinding (a = 3) and in-place mutation (items.append(x),
-# self.count += 1). Arguments aren't repeated (they're in "args"). Costly:
-# every line of a matching function compares its locals, so scope it to the
-# functions you are debugging. Python 3.12+ (sys.monitoring line events);
+# self.count += 1). `set` ({name: value}) holds full values. `changed`
+# ({name: [op, ..]}) holds, for an object mutated in place, only the edits to
+# its previous value: ["+", path, [items]] appends to the list at path,
+# ["=", path, value] sets a key/attribute/index, ["-", path] deletes one
+# (path: a list of keys and indices, [] = the variable itself). The previous
+# value is the name's latest entry in this call -- or, for an argument with
+# none yet, its value in the node's "args" (at its index in the node's
+# "params", the positional parameter names) or "kwargs". `deleted`: names.
+# `globals`: like `set`, for names the function assigns via `global`.
+# Replaying a node's entries in order rebuilds every value:
+# perf.expand_locals(trace) does it. Arguments aren't repeated (they're in
+# "args"). Objects known only by a repr naming their address (a lock: <locked
+# _thread.lock object at 0x…>) change only when rebound, not when their state
+# words flip. The source
+# text of each line is stored once per trace, in the output's top-level
+# "sources" map -- {id: {"file": path, "lines": {"<line>": text}}} -- and the
+# node names its file's id as "source": an entry's text is
+# sources[node["source"]]["lines"][str(line)]. Costly:
+# after every line of a matching function that could change an object in
+# place (it calls something, stores an attribute/item, uses an in-place
+# operator, iterates, or awaits/yields), its mutable locals are converted and
+# compared, so scope it to the functions you are debugging. (After any other
+# line only rebinding is checked: a change that a property or operator
+# dunder makes there is recorded at the next such line instead.) Python 3.12+ (sys.monitoring line events);
 # ignored with a warning on older versions. Empty (the default) disables it.
 TRACE_LOCALS: list = []
 # Cap on "locals" entries per call (a loop can produce one per iteration);
@@ -566,6 +626,7 @@ _SKIP = object()
 # Matches Python's default object repr, e.g.
 #   <qdrant_client.http.api_client.BaseAsyncMiddleware object at 0x7fd8bc2d4d70>
 _DEFAULT_REPR = re.compile(r"^<[\w.<>]+ object at 0x[0-9a-fA-F]+>$")  # <> : local classes (f.<locals>.C)
+_ADDRESS_REPR = re.compile(r"^<.* at (0x[0-9a-fA-F]+)>$", re.S)  # any repr naming its object's address
 
 
 def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None,
@@ -603,10 +664,17 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     (see :func:`_capture_value` / :meth:`_ValuePool.intern`).
 
     Within ONE conversion, `_memo` converts each shared container/object once
-    per depth and reuses the result wherever else it is referenced: an object
-    graph where the same sub-objects are reachable along many paths would
-    otherwise be re-expanded along every path -- exponential in MAX_DEPTH.
-    (Not with a size budget: there every occurrence must be charged.)
+    and reuses the result wherever else it is referenced -- at other depths
+    too, as long as the reused subtree stays clear of MAX_DEPTH there: an
+    object graph where the same sub-objects are reachable along many paths
+    would otherwise be re-expanded along every path -- exponential in
+    MAX_DEPTH. (Not with a size budget: there every occurrence must be charged.)
+
+    A dict holding nothing but functions (a registry: jinja's filters, a
+    dispatch table) becomes ``{"__functions__": [its keys]}`` -- which names
+    are registered is the data; one ``{__type__: function, …}`` description
+    per entry was most of the cost of capturing any object that reaches one.
+    Swapping one function for another under the same key is not visible.
 
     Only objects of PROJECT classes (see _is_project_module; SCAN_VENV opts
     libraries in) are expanded field by field, plus dataclasses and pydantic
@@ -615,8 +683,14 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     not the program's data, and walking them reaches modules, registries and
     whole connection pools. Modules are never expanded.
     """
-    if _memo is None and _budget is None and depth == 0:
+    if _memo is None:
         _memo = {"circular": 0}
+    if depth == 0 and "max_depth" not in _memo:
+        # Settings read once per conversion, not at every step (each `_cfg`
+        # read is a context-var lookup).
+        _memo["max_depth"] = _cfg.MAX_DEPTH
+        _memo["rx"] = _redactor()
+        _memo["skip"] = bool(_cfg.SKIP_VARIABLES)
     if value is None or isinstance(value, (bool, int, float)):
         if _budget is not None:
             # Numbers count too: a huge list of ints must hit MAX_SIZE_CAPTURE
@@ -624,7 +698,8 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
             _budget[0] -= len(repr(value))
         return value
     if isinstance(value, str):
-        value = _redact(value)
+        if _memo["rx"] is not None:
+            value = _memo["rx"].sub("<redacted>", value)
         if _budget is not None:
             if len(value) >= _budget[0]:
                 truncated = value[: max(_budget[0], 0)]
@@ -640,32 +715,45 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
                 return _safe_repr(bytes(value[:n]))
             _budget[0] -= len(value)
         return _safe_repr(value)
-    if depth >= _cfg.MAX_DEPTH:
+    max_depth = _memo["max_depth"]
+    if depth > _memo.get("deepest", 0):
+        _memo["deepest"] = depth
+    if depth >= max_depth:
         return _charge(_safe_repr(value), _budget)
     if id(value) in _seen:
-        if _memo is not None:
-            _memo["circular"] += 1
+        _memo["circular"] += 1
         return _charge(f"<circular {type(value).__name__}>", _budget)
     if _budget is not None and _budget[0] <= 0:
         return f"<{type(value).__name__} truncated: size limit reached>"
-    if _memo is not None:
-        key = (id(value), depth)
-        entry = _memo.get(key)
-        if entry is not None and entry[0] is value:
+    if _budget is None:
+        entry = _memo.get(id(value))
+        # Reused at its own depth, or at any depth where neither it nor this
+        # occurrence reaches MAX_DEPTH: a subtree `height` levels deep that
+        # was never cut converts the same wherever it sits above the limit.
+        # (A hub object -- a jinja Environment every AST node points to -- is
+        # otherwise re-expanded once per depth it is reached at.)
+        if entry is not None and entry[0] is value and (
+                entry[2] == depth or (entry[2] + entry[3] < max_depth and depth + entry[3] < max_depth)):
+            if depth + entry[3] > _memo.get("deepest", 0):
+                _memo["deepest"] = depth + entry[3]
             return entry[1]
         circular_before = _memo["circular"]
+        deepest_before = _memo.get("deepest", 0)
+        _memo["deepest"] = depth
         converted = _jsonable_uncached(value, depth, _seen, _budget, _memo)
+        height = _memo["deepest"] - depth
+        _memo["deepest"] = max(deepest_before, _memo["deepest"])
         # A subtree that cut a cycle depends on the path it was reached by:
         # reusing it elsewhere could show "<circular>" where there is none.
         # The value itself is kept in the entry so its id can't be reused by
         # another (temporary) object during this conversion.
         if _memo["circular"] == circular_before:
-            _memo[key] = (value, converted)
+            _memo[id(value)] = (value, converted, depth, height)
         return converted
     return _jsonable_uncached(value, depth, _seen, _budget, _memo)
 
 
-def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list | None, _memo: dict | None) -> Any:
+def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list | None, _memo: dict) -> Any:
     """Containers and objects (see _jsonable)."""
     try:
         # Compact, unambiguous forms for values whose generic conversion is
@@ -690,13 +778,17 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
         if isinstance(value, (dict, types.MappingProxyType)):
             seen = _seen | {id(value)}
             out = {}
-            skip_keys = bool(_cfg.SKIP_VARIABLES)
-            redact = _redactor() is not None
-            leaf_types = _NON_STR_LEAF_TYPES if redact else _LEAF_TYPES
+            skip_keys = _memo["skip"]
+            rx = _memo["rx"]
+            if len(value) >= _REGISTRY_MIN and all(map(_is_routine, value.values())):  # see _jsonable
+                return {"__functions__": [
+                    _charge((rx.sub("<redacted>", k) if rx else k) if isinstance(k, str) else _safe_repr(k), _budget)
+                    for k in value if not (skip_keys and isinstance(k, str) and _is_skipped_variable(k))]}
+            leaf_types = _NON_STR_LEAF_TYPES if rx else _LEAF_TYPES
             for k, v in value.items():
                 if skip_keys and isinstance(k, str) and _is_skipped_variable(k):
                     continue
-                key = (_redact(k) if redact else k) if isinstance(k, str) else _safe_repr(k)
+                key = (rx.sub("<redacted>", k) if rx else k) if isinstance(k, str) else _safe_repr(k)
                 if _budget is None:
                     if type(v) in leaf_types:  # fast path: same result as recursing
                         out[key] = v
@@ -710,7 +802,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
         if isinstance(value, (list, tuple, set, frozenset)):
             seen = _seen | {id(value)}
             out = []
-            leaf_types = _NON_STR_LEAF_TYPES if _redactor() is not None else _LEAF_TYPES
+            leaf_types = _NON_STR_LEAF_TYPES if _memo["rx"] is not None else _LEAF_TYPES
             for v in value:
                 if _budget is None:
                     if type(v) in leaf_types:  # fast path: same result as recursing
@@ -741,7 +833,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
         # bound method's __func__ may carry unrelated noise like __wrapped__
         # from being auto-instrumented) -- describe identity instead of
         # falling through to a raw "<bound method ... at 0x...>" repr.
-        if inspect.isroutine(value):
+        if _is_routine(value):
             is_method = inspect.ismethod(value)
             func = value.__func__ if is_method else value
             info: dict = {
@@ -794,7 +886,31 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
     r = _safe_repr(value)
     if _DEFAULT_REPR.match(r):
         return _SKIP
+    if _comparing.get():
+        m = _ADDRESS_REPR.match(r)
+        if m:
+            _memo["shortened"] = _memo.get("shortened", 0) + 1
+            # TRACE_LOCALS change detection: a repr that names its object's
+            # address (<locked _thread.lock object at 0x…>) is that object's
+            # identity, not its data -- its state words flipping on every
+            # `with lock:` must not count as a change of the variable.
+            return f"<{type(value).__qualname__} at {m.group(1)}>"
     return _charge(r, _budget)
+
+
+_REGISTRY_MIN = 4  # a dict of at least this many functions and nothing else is a registry (see _jsonable)
+_routine_types: dict = {}  # type -> inspect.isroutine verdict
+
+
+def _is_routine(value: Any) -> bool:
+    """inspect.isroutine, cached per type: its answer depends only on the
+    type, and it chains five checks -- run on every captured object and every
+    value of a dict that might be a function registry."""
+    verdict = _routine_types.get(type(value))
+    if verdict is None:
+        verdict = _routine_types[type(value)] = inspect.isroutine(value)
+    return verdict
+
 
 
 class _NotExpanded(Exception):
@@ -900,17 +1016,25 @@ def _capture_value(value: Any) -> Any:
     conversion never reaches the pool, and a spilled value's file holds its
     full content inline, never a ref into a pool that isn't written with it.
     """
+    jv, inline = _capture_value_inline(value)
+    return _intern(jv) if inline else jv
+
+
+def _capture_value_inline(value: Any) -> tuple:
+    """:func:`_capture_value` before interning: (converted form, whether it is
+    the value's full content -- False for a spill reference or a dropped value)."""
     if _cfg.MAX_SIZE_CAPTURE is None:
-        return _intern(_jsonable(value))
+        jv = _jsonable(value)
+        return jv, jv is not _SKIP
     budget = [_cfg.MAX_SIZE_CAPTURE]
     jv = _jsonable(value, _budget=budget)
     if jv is _SKIP:
-        return _SKIP
+        return _SKIP, False
     if budget[0] > 0:
-        return _intern(jv)
+        return jv, True
     if _cfg.SPILL_DIR:
-        return _spill_value(value)
-    return _SKIP
+        return _spill_value(value), False
+    return _SKIP, False
 
 
 def _intern(converted: Any) -> Any:
@@ -2769,11 +2893,12 @@ class _RemoteOutcome:
     to. On failure the same object rides back on the exception instead, as
     its ``_perf_remote`` attribute."""
 
-    def __init__(self, result: Any, children: list, variables: dict, token: Any = None) -> None:
+    def __init__(self, result: Any, children: list, variables: dict, token: Any = None, sources: dict | None = None) -> None:
         self.result = result
         self.children = children
         self.variables = variables
-        self.token = token  # multiprocessing.Pool: where to graft (see _pool_grafts)
+        self.token = token
+        self.sources = sources or {}  # multiprocessing.Pool: where to graft (see _pool_grafts)
 
 
 class _RemoteCall:
@@ -2805,8 +2930,9 @@ class _RemoteCall:
         _install_executor_hook()  # nested pools inside the worker get traced too
         _patch_all_project_classes()
         holder = make_node(self.name)
-        state = _TraceState()
-        pool = _ValuePool(prefix=f"{uuid.uuid4().hex[:8]}_", state=state) if _cfg.CAPTURE_IO else None
+        prefix = f"{uuid.uuid4().hex[:8]}_"
+        state = _TraceState(source_prefix=prefix)
+        pool = _ValuePool(prefix=prefix, state=state) if _cfg.CAPTURE_IO else None
         _current_node.set(holder)
         _current_trace.set(state)
         _current_pool.set(pool)
@@ -2830,7 +2956,7 @@ class _RemoteCall:
         except BaseException as exc:
             state.close()  # freeze before pickling: threads the call started may still run
             try:
-                exc._perf_remote = _RemoteOutcome(None, holder["children"], pool.variables if pool else {}, self.token)
+                exc._perf_remote = _RemoteOutcome(None, holder["children"], pool.variables if pool else {}, self.token, state.sources)
             except Exception:
                 pass  # an exception type that rejects attributes just loses its subtree
             raise
@@ -2840,7 +2966,7 @@ class _RemoteCall:
             _events_release()
             uninstall_profiler()
         state.close()
-        return _RemoteOutcome(result, holder["children"], pool.variables if pool else {}, self.token)
+        return _RemoteOutcome(result, holder["children"], pool.variables if pool else {}, self.token, state.sources)
 
 
 def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None", state: "_TraceState") -> None:
@@ -2865,6 +2991,7 @@ def _graft_remote(future: Any, parent: dict, pool: "_ValuePool | None", state: "
             return  # finished after the trace ended: not part of it
         if pool is not None:
             pool.variables.update(outcome.variables)
+        state.sources.update(outcome.sources)
         parent["children"].extend(outcome.children)
 
 
@@ -2957,6 +3084,7 @@ def _graft_outcome(outcome: "_RemoteOutcome") -> Any:
             if state.open:
                 if pool is not None:
                     pool.variables.update(outcome.variables)
+                state.sources.update(outcome.sources)
                 parent["children"].extend(outcome.children)
     return outcome.result
 
@@ -3301,11 +3429,21 @@ _IMMUTABLE_TYPES = (int, float, complex, str, bytes, bool, type(None), frozenset
 
 class _LocalsState:
     __slots__ = ("frame", "node", "state", "snapshot", "global_names", "global_snapshot", "last_line", "events",
-                 "dropped", "limit", "overhead")
+                 "dropped", "limit", "overhead", "source", "based", "arg_based", "params", "params_used")
 
     def __init__(self, frame: Any, node: dict, state: "_TraceState") -> None:
         self.frame, self.node, self.state = frame, node, state
         self.snapshot: dict = {}  # name -> (value, comparable form or None)
+        # Names whose latest entry in this call holds their full content, so a
+        # later in-place mutation can be recorded as "changed" ops against it.
+        self.based: set = set()
+        # Arguments whose base is still the node's recorded "args"/"kwargs"
+        # value (no entry of their own yet), and the positional parameter
+        # names a reader needs to find it -- written as the node's "params"
+        # once an entry is recorded against one (see _locals_arg_bases).
+        self.arg_based: set = set()
+        self.params: tuple = ()
+        self.params_used = False
         self.global_names = _stored_globals(frame.f_code)  # `global x` names this function assigns
         self.global_snapshot: dict = {}
         self.last_line = None
@@ -3313,16 +3451,70 @@ class _LocalsState:
         self.dropped = 0
         self.limit = _cfg.MAX_LOCALS_EVENTS
         self.overhead = 0.0
+        self.source: "str | None" = None  # id of this function's file in the trace's sources table
 
 
-def _locals_comparable(value: Any) -> Any:
+def _locals_comparable(value: Any, memo: "dict | None" = None) -> Any:
     """What a mutable value is compared by between lines (None for immutables,
-    which can only change by rebinding)."""
+    which can only change by rebinding). `memo`, shared by every value
+    compared at one line, converts an object reachable from several of them
+    (self, and a local holding self.items, …) once for all."""
     if isinstance(value, _IMMUTABLE_TYPES):
         return None
     # Full conversion, no size budget: a budget-truncated form would hide a
     # change past the cut-off (MAX_SIZE_CAPTURE only limits what is STORED).
-    return _jsonable(value)
+    token = _comparing.set(1)
+    try:
+        return _jsonable(value, _memo=memo if memo is not None else {"circular": 0})
+    finally:
+        _comparing.reset(token)
+
+
+# Instructions that can change an object in place, or let other code run
+# that can: calls (a with-statement's __enter__/__exit__ included), stores
+# and deletes of attributes/items, in-place operators, iterating (a
+# generator's body runs), and suspending (yield/await: other code runs
+# meanwhile). After a line with none of them only rebinding is possible, so
+# its locals are compared by identity alone. Not covered: user code run
+# implicitly by an attribute read (a property) or an operator (__eq__,
+# __getitem__) -- a change it makes is recorded at the next line that has
+# one of these instead.
+_MUTATING_OPS = frozenset({
+    "CALL", "CALL_KW", "CALL_FUNCTION_EX", "STORE_ATTR", "STORE_SUBSCR", "STORE_SLICE", "DELETE_ATTR",
+    "DELETE_SUBSCR", "FOR_ITER", "SEND", "YIELD_VALUE", "GET_AWAITABLE", "GET_ANEXT", "BEFORE_WITH",
+    "BEFORE_ASYNC_WITH", "WITH_EXCEPT_START", "IMPORT_NAME", "IMPORT_FROM",
+})
+_ALL_LINES = None  # _mutating_lines verdict: every line may mutate (analysis failed)
+_mutating_lines_cache: dict = {}
+
+
+def _mutating_lines(code: Any) -> "frozenset | None":
+    """The lines of `code` that contain an instruction from _MUTATING_OPS (or
+    an in-place operator); None when that can't be determined."""
+    try:
+        return _mutating_lines_cache[code]
+    except KeyError:
+        pass
+    lines: "set | None" = set()
+    try:
+        import dis
+
+        for ins in dis.get_instructions(code):
+            name = ins.opname.removeprefix("INSTRUMENTED_")
+            if name in _MUTATING_OPS or (name == "BINARY_OP" and ins.argrepr.endswith("=")):
+                line = ins.positions.lineno if ins.positions else None
+                if line is not None:  # unnumbered: exception plumbing, no user code
+                    lines.add(line)
+    except Exception:
+        lines = _ALL_LINES
+    verdict = frozenset(lines) if lines is not None else _ALL_LINES
+    _mutating_lines_cache[code] = verdict
+    return verdict
+
+
+def _line_may_mutate(code: Any, line: "int | None") -> bool:
+    lines = _mutating_lines(code)
+    return lines is _ALL_LINES or line is None or line in lines
 
 
 def _locals_read(frame: Any) -> dict:
@@ -3348,26 +3540,38 @@ def _stored_globals(code: Any) -> tuple:
     return names
 
 
-def _changes(snapshot: dict, current: dict) -> tuple:
-    """(changed {name: value}, deleted [names]) between a snapshot and now;
-    updates the snapshot."""
+def _changes(snapshot: dict, current: dict, content: bool = True) -> tuple:
+    """(changed {name: value}, deleted [names], mutated {name: (old, new)},
+    reusable {name: converted}) between a snapshot and now; updates the
+    snapshot. `reusable` holds changed values' comparison forms that are also
+    their exact capture (see _capture_locals). `mutated` holds the
+    changed names still bound to the SAME object (changed in place), with
+    their comparable forms before and after. With `content` False (the line
+    that ran can't have changed anything in place, see _MUTATING_OPS) a name
+    still bound to the same object is unchanged without comparing it."""
     changed: dict = {}
+    mutated: dict = {}
+    memo: dict = {"circular": 0}
     for name, value in current.items():
         previous = snapshot.get(name)
         if previous is not None and previous[0] is value:
-            if previous[1] is None:
-                continue  # same immutable object: unchanged
-            comparable = _locals_comparable(value)
+            if previous[1] is None or not content:
+                continue  # same immutable object, or nothing could change it: unchanged
+            comparable = _locals_comparable(value, memo)
             if comparable == previous[1]:
                 continue
+            mutated[name] = (previous[1], comparable)
         else:
-            comparable = _locals_comparable(value)
+            comparable = _locals_comparable(value, memo)
         snapshot[name] = (value, comparable)
         changed[name] = value
     deleted = [name for name in snapshot if name not in current]
     for name in deleted:
         del snapshot[name]
-    return changed, deleted
+    # When no repr was shortened for comparing, each comparable form is
+    # exactly what capturing the value would store, so it can be stored as is.
+    reusable = {} if memo.get("shortened") else {name: snapshot[name][1] for name in changed}
+    return changed, deleted, mutated, reusable
 
 
 def _capture_named(values: dict) -> dict:
@@ -3381,26 +3585,183 @@ def _capture_named(values: dict) -> dict:
     return captured
 
 
+def _capture_locals(st: "_LocalsState", changed: dict, mutated: dict, reusable: "dict | None" = None) -> tuple:
+    """The "set" and "changed" parts of a TRACE_LOCALS entry: a value changed
+    in place whose previous state this call already recorded in full is
+    stored as edits to it (when they are smaller); anything else in full. An
+    argument's first edits are against its recorded value in the node's
+    "args"/"kwargs" (see _locals_arg_bases)."""
+    sets: dict = {}
+    deltas: dict = {}
+    for name, value in changed.items():
+        arg_based = name in st.arg_based
+        st.arg_based.discard(name)  # from here on, its base is this entry
+        if _is_skipped_variable(name):
+            sets[name] = f"<skipped:{name}>"
+            st.based.discard(name)
+            continue
+        if name in mutated and (name in st.based or (arg_based and _arg_base_matches(st, name, mutated[name][0]))):
+            ops = _locals_delta(*mutated[name])
+            if ops is not None:
+                deltas[name] = ops
+                st.based.add(name)  # an argument's base until now was its recorded value
+                st.params_used = st.params_used or arg_based
+                continue
+        jv = (reusable or {}).get(name)
+        if jv is not None and jv is not _SKIP and _cfg.MAX_SIZE_CAPTURE is None:
+            inline = True  # already converted for comparing (no size limit to apply)
+        else:
+            jv, inline = _capture_value_inline(value)
+        if inline:
+            sets[name] = _intern(jv)
+            st.based.add(name)
+        else:
+            sets[name] = f"<{type(value).__name__}>" if jv is _SKIP else jv
+            st.based.discard(name)
+    return sets, deltas
+
+
+def _locals_delta(old: Any, new: Any) -> "list | None":
+    """Edit ops turning the converted value `old` into `new` (see TRACE_LOCALS),
+    or None when they would not be smaller than `new` itself (or can't be
+    expressed, or exceed MAX_SIZE_CAPTURE)."""
+    if old is _SKIP or new is _SKIP:
+        return None
+    ops: list = []
+    if not _delta_ops(old, new, [], ops) or not ops:
+        return None
+    size = len(_json.dumps(ops, ensure_ascii=False, separators=(",", ":"), default=str))
+    if not _json_size_exceeds(new, size):
+        return None
+    if _cfg.MAX_SIZE_CAPTURE is not None and size >= _cfg.MAX_SIZE_CAPTURE:
+        return None
+    for op in ops:
+        if len(op) == 3:
+            op[2] = _intern(op[2])
+    return ops
+
+
+def _json_size_exceeds(value: Any, limit: int) -> bool:
+    """Whether `value`'s compact JSON is longer than `limit` characters --
+    walked only until that is known (serializing a large value in full to
+    compare it with a few bytes of edits would cost more than the edits save).
+    Approximate where it doesn't matter: string escapes aren't counted."""
+    budget = [limit]
+
+    def walk(v: Any) -> bool:  # True once the budget is exhausted
+        t = type(v)
+        if t is str:
+            budget[0] -= len(v) + 2
+        elif t is dict:
+            budget[0] -= 1 + len(v)  # braces, commas, colons
+            for k, x in v.items():
+                budget[0] -= len(k) + 3 if type(k) is str else 3
+                if budget[0] < 0 or walk(x):
+                    return True
+        elif t is list:
+            budget[0] -= 1 + len(v)
+            for x in v:
+                if budget[0] < 0 or walk(x):
+                    return True
+        else:
+            budget[0] -= len(_json.dumps(v, default=str))
+        return budget[0] < 0
+
+    return walk(value)
+
+
+def _delta_ops(old: Any, new: Any, path: list, ops: list) -> bool:
+    """Append to `ops` the edits turning `old` into `new` at `path`; False if
+    they can't be expressed as edits (the caller then sets the whole value)."""
+    if type(old) is list and type(new) is list:
+        n_old, n_new = len(old), len(new)
+        common = min(n_old, n_new)
+        if n_old != n_new and not all(map(_same_converted, old[:common], new[:common])):
+            return False  # not a pure append/truncate: e.g. insert(0, x), remove()
+        if n_new > n_old:
+            ops.append(["+", path, new[n_old:]])
+        elif n_new < n_old:
+            ops.extend(["-", [*path, i]] for i in range(n_old - 1, n_new - 1, -1))
+        else:
+            for i, (a, b) in enumerate(zip(old, new)):
+                if not _same_converted(a, b) and not _delta_ops(a, b, [*path, i], ops):
+                    ops.append(["=", [*path, i], b])
+        return True
+    if type(old) is dict and type(new) is dict:
+        for k, v in new.items():
+            if k not in old:
+                ops.append(["=", [*path, k], v])
+            elif not _same_converted(old[k], v) and not _delta_ops(old[k], v, [*path, k], ops):
+                ops.append(["=", [*path, k], v])
+        ops.extend(["-", [*path, k]] for k in old if k not in new)
+        return True
+    return False
+
+
+def _same_converted(a: Any, b: Any) -> bool:
+    """Equality of converted values that also tells 1, 1.0 and True apart (==
+    doesn't, and an edit skipped on that basis would replay the wrong value).
+    The C-level == rejects a different value at once; only equal ones are
+    walked, to check that their leaves have the same types too."""
+    if type(a) is not type(b) or a != b:
+        return False
+    t = type(a)
+    if t is dict:
+        for k, v in a.items():
+            w = b[k]
+            tv = type(v)
+            if tv is not type(w) or ((tv is dict or tv is list) and not _same_types(v, w)):
+                return False
+        return True
+    if t is list:
+        for v, w in zip(a, b):
+            tv = type(v)
+            if tv is not type(w) or ((tv is dict or tv is list) and not _same_types(v, w)):
+                return False
+    return True
+
+
+def _same_types(a: Any, b: Any) -> bool:
+    """For two values already known to be ==: whether their leaves' types match too."""
+    if type(a) is dict:
+        for k, v in a.items():
+            w = b[k]
+            tv = type(v)
+            if tv is not type(w) or ((tv is dict or tv is list) and not _same_types(v, w)):
+                return False
+        return True
+    for v, w in zip(a, b):
+        tv = type(v)
+        if tv is not type(w) or ((tv is dict or tv is list) and not _same_types(v, w)):
+            return False
+    return True
+
+
 def _locals_diff(st: "_LocalsState", frame: Any) -> None:
-    changed, deleted = _changes(st.snapshot, _locals_read(frame))
-    g_changed, g_deleted = _changes(st.global_snapshot, _globals_read(st, frame)) if st.global_names else ({}, [])
+    content = _line_may_mutate(frame.f_code, st.last_line)
+    changed, deleted, mutated, reusable = _changes(st.snapshot, _locals_read(frame), content)
+    g_changed, g_deleted, _, _ = (_changes(st.global_snapshot, _globals_read(st, frame), content)
+                                  if st.global_names else ({}, [], {}, {}))
+    st.based.difference_update(deleted)
+    st.arg_based.difference_update(deleted)
     if not (changed or deleted or g_changed or g_deleted):
         return
     if len(st.events) >= st.limit:
         st.dropped += 1
         return
-    event: dict = {"line": st.last_line}
-    text = _statement_text(frame.f_code.co_filename, st.last_line) if st.last_line else ""
+    filename = frame.f_code.co_filename
+    text = _statement_text(filename, st.last_line) if st.last_line else ""
     if text:
-        event["text"] = _redact(text)
-    if changed:
-        event["set"] = _capture_named(changed)
-    if deleted:
-        event["deleted"] = deleted
-    if g_changed:
-        event["globals"] = _capture_named(g_changed)
-    if g_deleted:
-        event["deleted_globals"] = g_deleted
+        sid = st.state.source_line(filename, st.last_line, _redact(text))
+        if sid is not None:
+            st.source = sid
+    sets, deltas = _capture_locals(st, changed, mutated, reusable) if changed else ({}, {})
+    # Positional: [line, set, changed, deleted, globals, deleted_globals],
+    # 0 for an empty part, trailing empty parts left out (see TRACE_LOCALS).
+    event = [st.last_line, sets or 0, deltas or 0, deleted or 0,
+             _capture_named(g_changed) if g_changed else 0, g_deleted or 0]
+    while event[-1] == 0:
+        event.pop()
     st.events.append(event)
 
 
@@ -3448,14 +3809,97 @@ def _locals_begin(code: Any, frame: Any) -> "_LocalsState | None":
     st = _LocalsState(frame, node, state)
     token = _capturing.set(1)  # converting values may run user code (__repr__)
     try:
+        memo: dict = {"circular": 0}
         for name, value in _locals_read(frame).items():  # the arguments: baseline, not events
-            st.snapshot[name] = (value, _locals_comparable(value))
+            st.snapshot[name] = (value, _locals_comparable(value, memo))
         for name, value in _globals_read(st, frame).items():
-            st.global_snapshot[name] = (value, _locals_comparable(value))
+            st.global_snapshot[name] = (value, _locals_comparable(value, memo))
+        _locals_arg_bases(st, frame)
     finally:
         _capturing.reset(token)
     _locals_frames[id(frame)] = st
     return st
+
+
+def _locals_arg_bases(st: "_LocalsState", frame: Any) -> None:
+    """Note which arguments may have their first in-place change recorded as
+    edits against the value already in the node's "args"/"kwargs" instead of
+    in full. Checked lazily, at that first change (_arg_base_matches): most
+    arguments are never mutated, and checking costs a walk of the value. A
+    reader finds that value as args[params.index(name)] when the name is in
+    the node's "params" (positional parameter names) and that index is within
+    "args", else as kwargs[name]."""
+    node = st.node
+    if node.get("args") is None and not node.get("kwargs"):
+        return  # CAPTURE_IO off, or no arguments
+    code = frame.f_code
+    st.params = code.co_varnames[: code.co_argcount]
+    kwonly = code.co_varnames[code.co_argcount : code.co_argcount + code.co_kwonlyargcount]
+    for name in (*st.params, *kwonly):
+        entry = st.snapshot.get(name)
+        if entry is not None and entry[1] is not None and not _is_skipped_variable(name):
+            st.arg_based.add(name)  # bound and mutable (an immutable one can only be rebound)
+
+
+def _arg_base_matches(st: "_LocalsState", name: str, comparable: Any) -> bool:
+    """Whether argument `name`'s recorded value in the node is exactly
+    `comparable` -- its state from the call's start until now (not a
+    skipped/oversized marker, a spilled value, …)."""
+    node = st.node
+    args, kwargs = node.get("args") or [], node.get("kwargs") or {}
+    i = st.params.index(name) if name in st.params else len(args)
+    if i < len(args):
+        recorded = args[i]
+    elif name in kwargs:
+        recorded = kwargs[name]
+    else:
+        return False
+    pool = _current_pool.get()
+    return _same_recorded(recorded, comparable, pool.variables if pool is not None else {})
+
+
+def _same_recorded(recorded: Any, comparable: Any, variables: dict, depth: int = 0) -> bool:
+    """:func:`_same_converted` between a RECORDED value (which may hold
+    {"__ref__"} pool references) and a comparison form (whose address-bearing
+    reprs are shortened, see _locals_comparable): such reprs match by address."""
+    if depth > 100:
+        return False
+    if type(recorded) is dict and "__ref__" in recorded:
+        target = variables.get(recorded["__ref__"])
+        if len(recorded) > 1:  # {"__type__": T, "__ref__": r}: r is the object's pooled fields
+            if type(target) is not dict:
+                return False
+            target = {**{k: v for k, v in recorded.items() if k != "__ref__"}, **target}
+        recorded = target
+    if type(recorded) is not type(comparable):
+        return False
+    if type(recorded) is dict:
+        return len(recorded) == len(comparable) and all(
+            k in comparable and _same_recorded(v, comparable[k], variables, depth + 1) for k, v in recorded.items())
+    if type(recorded) is list:
+        return len(recorded) == len(comparable) and all(
+            _same_recorded(a, b, variables, depth + 1) for a, b in zip(recorded, comparable))
+    if recorded == comparable:
+        return True
+    if type(recorded) is str:
+        a, b = _ADDRESS_REPR.match(recorded), _ADDRESS_REPR.match(comparable)
+        return bool(a and b and a.group(1) == b.group(1))
+    return False
+
+
+def _resolve_pooled(value: Any, variables: dict, depth: int = 0) -> Any:
+    """`value` with its {"__ref__"} references into the trace's pool expanded."""
+    if depth > 100:
+        return value
+    if type(value) is dict:
+        if "__ref__" in value:
+            target = _resolve_pooled(variables.get(value["__ref__"], value), variables, depth + 1)
+            rest = {k: _resolve_pooled(v, variables, depth + 1) for k, v in value.items() if k != "__ref__"}
+            return {**rest, **target} if rest and isinstance(target, dict) else target
+        return {k: _resolve_pooled(v, variables, depth + 1) for k, v in value.items()}
+    if type(value) is list:
+        return [_resolve_pooled(v, variables, depth + 1) for v in value]
+    return value
 
 
 def _on_locals_line(code: Any, line: int) -> Any:
@@ -3516,14 +3960,136 @@ def _on_locals_end_body(code: Any, offset: int, value: Any) -> Any:
         _locals_diff(st, frame)
         st.overhead += perf_counter() - t0
         fields: dict = {"locals": st.events, "locals_capture_time": round(st.overhead, _TIME_DECIMALS)}
+        if st.source is not None:
+            fields["source"] = st.source
         if st.dropped:
             fields["locals_dropped"] = st.dropped
+        if st.params_used:
+            fields["params"] = list(st.params)
         st.state.complete(st.node, fields)
     except Exception:
         pass
     finally:
         _capturing.reset(token)
     return None
+
+
+def _trace_sources() -> dict:
+    """The current trace's TRACE_LOCALS source table (empty if none), each
+    file's lines in file order."""
+    state = _current_trace.get()
+    if state is None:
+        return {}
+    with state.lock:
+        return {
+            sid: {"file": src["file"], "lines": dict(sorted(src["lines"].items(), key=lambda item: int(item[0])))}
+            for sid, src in state.sources.items()
+        }
+
+
+_UNRESOLVED = object()
+
+
+def expand_locals(trace: dict) -> dict:
+    """Rewrite a written trace (the parsed OUTPUT_FILE JSON) so every
+    TRACE_LOCALS entry is a readable dict holding full values:
+    {"line", "set", "deleted", "globals", "deleted_globals"} (empty parts
+    left out). Each "changed" edit list is replayed onto that name's previous
+    value in the same call -- its latest entry, or for an argument its value
+    in "args"/"kwargs" -- and stored under "set". Values are resolved against
+    the trace's "variables" pool (no {"__ref__"} left in them). Changes
+    `trace` in place and returns it.
+
+    The rebuilt values SHARE structure: a pooled value is resolved once for
+    the whole trace, and an edit copies only the containers on its path, so
+    expanding stays close to the trace's own size however many entries
+    repeat a large object. Treat them as read-only (copy one before changing it)."""
+    variables = trace.get("variables", {})
+    resolved_refs: dict = {}
+
+    def resolve(value: Any, depth: int = 0) -> Any:
+        if depth > 100:
+            return value
+        t = type(value)
+        if t is dict:
+            if "__ref__" in value:
+                ref = value["__ref__"]
+                target = resolved_refs.get(ref, _UNRESOLVED)
+                if target is _UNRESOLVED:
+                    if ref not in variables:
+                        return value  # not in this trace's pool: left as the reference it is
+                    resolved_refs[ref] = target = resolve(variables[ref], depth + 1)
+                if len(value) > 1 and type(target) is dict:  # {"__type__": T, "__ref__": r}: r is its fields
+                    return {**{k: resolve(v, depth + 1) for k, v in value.items() if k != "__ref__"}, **target}
+                return target
+            return {k: resolve(v, depth + 1) for k, v in value.items()}
+        if t is list:
+            return [resolve(v, depth + 1) for v in value]
+        return value
+
+    def apply(value: Any, op: list) -> Any:
+        """`value` after one edit op, as a new value sharing everything off the op's path."""
+        kind, path = op[0], op[1]
+        if not path:
+            return value + resolve(op[2]) if kind == "+" else value
+        root = parent = type(value)(value)  # shallow copies down the path only
+        for key in path[:-1]:
+            parent[key] = child = type(parent[key])(parent[key])
+            parent = child
+        last = path[-1]
+        if kind == "+":
+            parent[last] = parent[last] + resolve(op[2])
+        elif kind == "=":
+            parent[last] = resolve(op[2])
+        elif kind == "-":
+            del parent[last]
+        return root
+
+    def walk(node: dict) -> Any:
+        yield node
+        for child in node.get("children", []):
+            yield from walk(child)
+
+    keys = ("line", "set", "changed", "deleted", "globals", "deleted_globals")
+    for node in walk(trace["trace"]):
+        entries = node.get("locals")
+        if not entries:
+            continue
+        params = node.get("params") or []
+        args, kwargs = node.get("args") or [], node.get("kwargs") or {}
+
+        def base(name: str) -> Any:
+            if name in current:
+                return current[name]
+            i = params.index(name) if name in params else len(args)
+            return resolve(args[i] if i < len(args) else kwargs.get(name))
+
+        current: dict = {}
+        expanded = []
+        for raw in entries:
+            entry = dict(zip(keys, raw)) if isinstance(raw, list) else dict(raw)  # dicts: older traces
+            out: dict = {"line": entry["line"]}
+            sets: dict = {}
+            for name, value in (entry.get("set") or {}).items():
+                sets[name] = current[name] = resolve(value)
+            for name, ops in (entry.get("changed") or {}).items():
+                value = base(name)
+                for op in ops:
+                    value = apply(value, op)
+                sets[name] = current[name] = value
+            if sets:
+                out["set"] = sets
+            for name in entry.get("deleted") or ():
+                current.pop(name, None)
+            for key in ("deleted", "globals", "deleted_globals"):
+                if entry.get(key):
+                    out[key] = resolve(entry[key])
+            for extra in entry:  # e.g. "text" a reader filled in
+                if extra not in keys:
+                    out[extra] = entry[extra]
+            expanded.append(out)
+        node["locals"] = expanded
+    return trace
 
 
 def _locals_wanted(name: str) -> bool:
@@ -3693,10 +4259,12 @@ def _merge_children(nodes: list) -> list:
                 "cumulative": 0.0,
                 "count": 0,
                 "start": float("inf"),  # will become min
+                "self": 0.0,
                 "children": [],
                 "_intervals": [],
             }
             order.append(name)
+        merged[name]["self"] += _display_self(node)
         node_wall = node["time"] or 0
         node_cumul = node.get("cumulative") or node_wall
         merged[name]["start"] = min(merged[name]["start"], node.get("start", float("inf")))
@@ -3713,6 +4281,8 @@ def _merge_children(nodes: list) -> list:
         # drop cumulative if it equals wall (no noise)
         if abs(merged[name]["time"] - merged[name]["cumulative"]) < 1e-6:
             del merged[name]["cumulative"]
+        if merged[name]["count"] > 1:
+            merged[name]["name"] = f"{name} ×{merged[name]['count']}"
 
     return [merged[name] for name in order]
 
@@ -3782,7 +4352,7 @@ def _collapse(children: list) -> list:
         group = groups[name]
         if len(group) == 1:
             node = group[0]
-            collapsed.append({**node, "children": _collapse(node["children"])})
+            collapsed.append({**node, "self": _display_self(node), "children": _collapse(node["children"])})
             continue
         merged_children = _merge_children([c for n in group for c in n["children"]])
         wall = _wall_from_intervals(group)
@@ -3795,6 +4365,7 @@ def _collapse(children: list) -> list:
                 "cumulative": cumulative,
                 "count": calls,
                 "start": min(n.get("start", 0) for n in group),
+                "self": sum(_display_self(n) for n in group),
                 "children": merged_children,
             }
         )
@@ -3829,7 +4400,8 @@ def _collapse_repeating_groups(children: list) -> list | None:
                         "time": wall,
                         "cumulative": cumulative,
                         "count": sum(inst.get("count", 1) for inst in instances),
-                        "start": min(inst.get("start", 0) for inst in instances),  # ← add
+                        "start": min(inst.get("start", 0) for inst in instances),
+                        "self": sum(_display_self(inst) for inst in instances),
                         "children": _collapse(merged_children),
                     }
                 )
@@ -3841,7 +4413,8 @@ def _collapse_repeating_groups(children: list) -> list | None:
                     "time": group_wall,
                     "cumulative": group_cumulative,
                     "count": reps,
-                    "start": min(c.get("start", 0) for c in merged_group),  # ← add
+                    "start": min(c.get("start", 0) for c in merged_group),
+                    "self": 0.0,  # a display-only wrapper: all its time is its members'
                     "children": merged_group,
                 }
             ]
@@ -3882,6 +4455,17 @@ def _self_time(node: dict) -> float:
         return max(t, 0.0)
     occupied = [{"start": c.get("start", 0), "time": (c["time"] or 0) + c.get("capture_time", 0.0)} for c in children]
     return max(t - _wall_from_intervals(occupied), 0.0)
+
+
+def _display_self(node: dict) -> float:
+    """Self time of a display node from :func:`_collapse`: precomputed from the
+    raw calls it stands for. Recomputing it from the display node itself would
+    be wrong -- a merged child ("f ×N") is one interval spanning only the
+    union length of its calls, anchored at the first one, so merged siblings
+    seem to overlap and too little child time gets subtracted."""
+    if "self" in node:
+        return node["self"]
+    return _self_time(node)
 
 
 def _aggregate(root: dict) -> dict[str, dict]:
@@ -3998,7 +4582,8 @@ def _write_output(root: dict) -> None:
     value that recurs anywhere in the tree (see :class:`_ValuePool`) is
     stored once in ``variables`` and referenced from the tree as
     ``{"__ref__": ref}``, instead of being duplicated inline at every
-    occurrence.
+    occurrence. With TRACE_LOCALS, a ``"sources"`` map holds the text of
+    every recorded line once (see :data:`TRACE_LOCALS`).
     """
     if not _cfg.OUTPUT_DIR and not _cfg.OUTPUT_FILE:
         return
@@ -4008,6 +4593,9 @@ def _write_output(root: dict) -> None:
     tree = {**root, "children": _filter_by_names(root["children"], set(_cfg.LOG_FUNCTIONS))} if _cfg.LOG_FUNCTIONS else root
     pool = _current_pool.get()
     payload = {"variables": pool.variables if pool is not None else {}, "trace": tree}
+    sources = _trace_sources()
+    if sources:
+        payload["sources"] = sources
 
     if _cfg.OUTPUT_DIR:
         directory = Path(_cfg.OUTPUT_DIR)
@@ -4075,7 +4663,7 @@ def print_tree(root: dict) -> None:
         t = node["time"] or 0
         cumulative = node.get("cumulative")
         children = node["children"]
-        self_t = _self_time(node)
+        self_t = _display_self(node)
 
         children_sum = sum(c["time"] or 0 for c in children)
         parallel_hint = "  [parallel]" if len(children) > 1 and children_sum > t * 1.2 else ""
@@ -4209,6 +4797,9 @@ def _send_trace(root: dict) -> None:
         "variables": pool.variables if pool is not None else {},
         "trace": root,
     }
+    sources = _trace_sources()
+    if sources:
+        payload["sources"] = sources
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     # Resolved NOW, in the trace's context: the send may run on a background
     # thread after the trace (and its per-trace overrides) has ended.

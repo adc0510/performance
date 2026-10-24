@@ -35,6 +35,9 @@ EXPECT = {
         {"status": "works", "new": True, "desc": "a class passed as a value → {__class__: module.QualName}", "node": "__main__.a_class", "result": {"__class__": "__main__.User"}},
         {"status": "works", "desc": "functions/methods passed as values → {__type__: function|method, qualname, module}",
          "node": "__main__.takes_callable", "args": [{"__type__": "function", "qualname": "prim", "module": "__main__"}]},
+        {"status": "works", "new": True, "desc": "a dict of only functions (a registry, ≥ 4 entries) → {__functions__: [keys]}; fewer stay per-function",
+         "node": "__main__.registry", "result": [{"__functions__": ["abs", "len", "prim", "nested"]},
+                                                 {"one": {"__type__": "function", "qualname": "prim", "module": "__main__"}}]},
         {"status": "works", "desc": "cycles are cut with a `<circular list>` marker",
          "node": "__main__.cyclic", "result": [1, "<circular list>"]},
         {"status": "limitation", "desc": "beyond MAX_DEPTH (20) the remainder is a repr string",
@@ -135,6 +138,10 @@ def takes_callable(fn):
     return fn.__name__
 
 
+def registry():
+    return {"abs": abs, "len": len, "prim": prim, "nested": nested}, {"one": prim}
+
+
 def a_class():
     return User
 
@@ -163,7 +170,7 @@ def gen_value():
 @perf.trace
 def main():
     for fn in (prim, nested, tup, aset, intkeys, raw, stdlib_vals, dc, nt, obj, opaque,
-               custom_repr, color, a_class, cyclic, deep, exc_value, gen_value):
+               custom_repr, color, registry, a_class, cyclic, deep, exc_value, gen_value):
         fn()
     takes_callable(prim)
 
