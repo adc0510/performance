@@ -81,6 +81,7 @@ traced function):
 | `perf.TIMEOUT`      | `None` | Auto-terminate a traced call after N seconds. |
 | `perf.CAPTURE_IO`   | `True` | Record each call's arguments and return value. |
 | `perf.MAX_DEPTH`    | `20` | Max recursion depth when serializing captured values. |
+| `perf.MAX_CAPTURES_PER_FUNCTION` | `None` | Capture args/result for only the first N calls of each function per trace (all calls are still timed; later ones get `"capture_skipped": true`). Bounds capture cost in hot loops. |
 | `perf.MIN_PCT`      | `0.0` | Hide tree nodes below this fraction of total time. |
 | `perf.HOT_SPOTS`    | `15` | Number of functions in the flat hot-spots summary (`0` disables). |
 | `perf.SCAN_VENV`    | `False` | Also instrument code under stdlib / site-packages. |
