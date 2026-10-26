@@ -37,6 +37,23 @@ Or, from a local clone for development:
 pip install -e .
 ```
 
+### Optional C extension
+
+On CPython 3.12+ the install also compiles `perf._speedups`
+(`src/perf/_speedups.c`), a C version of the per-call wrapper: a call made
+outside any trace costs ~40 ns instead of ~130 ns, and recording a traced call
+is about twice as cheap. It needs a C compiler and the Python headers
+(`python3-dev` on Debian/Ubuntu). Without them, or on Python 3.10/3.11, PyPy
+or a free-threaded build, the install still succeeds and perf runs pure Python,
+recording exactly the same traces. Check which one you got:
+
+```bash
+python -c "import perf; print(perf._speedups is not None)"
+```
+
+Set `PERF_PURE_PYTHON=1` to ignore an installed extension. After editing
+`_speedups.c` in a clone, rebuild it with `pip install -e .` again.
+
 ## Usage
 
 ```python
