@@ -8,3 +8,5 @@ perf.json
 *.json
 lab/
 cases/out/
+*.so
+*.pyd

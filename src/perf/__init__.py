@@ -28,6 +28,8 @@ import hashlib
 import inspect
 import itertools
 import linecache
+import marshal
+import os
 import json as _json
 import re
 import signal
@@ -46,7 +48,24 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-__version__ = "0.9.0"
+# Optional C speedups (src/perf/_speedups.c, Python 3.12+). PERF_PURE_PYTHON=1
+# forces the pure-Python wrappers; perf behaves the same either way.
+_speedups: Any = None
+if sys.version_info >= (3, 12) and not os.environ.get("PERF_PURE_PYTHON"):
+    try:
+        # Not `from perf import _speedups`: that would find the None above.
+        _speedups = __import__("importlib").import_module(__name__ + "._speedups")
+    except ImportError:
+        pass
+_NodeWrapper: Any = _speedups.NodeWrapper if _speedups is not None else None
+
+
+def _is_function(obj: Any) -> bool:
+    """inspect.isfunction, also true for perf's C node wrapper (which stands
+    in for a wrapped Python function)."""
+    return inspect.isfunction(obj) or (_NodeWrapper is not None and type(obj) is _NodeWrapper)
+
+__version__ = "0.10.0"
 __all__ = [
     "TraceTimeout",
     "API_KEY",
@@ -136,7 +155,7 @@ class _TraceState:
     (``time: null``) in the output — which is exactly what it was.
     """
 
-    __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix")
+    __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix", "captures", "line_sources")
 
     def __init__(self, source_prefix: str = "") -> None:
         # Re-entrant: an asynchronous exception perf can't defer (Ctrl-C)
@@ -153,6 +172,19 @@ class _TraceState:
         self.sources: dict = {}
         self._source_ids: dict = {}
         self._source_prefix = source_prefix
+        # node name -> calls whose IO was captured (MAX_CAPTURES_PER_FUNCTION)
+        self.captures: dict = {}
+        # (filename, line) -> source id ("" when the line has no text), so a
+        # TRACE_LOCALS line in a loop looks its statement up once per trace
+        self.line_sources: dict = {}
+
+    def capture_allowed(self, name: str, limit: int) -> bool:
+        """Whether a call of `name` still gets its IO captured, counting it if so."""
+        n = self.captures.get(name, 0)
+        if n >= limit:
+            return False
+        self.captures[name] = n + 1
+        return True
 
     def close(self) -> None:
         with self.lock:
@@ -261,6 +293,8 @@ def _completion(node: dict) -> dict:
     fields = {"time": round(perf_counter() - node["start"], _TIME_DECIMALS)}
     if "capture_time" in node:
         fields["capture_time"] = node["capture_time"]
+    if "capture_skipped" in node:  # so _record_output skips this call too
+        fields["capture_skipped"] = True
     return fields
 
 
@@ -300,9 +334,25 @@ class _Config:
 _cfg = _Config()
 
 
+# (name, SKIP_FUNCTIONS as a tuple) -> verdict, so fnmatch runs once per name
+# and config rather than on every call. Cleared when it grows past
+# _SKIP_CACHE_MAX (SKIP_FUNCTIONS changed many times, e.g. per-trace overrides).
+_skip_cache: dict = {}
+_SKIP_CACHE_MAX = 4096
+
+
 def _is_skipped(name: str) -> bool:
     """Whether ``name`` matches an entry in SKIP_FUNCTIONS (glob-aware via fnmatch)."""
-    return any(fnmatch(name, pattern) for pattern in _cfg.SKIP_FUNCTIONS)
+    patterns = _cfg.SKIP_FUNCTIONS
+    if not patterns:
+        return False
+    key = (name, tuple(patterns))
+    verdict = _skip_cache.get(key)
+    if verdict is None:
+        if len(_skip_cache) >= _SKIP_CACHE_MAX:
+            _skip_cache.clear()
+        verdict = _skip_cache[key] = any(fnmatch(name, pattern) for pattern in patterns)
+    return verdict
 
 
 def _is_skipped_variable(name: str) -> bool:
@@ -613,6 +663,14 @@ SPILL_DIR: str | None = None
 # yielded. 0 records none.
 MAX_YIELDS_CAPTURE = 10
 
+# CAPTURE_IO for hot functions: record args/result (and generator yields) for
+# only the first N calls of each function (by node name) in a trace. Every
+# call still gets its node and timing, and exceptions are always recorded; a
+# call past the limit carries "capture_skipped": true instead. Capture is most
+# of a traced call's cost, so this bounds it for code called in a loop. None
+# captures every call.
+MAX_CAPTURES_PER_FUNCTION: int | None = None
+
 
 # Exact types _jsonable returns unchanged (when not budget-limited) -- lets the
 # container loops skip a recursive call per leaf.
@@ -908,7 +966,7 @@ def _is_routine(value: Any) -> bool:
     value of a dict that might be a function registry."""
     verdict = _routine_types.get(type(value))
     if verdict is None:
-        verdict = _routine_types[type(value)] = inspect.isroutine(value)
+        verdict = _routine_types[type(value)] = inspect.isroutine(value) or _is_function(value)
     return verdict
 
 
@@ -1075,6 +1133,37 @@ def _redact(text: Any) -> Any:
 # ── per-trace value pool: dedup repeated captures by content ────────────────
 
 
+# _ValuePool serializes content exactly as json.dumps(value, ensure_ascii=False,
+# separators=(",", ":"), default=str) would -- one reusable encoder (json.dumps
+# builds a new one per call for non-default arguments), plus the same leaf
+# encodings json uses, so containers can be assembled from their parts.
+_store_encoder = _json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), default=str)
+_encode_str = _json.encoder.encode_basestring
+_INF = float("inf")
+
+
+def _leaf_json(v: Any) -> "str | None":
+    """JSON text of a str/int/float/bool/None as json.dumps writes it, else None."""
+    t = type(v)
+    if t is str:
+        return _encode_str(v)
+    if t is int:
+        return int.__repr__(v)
+    if v is None:
+        return "null"
+    if t is bool:
+        return "true" if v else "false"
+    if t is float:
+        if v != v:
+            return "NaN"
+        if v == _INF:
+            return "Infinity"
+        if v == -_INF:
+            return "-Infinity"
+        return float.__repr__(v)
+    return None
+
+
 class _ValuePool:
     """Stores each distinct piece of captured *content* once per trace.
 
@@ -1121,39 +1210,79 @@ class _ValuePool:
         # A converted value can share sub-structures (_jsonable reuses the
         # conversion of an object referenced from many places): intern each
         # shared dict/list once per call, or a DAG is walked as a tree.
-        if _memo is None:
-            _memo = {}
+        return self._intern(value, {} if _memo is None else _memo)[0]
+
+    # A container with more plain (leaf) values than this is serialized by the
+    # C encoder in one call; a smaller one is assembled from its children's
+    # serialized forms, which beats a C call per container (lists of small
+    # records). Either way nothing is serialized once per nesting level.
+    COMPOSE_MAX_LEAVES = 6
+
+    def _intern(self, value: Any, memo: dict) -> tuple:
+        """(interned value, its serialized form or None if unknown)."""
         if isinstance(value, (dict, list)):
-            done = _memo.get(id(value))
+            done = memo.get(id(value))
             if done is not None:
                 return done
             original = value
+            leaves = 0
+            composable = True
             if isinstance(value, dict):
-                value = {k: v if self._is_small_leaf(v) else self.intern(v, _memo) for k, v in value.items()}
+                out: Any = {}
+                sers: Any = {}
+                for k, v in value.items():
+                    if self._is_small_leaf(v):
+                        out[k] = v
+                        leaves += 1
+                    else:
+                        out[k], sv = self._intern(v, memo)
+                        sers[k] = sv
+                        composable = composable and sv is not None
+                    composable = composable and type(k) is str
+                serialized = None
+                if composable and leaves <= self.COMPOSE_MAX_LEAVES:
+                    serialized = "{" + ",".join(
+                        _encode_str(k) + ":" + (sers[k] if k in sers else _leaf_json(v)) for k, v in out.items()
+                    ) + "}"
             else:
-                value = [v if self._is_small_leaf(v) else self.intern(v, _memo) for v in value]
-            result = self._store(value)
-            _memo[id(original)] = result
+                out = []
+                sers = []
+                for v in value:
+                    if self._is_small_leaf(v):
+                        out.append(v)
+                        sers.append(None)
+                        leaves += 1
+                    else:
+                        rv, sv = self._intern(v, memo)
+                        out.append(rv)
+                        sers.append(sv)
+                        composable = composable and sv is not None
+                serialized = None
+                if composable and leaves <= self.COMPOSE_MAX_LEAVES:
+                    serialized = "[" + ",".join(_leaf_json(v) if sv is None else sv for v, sv in zip(out, sers)) + "]"
+            result = self._store(out, serialized)
+            memo[id(original)] = result
             return result
         if not isinstance(value, str) or len(value) < self.MIN_SIZE:
-            return value
-        return self._store(value)
+            return value, _leaf_json(value)
+        return self._store(value, _encode_str(value) if type(value) is str else None)
 
-    def _store(self, value: Any) -> Any:
-        serialized = _json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    def _store(self, value: Any, serialized: "str | None" = None) -> tuple:
+        if serialized is None:
+            serialized = _store_encoder.encode(value)
         if len(serialized) < self.MIN_SIZE:
-            return value
+            return value, serialized
         digest = hashlib.blake2b(serialized.encode("utf-8", "surrogatepass"), digest_size=32).digest()
         with self._lock:
             if not self._state.open:
-                return value
+                return value, serialized
             ref = self._ref_by_digest.get(digest)
             if ref is None:
                 ref = f"{self._prefix}v{self._next}"
                 self._next += 1
                 self._ref_by_digest[digest] = ref
                 self.variables[ref] = value
-        return {"__ref__": ref}
+        return {"__ref__": ref}, '{"__ref__":' + _encode_str(ref) + "}"
 
     @classmethod
     def _is_small_leaf(cls, v: Any) -> bool:
@@ -1399,6 +1528,12 @@ def _record_inputs(node: dict, args: tuple, kwargs: dict, param_names: tuple = (
     """
     if not _cfg.CAPTURE_IO:
         return
+    limit = _cfg.MAX_CAPTURES_PER_FUNCTION
+    if limit is not None:
+        state = _current_trace.get()
+        if state is not None and not state.capture_allowed(node["name"], limit):
+            node["capture_skipped"] = True
+            return
     # Perf's own capture: user code it triggers (a __repr__, a property) is
     # not recorded as calls (see _capturing). Set once per call, inline (a
     # context manager here costs more than the whole guard).
@@ -1452,7 +1587,7 @@ def _record_output(node: dict, result: Any) -> None:
         node: The call-tree node to annotate in place.
         result: The value returned by the traced function.
     """
-    if _cfg.CAPTURE_IO:
+    if _cfg.CAPTURE_IO and "capture_skipped" not in node:
         token = _capturing.set(1)
         try:
             start = perf_counter()
@@ -1954,7 +2089,7 @@ class _GenRecorder:
 
     def on_yield(self, value: Any) -> None:
         self.yields += 1
-        if len(self.yielded) < self.limit and _cfg.CAPTURE_IO:
+        if len(self.yielded) < self.limit and _cfg.CAPTURE_IO and "capture_skipped" not in self.node:
             token = _capturing.set(1)
             try:
                 jv = _capture_value(value)
@@ -2146,6 +2281,7 @@ def _register_wrapper_codes() -> None:
         return None
 
     for wrapper in (_sync_wrap(f, "f"), _async_wrap(af, "af")):
+        wrapper = getattr(wrapper, "_perf_slow", wrapper)  # the Python wrapper behind a C one
         _WRAPPER_CODES.add(wrapper.__code__)
 
 
@@ -2242,6 +2378,10 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
 
     @wraps(func)
     def wrapper(*args, **kwargs) -> Any:
+        if _current_node.get() is None:
+            # Not inside any trace (the common case once a trace has patched
+            # the program): behave exactly like the original, as cheaply as possible.
+            return func(*args, **kwargs)
         if _is_skipped(name) or _skip_depth.get():
             token = _skip_depth.set(_skip_depth.get() + 1)
             try:
@@ -2291,7 +2431,30 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
             _current_node.reset(token)
 
     wrapper._perf_wrapped = wrapper._perf_node = True  # type: ignore
-    return wrapper
+    if _speedups is None:
+        return wrapper
+    # Same behaviour, bookkeeping in C (see _speedups.c); `wrapper` stays
+    # behind it for the rare paths (SKIP_FUNCTIONS, a pending TIMEOUT).
+    fast = _speedups.NodeWrapper(func, name, wrapper, extra, suppress, default_factory, param_names, inner_code)
+    functools.update_wrapper(fast, func)
+    fast._perf_wrapped = fast._perf_node = True  # type: ignore
+    return fast
+
+
+# Returned by _sync_failure when the exception must propagate unchanged.
+_RERAISE = object()
+
+
+def _sync_failure(done: dict, exc: BaseException, suppress: bool, default_factory: Any) -> Any:
+    """The ``except`` branch of :func:`_sync_wrap`'s wrapper, for the C
+    wrapper: record `exc` on `done`, then return :data:`_RERAISE` or (under
+    SUPPRESS_ERRORS) the call's default return value."""
+    _record_exception(done, exc)
+    if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
+        return _RERAISE
+    result = _default_return_unrecorded(default_factory)
+    _record_output(done, result)
+    return result
 
 
 def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
@@ -2323,6 +2486,10 @@ def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
 
     @wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
+        if _current_node.get() is None:
+            # Not inside any trace (the common case once a trace has patched
+            # the program): behave exactly like the original, as cheaply as possible.
+            return await func(*args, **kwargs)
         if _is_skipped(name) or _skip_depth.get():
             token = _skip_depth.set(_skip_depth.get() + 1)
             try:
@@ -2430,19 +2597,35 @@ def _try_install_monitoring() -> Any:
     except ValueError:
         return None
 
-    def on_start(code: Any, instruction_offset: Any) -> None:
+    # The tool is process-wide: these fire for every Python call on EVERY
+    # thread while a trace runs. DISABLE (per code object) wherever the answer
+    # can never change -- a code without any `self` binding never has one at
+    # PY_START, and only __init__'s return matters -- and bail out early on
+    # threads that aren't recording.
+    disable = m.DISABLE
+
+    def on_start(code: Any, instruction_offset: Any) -> Any:
+        if "self" not in code.co_varnames and "self" not in code.co_freevars:
+            return disable
+        if _current_node.get() is None:
+            return None
         # PY_START hands (code, offset), not a frame -- unlike sys.setprofile,
         # which hands the frame directly. `self` (when there is one) is
         # already bound in locals by the time the function body starts.
         self = sys._getframe(1).f_locals.get("self")
         if self is not None:
             _patch_instance(self)
+        return None
 
-    def on_return(code: Any, instruction_offset: Any, retval: Any) -> None:
-        if code.co_name == "__init__":
-            self = sys._getframe(1).f_locals.get("self")
-            if self is not None:
-                _patch_instance(self)
+    def on_return(code: Any, instruction_offset: Any, retval: Any) -> Any:
+        if code.co_name != "__init__":
+            return disable
+        if _current_node.get() is None:
+            return None
+        self = sys._getframe(1).f_locals.get("self")
+        if self is not None:
+            _patch_instance(self)
+        return None
 
     try:
         m.register_callback(tool_id, m.events.PY_START, on_start)
@@ -2457,6 +2640,9 @@ def _try_install_monitoring() -> Any:
             m.set_events(tool_id, 0)
             m.register_callback(tool_id, m.events.PY_START, None)
             m.register_callback(tool_id, m.events.PY_RETURN, None)
+            # Undo our DISABLEs: they outlive free_tool_id, and the next
+            # holder of PROFILER_ID (cProfile on 3.12+) would miss those calls.
+            m.restart_events()
         finally:
             m.free_tool_id(tool_id)
 
@@ -2614,6 +2800,7 @@ _CONFIG_KEYS = frozenset(
         "SKIP_VARIABLES",
         "_SCAN_INCLUDE_PREFIXES",
         "MAX_YIELDS_CAPTURE",
+        "MAX_CAPTURES_PER_FUNCTION",
         "REDACT_PATTERNS",
         "TRACE_LOCALS",
         "MAX_LOCALS_EVENTS",
@@ -2785,7 +2972,7 @@ def _unwrap_node(fn: Any) -> Any:
     re-bound to the unwrapped function)."""
     if inspect.ismethod(fn) and getattr(fn.__func__, "_perf_node", False):
         return types.MethodType(fn.__func__.__wrapped__, fn.__self__)
-    if inspect.isfunction(fn) and getattr(fn, "_perf_node", False):
+    if _is_function(fn) and getattr(fn, "_perf_node", False):
         return fn.__wrapped__
     return fn
 
@@ -2847,6 +3034,7 @@ _REMOTE_CONFIG_KEYS = (
     "SUPPRESS_ERRORS",
     "DEFAULT_RETURN",
     "MAX_YIELDS_CAPTURE",
+    "MAX_CAPTURES_PER_FUNCTION",
     "REDACT_PATTERNS",
     "TRACE_LOCALS",
     "MAX_LOCALS_EVENTS",
@@ -2882,7 +3070,7 @@ def _remote_name(fn: Any) -> str:
     ``module.func`` for a free function, ``Class.method`` for a method."""
     func = fn.__func__ if inspect.ismethod(fn) else fn
     qualname = getattr(func, "__qualname__", None) or type(fn).__name__
-    if inspect.isfunction(func) and "." not in qualname:
+    if _is_function(func) and "." not in qualname:
         return f"{_module_label(func.__module__)}.{qualname}"
     return qualname
 
@@ -3265,6 +3453,13 @@ def _event_name(code: Any, frame: Any) -> Any:
 
 
 def _on_event_start(code: Any, offset: int) -> Any:
+    # Fast exits first: these events are process-wide, so they also fire for
+    # every project call on threads that aren't recording anything.
+    name = _event_names.get(code, _SKIP)
+    if name is None:
+        return sys.monitoring.DISABLE
+    if name is not _SKIP and _current_node.get() is None:
+        return None
     _hook_enter()
     try:
         return _on_event_start_body(code, offset)
@@ -3308,6 +3503,10 @@ def _on_event_start_body(code: Any, offset: int) -> Any:
 
 
 def _event_end(code: Any, value: Any, failed: bool) -> Any:
+    if _current_node.get() is None:
+        # Not recording on this thread, so this frame can't have a node open:
+        # _on_event_start made that node current until this very return.
+        return sys.monitoring.DISABLE if _event_names.get(code, _SKIP) is None else None
     _hook_enter()
     try:
         return _event_end_body(code, value, failed)
@@ -3429,11 +3628,12 @@ _IMMUTABLE_TYPES = (int, float, complex, str, bytes, bool, type(None), frozenset
 
 class _LocalsState:
     __slots__ = ("frame", "node", "state", "snapshot", "global_names", "global_snapshot", "last_line", "events",
-                 "dropped", "limit", "overhead", "source", "based", "arg_based", "params", "params_used")
+                 "dropped", "limit", "overhead", "source", "based", "arg_based", "params", "params_used",
+                 "mutating_lines")
 
     def __init__(self, frame: Any, node: dict, state: "_TraceState") -> None:
         self.frame, self.node, self.state = frame, node, state
-        self.snapshot: dict = {}  # name -> (value, comparable form or None)
+        self.snapshot: dict = {}  # name -> (value, comparable form or None, fingerprint or None)
         # Names whose latest entry in this call holds their full content, so a
         # later in-place mutation can be recorded as "changed" ops against it.
         self.based: set = set()
@@ -3452,6 +3652,25 @@ class _LocalsState:
         self.limit = _cfg.MAX_LOCALS_EVENTS
         self.overhead = 0.0
         self.source: "str | None" = None  # id of this function's file in the trace's sources table
+        self.mutating_lines = _mutating_lines(frame.f_code)  # looked up once per call, not per line
+
+
+_FINGERPRINT_TYPES = frozenset({list, dict, set, bytearray})
+
+
+def _locals_fingerprint(value: Any) -> "bytes | None":
+    """A C-speed stand-in for comparing a builtin container's content between
+    lines: marshal's bytes for a list/dict/set/bytearray holding only builtin
+    values (None if it holds anything else, e.g. a project object). Equal
+    bytes mean equal content -- and so an equal comparable form; different
+    bytes (which can also come from a change in sharing between its parts)
+    only mean the comparable form must be looked at, which still decides."""
+    if type(value) not in _FINGERPRINT_TYPES:
+        return None
+    try:
+        return marshal.dumps(value)
+    except Exception:  # ValueError: unmarshallable content; too deeply nested
+        return None
 
 
 def _locals_comparable(value: Any, memo: "dict | None" = None) -> Any:
@@ -3554,16 +3773,25 @@ def _changes(snapshot: dict, current: dict, content: bool = True) -> tuple:
     memo: dict = {"circular": 0}
     for name, value in current.items():
         previous = snapshot.get(name)
+        fingerprint = None
         if previous is not None and previous[0] is value:
             if previous[1] is None or not content:
                 continue  # same immutable object, or nothing could change it: unchanged
+            if previous[2] is not None:
+                fingerprint = _locals_fingerprint(value)
+                if fingerprint == previous[2]:
+                    continue  # identical content, so an identical comparable form: unchanged
             comparable = _locals_comparable(value, memo)
             if comparable == previous[1]:
+                if fingerprint is not None:  # don't miss the fast path on the next line
+                    snapshot[name] = (value, previous[1], fingerprint)
                 continue
             mutated[name] = (previous[1], comparable)
         else:
             comparable = _locals_comparable(value, memo)
-        snapshot[name] = (value, comparable)
+        if comparable is not None and fingerprint is None:
+            fingerprint = _locals_fingerprint(value)
+        snapshot[name] = (value, comparable, fingerprint)
         changed[name] = value
     deleted = [name for name in snapshot if name not in current]
     for name in deleted:
@@ -3607,6 +3835,11 @@ def _capture_locals(st: "_LocalsState", changed: dict, mutated: dict, reusable: 
                 st.based.add(name)  # an argument's base until now was its recorded value
                 st.params_used = st.params_used or arg_based
                 continue
+        t = type(value)
+        if (t is int or t is float or t is bool or value is None) and _cfg.MAX_SIZE_CAPTURE is None:
+            sets[name] = value  # what _jsonable + _intern would give, without the walk
+            st.based.add(name)
+            continue
         jv = (reusable or {}).get(name)
         if jv is not None and jv is not _SKIP and _cfg.MAX_SIZE_CAPTURE is None:
             inline = True  # already converted for comparing (no size limit to apply)
@@ -3738,7 +3971,8 @@ def _same_types(a: Any, b: Any) -> bool:
 
 
 def _locals_diff(st: "_LocalsState", frame: Any) -> None:
-    content = _line_may_mutate(frame.f_code, st.last_line)
+    lines, line = st.mutating_lines, st.last_line
+    content = lines is _ALL_LINES or line is None or line in lines  # _line_may_mutate
     changed, deleted, mutated, reusable = _changes(st.snapshot, _locals_read(frame), content)
     g_changed, g_deleted, _, _ = (_changes(st.global_snapshot, _globals_read(st, frame), content)
                                   if st.global_names else ({}, [], {}, {}))
@@ -3750,10 +3984,16 @@ def _locals_diff(st: "_LocalsState", frame: Any) -> None:
         st.dropped += 1
         return
     filename = frame.f_code.co_filename
-    text = _statement_text(filename, st.last_line) if st.last_line else ""
-    if text:
-        sid = st.state.source_line(filename, st.last_line, _redact(text))
-        if sid is not None:
+    if st.last_line:
+        # Once per line per trace: statement text, its redaction, the lock.
+        key = (filename, st.last_line)
+        sid = st.state.line_sources.get(key)
+        if sid is None:
+            text = _statement_text(filename, st.last_line)
+            sid = st.state.source_line(filename, st.last_line, _redact(text)) if text else ""
+            if sid is not None:
+                st.state.line_sources[key] = sid
+        if sid:
             st.source = sid
     sets, deltas = _capture_locals(st, changed, mutated, reusable) if changed else ({}, {})
     # Positional: [line, set, changed, deleted, globals, deleted_globals],
@@ -3811,9 +4051,11 @@ def _locals_begin(code: Any, frame: Any) -> "_LocalsState | None":
     try:
         memo: dict = {"circular": 0}
         for name, value in _locals_read(frame).items():  # the arguments: baseline, not events
-            st.snapshot[name] = (value, _locals_comparable(value, memo))
+            comparable = _locals_comparable(value, memo)
+            st.snapshot[name] = (value, comparable, None if comparable is None else _locals_fingerprint(value))
         for name, value in _globals_read(st, frame).items():
-            st.global_snapshot[name] = (value, _locals_comparable(value, memo))
+            comparable = _locals_comparable(value, memo)
+            st.global_snapshot[name] = (value, comparable, None if comparable is None else _locals_fingerprint(value))
         _locals_arg_bases(st, frame)
     finally:
         _capturing.reset(token)
@@ -4844,3 +5086,6 @@ def _send_trace(root: dict) -> None:
 
 
 _register_wrapper_codes()
+
+if _speedups is not None:
+    _speedups.init(globals())
