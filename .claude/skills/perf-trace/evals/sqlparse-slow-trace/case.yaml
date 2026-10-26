@@ -1,0 +1,7 @@
+schema_version: "1.1"
+name: sqlparse-slow-trace
+expected_outcome: |
+  report.md recognizes that the 146 s is almost entirely perf's own recording cost (about 93%: ~121 s of
+  TRACE_LOCALS line capture plus ~15 s of argument/result capture across 47k calls), so the trace does not
+  show sqlparse itself being slow; it recommends re-measuring with TRACE_LOCALS off / lighter capture
+  before optimizing, and treats any per-function ranking from this trace as unreliable or secondary.

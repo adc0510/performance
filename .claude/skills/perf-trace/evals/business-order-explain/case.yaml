@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: business-order-explain
+expected_outcome: |
+  explanation.md explains from the trace: line B was skipped by the qty <= 0 guard; Inventory.reserve
+  raised OutOfStock for C (wanted 5, have 3) and D (wanted 1, have 0), both caught inside process_order;
+  C was then reserved at the available qty 3 and D skipped because nothing was available; reserved is
+  [A 2, C 3]; subtotal 20 + 9 = 29; discounts loyalty 2 + coupon 5 + bulk 3 = 10 capped at 29 // 4 = 7;
+  total 29 - 7 = 22; status partial because warnings is non-empty.
+context:
+  scaffold_script: place-files.sh
