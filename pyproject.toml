@@ -1,10 +1,12 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+# setuptools builds the optional C extension (see setup.py); bdist_wheel is
+# built in since setuptools 70.1.
+requires = ["setuptools>=70.1"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "perf"
-version = "0.10.0"
+version = "0.10.1"
 description = "A zero-dependency call-tree profiler / tracer for Python."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +21,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C",
     "Topic :: Software Development :: Debuggers",
     "Topic :: System :: Benchmark",
 ]
@@ -28,8 +33,11 @@ dependencies = []
 Homepage = "https://github.com/adc0510/performance"
 Source = "https://github.com/adc0510/performance"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/perf"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.hatch.build.targets.sdist]
-include = ["src/perf", "README.md", "pyproject.toml"]
+[tool.setuptools.package-data]
+perf = ["py.typed"]
+
+[tool.setuptools.exclude-package-data]
+perf = ["*.c"]  # compiled into perf._speedups; the sdist still ships it
