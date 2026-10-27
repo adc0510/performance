@@ -1,138 +1,121 @@
 ---
 name: perf-trace
-description: Investigate Python code through perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. Use it to find why a request or job is slow, where an exception really came from (including exceptions that were caught and swallowed), what values a function received, returned or held line by line (TRACE_LOCALS), and to verify a fix or optimization by comparing traces. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
+description: Debug, fix and optimize Python code using perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. A trace records every project call with timing, arguments at entry, results, exceptions (including swallowed ones) and, under TRACE_LOCALS, every local variable line by line. Use it to find why a request or job is slow (critical path, N+1 calls, serialized awaits, duplicate work, cache misses, perf's own overhead), where a wrong value or exception really came from, what a function received and held, to generate a regression test from a captured call, to compare runs before/after a fix, and to map which code a request actually runs. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain, test or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
 ---
 
-# Investigating code with perf traces
+# Debugging, fixing and optimizing with perf traces
 
-A perf trace is a recording of one call of a `@perf.trace` function: every project
-function it reached, as a tree, with wall/self time, arguments (as they were on entry),
-return values, exceptions (with the line that raised them), and -- for functions listed in
-`TRACE_LOCALS` -- every local variable change, line by line. It answers "what actually
-happened" questions that reading code alone can't: which branch ran, which value was
-wrong, which call was slow, which exception got swallowed.
+A perf trace is the recording of one call of a `@perf.trace` function. It holds every
+project function that call reached, as a tree. For each call it has wall time and self
+time, the arguments as they were on entry, the return value, and any exception with the
+line that raised it. For functions matched by `TRACE_LOCALS` it also has every
+local-variable change, line by line, with the source text. So it can answer what actually
+happened: which branch ran, which value was wrong, what the request waited on, which
+exception got swallowed.
 
-Trace files are large (hundreds of KB to tens of MB, mostly captured values). Don't read
-them whole -- use the bundled script, which decodes the format and prints compact,
-targeted views:
+Traces are big, so don't read them whole. The bundled script decodes them and answers
+targeted questions:
 
 ```bash
-python3 <skill-dir>/scripts/perf_trace.py <command> ...   # stdlib only, any python3
+python3 <skill-dir>/scripts/perf_trace.py <command> ...   # stdlib only, python3.9+
+python3 <skill-dir>/scripts/perf_trace.py --help          # every command, grouped by task
 ```
 
-| command | use it to |
+## When to use it
+
+- **Slow request or job.** Find what the wall time was spent waiting on, and what can be
+  overlapped, batched, cached or dropped.
+- **Wrong result or a crash.** Find where the bad value or the exception came from,
+  including exceptions that were caught and turned into a degraded answer.
+- **Fixing.** Turn a captured call into a regression test, then prove the fix with a new
+  trace.
+- **Unfamiliar code.** See which files and functions a request actually runs, what types
+  they really get, and what calls what.
+- **Before sharing a trace or capturing a new one.** Check for leaked secrets and pick
+  cheaper or more targeted settings.
+
+## Core workflow
+
+1. **Pick the trace.** Run `ls DIR`. The directory defaults to `perf_traces/` where the
+   service started, or whatever `perf.OUTPUT_DIR` says. Match the user's request by time
+   or by the id shown in the first-string-argument column. If several files share an id,
+   run `group DIR`: it tells you whether they are the same input processed again or
+   different requests that share the id. Never assume either one.
+2. **Baseline.** Run `summary TRACE` and note the total, perf's own recording share, the
+   exceptions and any unfinished calls. If recording is 20% or more of the total, timings
+   are inflated (see `capture.md`).
+3. **Pick the task and load its reference** (table below). Follow its method until every
+   claim points at a node id `#N` and a `file:line`.
+4. **Read the source.** The trace tells you what happened. The code tells you why. Use
+   `where`, `lines`, exception origins and `touched` to get there.
+5. **Fix, then prove it.** Write a test with `to-test`/`snapshot`. Re-run the same input,
+   then compare with `diff`, `sdiff` and `vdiff`. A change isn't done until a test or a
+   new trace shows the difference.
+
+## Reference guide
+
+| Task | Reference | Load when |
+|---|---|---|
+| Debugging | `references/debug.md` | wrong value, wrong branch, exception, "partial"/degraded result, flaky behaviour |
+| Optimizing | `references/optimize.md` | slow request/job, latency regression, "what should we optimize" |
+| Fixing and verifying | `references/fix-and-verify.md` | writing the fix, regression tests, before/after comparison |
+| Understanding code | `references/understand.md` | unfamiliar code path, types, diagrams, secret scan before sharing |
+| Capturing the next trace | `references/capture.md` | the trace lacks what you need, or the overhead is too high |
+| Trace file format | `references/trace-format.md` | output shows an unexpected marker (`<TypeName>`, `capture_skipped`, `__spilled__`, a cut-off repr) |
+
+## Commands
+
+| group | commands |
 |---|---|
-| `ls DIR` | list traces newest first, with root call, duration, error count, first string arg (e.g. a request/correlation id) |
-| `summary TRACE` | first look: total, perf's own overhead, hot spots, slowest leaf calls, exceptions |
-| `tree TRACE [--id N] [--depth D] [--min-pct P] [--no-merge]` | the call tree (same-named siblings merged as `name ×N`); `--id` zooms into a subtree |
-| `hot TRACE [--sort self\|wall\|calls\|cumul]` | per-function totals |
-| `find TRACE PATTERN [--errors]` | calls by name (substring or glob), with ids, args, result |
-| `node TRACE ID [--frames]` | everything about one call: path, timing, named args, result, exception + origin, children |
-| `errors TRACE` | each distinct exception: the call that raised it, file:line, and whether it reached the root or was caught (and where) |
-| `locals TRACE ID` | TRACE_LOCALS of one call, rebuilt into full values, next to each line's source text |
-| `path TRACE ID` | the chain of calls from the root to a node |
-| `where TRACE ID --root SRC` / `where NAME --root SRC` | the `file:line` defining a node's function |
-| `diff BEFORE AFTER` | per-function time change between two traces |
+| browse | `ls` `summary` `tree` `hot` `find` `node` `path` `where` `locals` `diff` |
+| data and state | `value` (every place a value appears) · `flow` (where args came from and the result went) · `diverge`/`vdiff` (two calls or two traces, down to the first difference) · `at` (all locals after the K-th run of a line) · `iters` (one row per loop iteration) · `mutations` (calls that changed objects they were handed) · `lines` (source annotated with hits and values) |
+| exceptions | `errors` (origin, fate, cause chain, translation) · `retries` · `exc-flow` (exceptions used as control flow) · `unfinished` |
+| time | `critical-path` · `timeline` · `serial` (independent work done in sequence) · `nplus1` · `dupes` · `cache` · `scaling` (growth with input size) · `outliers` · `gens` · `payload` |
+| many traces | `stats DIR` (p50/p95, what drives the slow ones) · `sdiff` (calls that appeared or vanished) · `group DIR` |
+| fix | `to-test TRACE ID --root SRC [--mock-leaves]` · `snapshot TRACE --fn NAME --root SRC` |
+| understand | `types` · `touched --root SRC` · `sequence` (Mermaid) · `secrets` · `advise` |
 
-Node ids (`#N`) are stable for a file, so ids printed by one command feed the next.
-Field and marker meanings are in `references/trace-format.md` -- read it when output shows
-something unexpected (`<TypeName>`, `capture_skipped`, `{"__type__": ...}`, a cut-off repr).
+Node ids (`#N`) are stable for a file, so an id printed by one command can be passed to
+the next. Every command prints its own blind spots (values not captured, matching by equal
+value rather than identity, column resolution). Carry those caveats into your conclusions.
 
-## Workflow
+## Work from the evidence, and account for all of it
 
-1. **Pick the trace.** `ls` the directory (default `perf_traces/` relative to where the
-   service started, or whatever `perf.OUTPUT_DIR` / `PERF_OUTPUT_DIR` says). Match the
-   user's request by time or by the id shown in the first-string-argument column. Several
-   files with the same id usually mean the same message was processed twice.
-2. **`summary` first, then form a hypothesis** before drilling down. Note the perf
-   overhead line: if capture is a large share of the total, timings of capture-heavy
-   functions are inflated (see Pitfalls).
-3. **Drill down** with `tree --id`, `find`, `node`, `errors`, `locals` until you can point
-   at specific calls (`#id`), values and timings.
-4. **Map to source.** `where` gives the definition; exception origins give the exact
-   raising line; TRACE_LOCALS nodes name their file. Then read the code -- the trace tells
-   you what happened, the code tells you why.
-5. **Fix, then prove it with a new trace** (see "Verifying a change"). A change to slow or
-   buggy code isn't done until a fresh trace shows the difference.
+The commands report facts. You draw the conclusions, and you must cover the whole picture
+rather than stop at the first familiar thing:
 
-## Reading the numbers
+- **Slow:** the critical path has to explain the request's wall time. Time it doesn't
+  explain is itself a finding: own code between calls, untraced library calls, a lock, the
+  event loop. Don't drop it.
+- **Wrong:** follow the bad value back to the first call where it appears with good
+  inputs, whatever kind of bug that turns out to be.
+- **Name the cause from what the trace and the source show.** Several causes can stack up.
+  Report each with its share of the time, or its place in the chain of events.
 
-- **self** -- time in the function itself, children excluded. **wall** -- elapsed time of
-  the function across its calls, overlaps counted once. **cumul** -- sum of call
-  durations. With concurrency (asyncio tasks, threads, `gather`) summed self and cumul
-  exceed wall and `%tot` can pass 100%: judge what the request waited on by wall.
-- **Large self time on a leaf call usually means waiting**, not computing. Library code
-  (DB drivers, HTTP clients, LLM SDKs) isn't traced by default, so a query, an HTTP request
-  or a model call shows up as self time of the project function that made it -- e.g.
-  `LawRepository.find_law_citations` self 9 s is the SQL behind it. Optimize the query,
-  batching, caching or concurrency at that call, not the Python around it. Its arguments
-  (ids, query text) are in `node` and usually explain the cost.
-- **Large self time on a function with children** is its own Python work (or untraced
-  library calls between its children). Look for loops in its source and for `×N` children.
-- **`name ×N` in the tree** is where repeated work hides: N calls to the same function
-  under one parent. Compare N with the data size in the arguments -- N+1 queries, a call
-  inside a loop that could be batched, a missing cache (look for `cache: miss` on
-  lru_cache functions).
-- **Sequential awaits that could be concurrent**: siblings under an async function whose
-  intervals don't overlap (wall of the group ~= sum of their times) while they don't depend
-  on each other's results.
-- Remote calls (DB, LLM, search) vary a lot between runs; one trace is an anecdote. Before
-  claiming a regression or improvement from timing alone, compare a few traces.
+## MUST DO
 
-## Reading the values
+- Get a baseline (`summary`) before changing anything, and measure again after every change.
+- Cite node ids and `file:line` for every claim, so it can be checked.
+- Change one thing per measurement, otherwise the effect can't be attributed.
+- Compare several traces (`stats`) before calling a remote-call timing a regression or an
+  improvement: DB, HTTP and LLM latency varies run to run.
+- Say what the trace could not show: uncaptured values, timing inflated by capture, code
+  outside the project.
 
-- `args` are captured **before** the call runs and `result` at return: an argument the
-  function mutates shows its state on entry. That makes "what did this function get"
-  exact -- the most direct way to see a wrong value arriving.
-- Values are snapshots with limits: `"<TypeName>"` means dropped (default repr, or larger
-  than `MAX_SIZE_CAPTURE`), a repr string at depth means `MAX_DEPTH` cut it, and
-  `capture_skipped` calls (past `MAX_CAPTURES_PER_FUNCTION`) have timing only. Missing
-  detail is not evidence of an empty value -- say so rather than guessing.
-- Library objects appear as their repr (`<Whitespace ' ' at 0x...>`); project objects as
-  `{"__type__": "Class", ...fields}`. `<redacted>` / skipped fields are secrets masked on
-  purpose -- never try to recover them.
+## MUST NOT DO
 
-## Finding bugs
+- Never treat a missing or cut-off value (`<TypeName>`, `capture_skipped`, a repr at
+  depth) as empty or as evidence.
+- Never claim a speed-up from a single trace, or from a trace dominated by recording
+  overhead.
+- Never conclude "duplicate processing" from a shared id without comparing the inputs
+  (`group`).
+- Never try to recover `<redacted>` or skipped values, and never paste secrets that
+  `secrets` finds.
+- Never present a pattern-shaped guess ("probably N+1") as a finding without the command
+  output that shows it.
 
-- Run `errors` even when the user reports "wrong results", not a crash: services often
-  catch broad exceptions and return a degraded answer. `errors` shows each exception's fate
-  -- "caught in #N X (did not propagate further)" is exactly such a swallowed failure, and
-  `node` on the raising call shows the inputs that triggered it.
-- For wrong values, walk from the symptom backwards: find the call whose `result` is
-  first wrong while its `args` look right -- the bug is inside that function. `path` shows
-  how execution got there; the tree shows which branch-specific calls ran.
-- When the arguments and result of a function aren't enough to see *where* inside it the
-  value goes wrong, ask for (or set up) a re-run with **TRACE_LOCALS scoped to that one
-  function** -- `@perf.trace(TRACE_LOCALS=["pkg.mod.func"])`, or `perf.TRACE_LOCALS = [...]`
-  before the call -- then `locals TRACE ID` shows every variable after every line. Keep the
-  pattern narrow: it costs time on every line of matched functions.
-
-## Verifying a change
-
-1. Keep the "before" trace (copy it aside; `OUTPUT_DIR` files are uuid-named, so new runs
-   don't overwrite it).
-2. Re-run the same input (same message, request or test) with the fix.
-3. `diff BEFORE AFTER` for timing, plus `summary`/`errors`/`node` on the new trace to
-   confirm the result, exception or value actually changed. Report the measured numbers,
-   and mention run-to-run noise if the effect is within it.
-
-If you can't re-run (no access to the environment, external services), say clearly that
-the fix is unverified and give the user the exact steps and what to look for in the new trace.
-
-## Pitfalls
-
-- **perf's own overhead.** `summary` prints how much of the total was capture. If it's
-  large (tens of percent), lower the cost before trusting fine-grained timings:
-  `MAX_CAPTURES_PER_FUNCTION`, `MAX_DEPTH`, `MAX_SIZE_CAPTURE`, or `CAPTURE_IO=False` for a
-  pure timing run. TRACE_LOCALS is the most expensive option.
-- **Debuggers and other tracers** (VS Code/debugpy, coverage, cProfile) slow code down;
-  traces recorded under them show where time goes, not real durations.
-- **Unfinished nodes** (`time` null) were still running when the trace closed: a TIMEOUT,
-  a background thread, a task the root didn't await.
-- Nested functions, lambdas and functions held in registries are traced on Python 3.12+
-  only; on older Pythons they're folded into their caller's self time.
-
-## Reporting findings
+## Reporting
 
 Lead with the answer, then the evidence the user can check:
 
@@ -142,9 +125,8 @@ Lead with the answer, then the evidence the user can check:
 Evidence (trace <file>):
 - #<id> <call> -- <time / value / exception that shows it>
 - ...
+Accounted for: <how much of the wall time or of the failure chain this explains; what remains>
 Cause: <file>:<line> -- <what the code does there>
 Fix: <the change, or the options with their trade-offs>
-Verified: <before -> after numbers from a new trace> | Not verified: <why, and how to check>
+Verified: <test name / before -> after numbers from a new trace> | Not verified: <why, and how to check>
 ```
-
-Cite node ids and `file:line` so every claim can be checked against the trace and the code.
