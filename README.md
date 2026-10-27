@@ -23,19 +23,23 @@ pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 pip install "perf @ git+https://<TOKEN>@github.com/adc0510/performance.git"
 ```
 
-Pin to a release tag or a commit by appending `@<ref>`, e.g. `...performance.git@v0.10.3`.
+These install the latest version (the `main` branch). To upgrade an existing
+install to the latest, add `--upgrade` (pip) or run `uv lock --upgrade-package perf` (uv).
 
 In a `requirements.txt`:
 
 ```
-perf @ git+ssh://git@github.com/adc0510/performance.git@v0.10.3
+perf @ git+ssh://git@github.com/adc0510/performance.git
 ```
 
 With uv:
 
 ```bash
-uv add "perf @ git+ssh://git@github.com/adc0510/performance.git" --tag v0.10.3
+uv add "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
+
+To pin a fixed version instead, append `@<tag>` to the URL, using a tag from
+[Releases](https://github.com/adc0510/performance/releases).
 
 Or, from a local clone for development:
 
