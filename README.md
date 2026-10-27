@@ -47,6 +47,31 @@ Or, from a local clone for development:
 pip install -e .
 ```
 
+### Machine-wide install (nothing added to the app's repo)
+
+To trace a project without adding perf to its `pyproject.toml`, `uv.lock` or
+`requirements.txt`, install perf once into its own folder and put that folder
+on `PYTHONPATH`. Every Python and every virtualenv on the machine can then
+`import perf`. A plain `pip install` / `pip install --user` won't do it: distros
+like Arch and Debian refuse it (PEP 668), and a project's venv doesn't see the
+user or system site-packages anyway.
+
+```bash
+uv pip install --target ~/.local/lib/perf-py --python 3.13 \
+  "perf @ git+ssh://git@github.com/adc0510/performance.git"
+echo 'export PYTHONPATH="$HOME/.local/lib/perf-py${PYTHONPATH:+:$PYTHONPATH}"' >> ~/.bashrc
+```
+
+- Upgrade by running the same `uv pip install` again with `--upgrade --reinstall`.
+- The C extension is built for the `--python` version given. Apps on other
+  versions import the same folder and run pure Python (same traces, a bit slower).
+- `PYTHONPATH` takes priority over a venv's own packages. A project that depends
+  on an unrelated package also named `perf` would see this one instead.
+- `uv sync` in the app does not remove it, because it is not in the venv.
+
+For a single run instead of a permanent install, `uv run --with "perf @ git+ssh://git@github.com/adc0510/performance.git" python ...`
+adds perf on top of the app's environment for that one command.
+
 ### Optional C extension
 
 On CPython 3.12+ the install also compiles `perf._speedups`
@@ -115,6 +140,36 @@ call                     wall/cumul     self    %tot  %parent
 ├─ load_config              120.0 ms  120.0 ms    10%   10%
 └─ run ×3                   980.0 ms   12.0 ms    82%   82%
 ```
+
+### Tracing code you don't want to edit
+
+`perf.trace` also works as a plain function on anything you can import. A small
+driver script, kept outside the app's repo, wraps the entry point at runtime
+and then starts the app as usual:
+
+```python
+# ~/perf-drivers/myservice.py
+import os, runpy, sys
+import perf
+
+perf.OUTPUT_DIR = os.path.expanduser("~/perf_traces/myservice")  # one file per traced call
+
+import app.pipeline as m
+m.Pipeline.handle = perf.trace(m.Pipeline.handle)  # a method, patched on its class
+# m.process = perf.trace(m.process)                # or a module-level function
+
+sys.argv = ["app.main", *sys.argv[1:]]
+runpy.run_module("app.main", run_name="__main__")  # same as `python -m app.main ...`
+```
+
+```bash
+cd ~/Work/myservice && uv run python ~/perf-drivers/myservice.py
+```
+
+Everything the wrapped function calls is traced under it. Patch the function
+where callers look it up: a `from app.pipeline import process` done before the
+patch keeps the original. Patch before the app imports it, or patch the
+importer's name too.
 
 ## Configuration
 

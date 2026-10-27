@@ -4,6 +4,56 @@ A trace is only as good as what was recorded. When it lacks a value, or its timi
 inflated, ask for (or set up) a re-run with settings aimed at the question. `advise TRACE`
 suggests them from an existing trace.
 
+## No traces yet: the app doesn't use perf
+
+An empty `perf_traces/`, or no `@perf.trace` anywhere in the app, doesn't mean you have
+to edit the app or add a dependency. Ask the user which function handles one request,
+message or job (or find it in the code), then set up both of these **outside the repo**:
+
+**1. Make perf importable without touching the app's dependencies.** Check first:
+`cd <app> && uv run python -c "import perf; print(perf.__version__)"` (or the app's own
+python).
+- A machine-wide install the user may already have: perf in `~/.local/lib/perf-py`,
+  on `PYTHONPATH` (see the README, "Machine-wide install").
+- A single run: `uv run --with "perf @ git+ssh://git@github.com/adc0510/performance.git" python ...`
+  adds perf for that command only.
+- Never add perf to the app's `pyproject.toml` / `uv.lock` / `requirements.txt`
+  unless the user asks. A plain `pip install --user` fails on PEP 668 distros, and the
+  app's venv wouldn't see it anyway.
+
+**2. Wrap the entry point from a driver script**, e.g. `~/perf-drivers/<app>.py`:
+
+```python
+import os, runpy, sys
+import perf
+
+perf.OUTPUT_DIR = os.path.expanduser("~/perf_traces/<app>")      # traces stay out of the repo
+# perf.TRACE_LOCALS = ["pkg.mod.func"]                            # only when debugging one function
+
+import app.pipeline as m
+m.Pipeline.handle = perf.trace(m.Pipeline.handle)                # method, patched on its class
+# m.process = perf.trace(m.process)                              # or a module function
+
+sys.argv = ["app.main", *sys.argv[1:]]
+runpy.run_module("app.main", run_name="__main__")                 # start the app exactly as usual
+```
+
+Run it from the app's directory with the app's environment (`uv run python
+~/perf-drivers/<app>.py ...`). Then send one request or message, and `ls ~/perf_traces/<app>`.
+
+- Wrap the function that handles **one unit of work**. Wrapping a server's main loop
+  gives a single trace that never finishes.
+- Patch the name callers look up. Code that ran `from app.pipeline import process`
+  before the patch keeps the original, so no trace starts: patch before that import
+  runs, or patch the importer's name too. Everything the wrapped call reaches is then
+  traced under it.
+- For a one-off function call (no server), call it directly in the driver:
+  `perf.trace(m.process, OUTPUT_FILE="one.json")(payload)`.
+- Don't write the driver into the app's repo, and keep traces out of it: they hold
+  real data (`secrets` before sharing).
+
+## Settings
+
 Settings are module attributes set before the call (`perf.TRACE_LOCALS = [...]`) or
 per-decorator overrides that apply only to that entry point
 (`@perf.trace(TRACE_LOCALS=[...], OUTPUT_DIR="perf_traces")`). Unknown keys raise
