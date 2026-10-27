@@ -23,12 +23,18 @@ pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 pip install "perf @ git+https://<TOKEN>@github.com/adc0510/performance.git"
 ```
 
-Pin to a tag or commit by appending `@<ref>`, e.g. `...performance.git@v0.1.0`.
+Pin to a release tag or a commit by appending `@<ref>`, e.g. `...performance.git@v0.10.3`.
 
 In a `requirements.txt`:
 
 ```
-perf @ git+ssh://git@github.com/adc0510/performance.git@v0.1.0
+perf @ git+ssh://git@github.com/adc0510/performance.git@v0.10.3
+```
+
+With uv:
+
+```bash
+uv add "perf @ git+ssh://git@github.com/adc0510/performance.git" --tag v0.10.3
 ```
 
 Or, from a local clone for development:
@@ -53,6 +59,28 @@ python -c "import perf; print(perf._speedups is not None)"
 
 Set `PERF_PURE_PYTHON=1` to ignore an installed extension. After editing
 `_speedups.c` in a clone, rebuild it with `pip install -e .` again.
+
+### Claude Code skill: perf-trace
+
+The repo ships a [Claude Code](https://claude.com/claude-code) skill,
+`.claude/skills/perf-trace`, for debugging, fixing and optimizing code from
+trace files. It finds the critical path, where a wrong value came from,
+swallowed exceptions and N+1 calls, and it writes regression tests from
+captured calls. It is not part of the pip package. Install it once
+for every project by linking it into your personal skills folder:
+
+```bash
+git clone git@github.com:adc0510/performance.git ~/code/performance
+ln -s ~/code/performance/.claude/skills/perf-trace ~/.claude/skills/perf-trace
+```
+
+Update it with `git -C ~/code/performance pull`. It needs only `python3`
+(3.9+); perf itself does not have to be installed where traces are read. The
+bundled reader also works on its own:
+
+```bash
+python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py --help
+```
 
 ## Usage
 
