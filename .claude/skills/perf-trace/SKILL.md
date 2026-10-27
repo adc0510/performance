@@ -42,8 +42,9 @@ python3 <skill-dir>/scripts/perf_trace.py --help          # every command, group
    run `group DIR`: it tells you whether they are the same input processed again or
    different requests that share the id. Never assume either one.
    **No traces at all**, or the app doesn't use `@perf.trace`? Don't stop and don't edit
-   the app. Follow "No traces yet" in `references/capture.md`: perf from outside the
-   app's dependencies, plus a driver script outside the repo that wraps the entry point.
+   the app. Follow "No traces yet" in `references/capture.md`: perf installed in `.venv`
+   only (`uv pip install`, then `uv sync --inexact`), a `perf_driver.py` that wraps the
+   entry point, and both excluded from git via `.git/info/exclude`.
 2. **Baseline.** Run `summary TRACE` and note the total, perf's own recording share, the
    exceptions and any unfinished calls. If recording is 20% or more of the total, timings
    are inflated (see `capture.md`).

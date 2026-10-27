@@ -9,68 +9,49 @@ flat hot-spots summary.
 ## Install
 
 This is a **private** library hosted in a private GitHub repository, so
-installing it requires a GitHub account with read access to the repo.
+installing it requires a GitHub account with read access to the repo (SSH key,
+or a personal access token: replace `git+ssh://git@github.com/` with
+`git+https://<TOKEN>@github.com/` in the URLs below).
 
-**Over SSH** (uses your configured SSH key):
+### Into a uv project, without changing the project
+
+To trace a project without adding perf to its dependencies, install it into
+the project's `.venv` only:
 
 ```bash
-pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
+cd your-project
+uv pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
-**Over HTTPS with a personal access token** (PAT needs `repo` / read access):
+`pyproject.toml`, `uv.lock` and `git status` stay unchanged (uv's default
+`.gitignore` covers `.venv`), and `uv run` / `uv add` keep perf installed. A plain `uv sync`
+removes it, because it is not in the lockfile: use `uv sync --inexact`, or run
+the `uv pip install` again. Add `--upgrade` to that command to move to the
+latest version.
+
+Keep trace files, and any driver script you put in the project, out of git with
+the clone-local exclude file (never committed):
 
 ```bash
-pip install "perf @ git+https://<TOKEN>@github.com/adc0510/performance.git"
+printf 'perf_traces/\nperf_driver.py\n' >> .git/info/exclude
 ```
 
-These install the latest version (the `main` branch). To upgrade an existing
-install to the latest, add `--upgrade` (pip) or run `uv lock --upgrade-package perf` (uv).
-
-In a `requirements.txt`:
-
-```
-perf @ git+ssh://git@github.com/adc0510/performance.git
-```
-
-With uv:
+### As a regular dependency
 
 ```bash
 uv add "perf @ git+ssh://git@github.com/adc0510/performance.git"
+pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
-To pin a fixed version instead, append `@<tag>` to the URL, using a tag from
+These install the latest version (the `main` branch). To pin a version, append
+`@<tag>` to the URL, using a tag from
 [Releases](https://github.com/adc0510/performance/releases).
 
-Or, from a local clone for development:
+### From a clone, for development
 
 ```bash
 pip install -e .
 ```
-
-### Machine-wide install (nothing added to the app's repo)
-
-To trace a project without adding perf to its `pyproject.toml`, `uv.lock` or
-`requirements.txt`, install perf once into its own folder and put that folder
-on `PYTHONPATH`. Every Python and every virtualenv on the machine can then
-`import perf`. A plain `pip install` / `pip install --user` won't do it: distros
-like Arch and Debian refuse it (PEP 668), and a project's venv doesn't see the
-user or system site-packages anyway.
-
-```bash
-uv pip install --target ~/.local/lib/perf-py --python 3.13 \
-  "perf @ git+ssh://git@github.com/adc0510/performance.git"
-echo 'export PYTHONPATH="$HOME/.local/lib/perf-py${PYTHONPATH:+:$PYTHONPATH}"' >> ~/.bashrc
-```
-
-- Upgrade by running the same `uv pip install` again with `--upgrade --reinstall`.
-- The C extension is built for the `--python` version given. Apps on other
-  versions import the same folder and run pure Python (same traces, a bit slower).
-- `PYTHONPATH` takes priority over a venv's own packages. A project that depends
-  on an unrelated package also named `perf` would see this one instead.
-- `uv sync` in the app does not remove it, because it is not in the venv.
-
-For a single run instead of a permanent install, `uv run --with "perf @ git+ssh://git@github.com/adc0510/performance.git" python ...`
-adds perf on top of the app's environment for that one command.
 
 ### Optional C extension
 
@@ -144,15 +125,16 @@ call                     wall/cumul     self    %tot  %parent
 ### Tracing code you don't want to edit
 
 `perf.trace` also works as a plain function on anything you can import. A small
-driver script, kept outside the app's repo, wraps the entry point at runtime
-and then starts the app as usual:
+driver script wraps the entry point at runtime and then starts the app as usual,
+so the app's code stays untouched. Keep it in the project but excluded from git
+(see Install), or anywhere outside the project:
 
 ```python
-# ~/perf-drivers/myservice.py
-import os, runpy, sys
+# perf_driver.py
+import runpy, sys
 import perf
 
-perf.OUTPUT_DIR = os.path.expanduser("~/perf_traces/myservice")  # one file per traced call
+perf.OUTPUT_DIR = "perf_traces"  # one file per traced call
 
 import app.pipeline as m
 m.Pipeline.handle = perf.trace(m.Pipeline.handle)  # a method, patched on its class
@@ -163,7 +145,7 @@ runpy.run_module("app.main", run_name="__main__")  # same as `python -m app.main
 ```
 
 ```bash
-cd ~/Work/myservice && uv run python ~/perf-drivers/myservice.py
+uv run python perf_driver.py      # with any arguments the app normally takes
 ```
 
 Everything the wrapped function calls is traced under it. Patch the function

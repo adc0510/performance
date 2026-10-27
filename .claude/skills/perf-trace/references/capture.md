@@ -8,26 +8,33 @@ suggests them from an existing trace.
 
 An empty `perf_traces/`, or no `@perf.trace` anywhere in the app, doesn't mean you have
 to edit the app or add a dependency. Ask the user which function handles one request,
-message or job (or find it in the code), then set up both of these **outside the repo**:
+message or job (or find it in the code). Then set up the three steps below without
+changing anything git tracks.
 
-**1. Make perf importable without touching the app's dependencies.** Check first:
-`cd <app> && uv run python -c "import perf; print(perf.__version__)"` (or the app's own
-python).
-- A machine-wide install the user may already have: perf in `~/.local/lib/perf-py`,
-  on `PYTHONPATH` (see the README, "Machine-wide install").
-- A single run: `uv run --with "perf @ git+ssh://git@github.com/adc0510/performance.git" python ...`
-  adds perf for that command only.
-- Never add perf to the app's `pyproject.toml` / `uv.lock` / `requirements.txt`
-  unless the user asks. A plain `pip install --user` fails on PEP 668 distros, and the
-  app's venv wouldn't see it anyway.
+**1. perf in the project's `.venv`, not in its dependencies.** Check:
+`uv run python -c "import perf; print(perf.__version__)"`. If it fails, install it into
+the venv only:
 
-**2. Wrap the entry point from a driver script**, e.g. `~/perf-drivers/<app>.py`:
+```bash
+uv pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
+```
+
+- This leaves `pyproject.toml` and `uv.lock` untouched, and perf survives `uv run` and
+  `uv add`.
+- **A plain `uv sync` removes it**: run `uv sync --inexact` in this project instead. If
+  perf is gone ("No module named perf"), run the `uv pip install` again.
+- Never `uv add perf` or edit `pyproject.toml` / `uv.lock` / `requirements.txt` for it
+  unless the user asks.
+- Not a uv project: `pip install` the same URL into the app's own virtualenv.
+
+**2. A driver script that wraps the entry point.** Name it `perf_driver.py` in the
+project root:
 
 ```python
-import os, runpy, sys
+import runpy, sys
 import perf
 
-perf.OUTPUT_DIR = os.path.expanduser("~/perf_traces/<app>")      # traces stay out of the repo
+perf.OUTPUT_DIR = "perf_traces"                                   # one file per traced call
 # perf.TRACE_LOCALS = ["pkg.mod.func"]                            # only when debugging one function
 
 import app.pipeline as m
@@ -38,8 +45,8 @@ sys.argv = ["app.main", *sys.argv[1:]]
 runpy.run_module("app.main", run_name="__main__")                 # start the app exactly as usual
 ```
 
-Run it from the app's directory with the app's environment (`uv run python
-~/perf-drivers/<app>.py ...`). Then send one request or message, and `ls ~/perf_traces/<app>`.
+Run it with `uv run python perf_driver.py ...`, passing the arguments the app normally
+takes. Then send one request or message, and `ls perf_traces/`.
 
 - Wrap the function that handles **one unit of work**. Wrapping a server's main loop
   gives a single trace that never finishes.
@@ -49,8 +56,17 @@ Run it from the app's directory with the app's environment (`uv run python
   traced under it.
 - For a one-off function call (no server), call it directly in the driver:
   `perf.trace(m.process, OUTPUT_FILE="one.json")(payload)`.
-- Don't write the driver into the app's repo, and keep traces out of it: they hold
-  real data (`secrets` before sharing).
+
+**3. Keep the driver and the traces out of git** with the clone-local exclude file. It
+is never committed, unlike `.gitignore`. Add only the lines that are missing:
+
+```bash
+grep -qx 'perf_traces/' .git/info/exclude || echo 'perf_traces/' >> .git/info/exclude
+grep -qx 'perf_driver.py' .git/info/exclude || echo 'perf_driver.py' >> .git/info/exclude
+```
+
+Check with `git status --short`: neither may appear. Traces hold real data, so run
+`secrets` before sharing one.
 
 ## Settings
 
