@@ -115,12 +115,34 @@ below). It runs on CPython 3.10+; `TRACE_LOCALS` and the C extension need 3.12+.
 |---|---|---|
 | Read access to this GitHub repo | it is private | an SSH key on your GitHub account (or a read-only deploy key on the repo); `ssh -T git@github.com` should greet you. Or use a token URL (above). |
 | `git` | uv and pip clone the repo with it | `sudo apt install -y git` · `sudo dnf install -y git` |
-| A C compiler | builds the C extension | `sudo apt install -y gcc` · `sudo dnf install -y gcc` |
+| A C compiler (`cc`) | builds the C extension, and any dependency without a prebuilt wheel for your Python | `sudo apt install -y build-essential` · `sudo dnf install -y gcc make` · `sudo yum install -y gcc make` · `sudo apk add build-base` (as root, drop `sudo`) |
 | Python 3.12+ headers | builds the C extension | Pythons installed by uv already have them. A system Python needs `python3-dev` (apt) or `python3-devel` (dnf). |
 | [uv](https://docs.astral.sh/uv/) (recommended) | installs into the project's `.venv` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 
 Without a compiler or headers the install still succeeds, but perf runs pure
-Python (the same traces, slower capture).
+Python (the same traces, slower capture). Fresh servers and container images
+often have no compiler at all, so check before installing: `which` should print
+two paths, and the header check (run in the project, once its `.venv` exists)
+should print `True`:
+
+```bash
+which cc gcc
+uv run python -c "import sysconfig, os; print(os.path.exists(os.path.join(sysconfig.get_paths()['include'], 'Python.h')))"
+```
+
+Install the compiler **before** perf. If perf went in first, the build without
+its C extension is cached: reinstall with `--no-cache` (last row of the table
+below).
+
+**Prefer a Python your dependencies ship wheels for.** A brand-new Python (say
+3.14) often has no prebuilt wheels yet for packages with native code, so uv
+compiles them from source. For example, litellm 1.92.0 has wheels only up to
+3.13, and on 3.14 its Rust build fails with `linker 'cc' not found` when there
+is no compiler. Pin the project to a supported version instead:
+
+```bash
+uv python pin 3.13 && rm -rf .venv && uv venv --python 3.13   # then reinstall the project's dependencies
+```
 
 **Then, in the repo** (with no other virtualenv activated: `uv pip install`
 installs into an active one, not the project's `.venv`, so run `deactivate`
