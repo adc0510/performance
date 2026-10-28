@@ -80,7 +80,7 @@ def cmd_touched(a):
     stats = aggregate(tr)
     per_file: dict[str, list] = defaultdict(list)
     unknown = []
-    prefer = trace_files(tr)
+    prefer = trace_files(tr, index)
     for name, s in stats.items():
         hint = next((tr.source_file(n) for n in tr.nodes if n["name"] == name and tr.source_file(n)), None)
         d = index.lookup(name, hint, prefer)
@@ -217,7 +217,9 @@ def _looks_secret(name: str, value: str) -> bool:
     if not isinstance(value, str) or (value.startswith("<") and value.endswith(">")) or " " in value.strip():
         return False
     if STRONG_NAMES.search(name):
-        return len(value) >= 4
+        # a lowercase word or name ("operator", "block_begin", "name:endfor": a lexer's token types)
+        # is a label, not a credential; real ones mix in digits, capitals or symbols
+        return len(value) >= 4 and not re.fullmatch(r"#?[a-z]+([_:.-][a-z]+)*", value)
     if len(value) < 12:
         return False
     classes = sum(bool(re.search(r, value)) for r in (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
@@ -233,18 +235,45 @@ def cmd_secrets(a):
     rx = [(label, re.compile(p)) for label, p in PATTERNS if a.emails or label != "email address"]
     hits = []  # (kind, where, masked, name)
 
+    # perf stores identical content once (the "variables" pool) and TRACE_LOCALS rows repeat full
+    # values line after line, so the same objects and strings come up again and again: each is
+    # scanned once per enclosing key. memo keeps the object alive so its id can't be reused.
+    memo: dict = {}
+
+    def find(v, key, depth=0):
+        """[(label, path, masked, key)] for v, whose nearest enclosing string key is `key`."""
+        if isinstance(v, str):
+            mk = (v, key)
+            if mk not in memo:
+                found = []
+                if v and not (v.startswith("<") and v.endswith(">")):
+                    for label, r in rx:
+                        m = r.search(v)
+                        if m:
+                            found.append((label, (), _mask(m.group(0)), key))
+                            break
+                    else:
+                        if key and SENSITIVE_NAMES.search(key) and _looks_secret(key, v):
+                            found.append((f"value of a field named {key!r}", (), _mask(v), key))
+                memo[mk] = found
+            return memo[mk]
+        if not isinstance(v, (dict, list)) or depth >= 30:
+            return []
+        mk = (id(v), key)
+        hit = memo.get(mk)
+        if hit is not None and hit[0] is v:
+            return hit[1]
+        found = []
+        items = ((k, x, k) for k, x in v.items() if k != "__type__") if isinstance(v, dict) else \
+            ((i, x, key) for i, x in enumerate(v))
+        for step, x, sub_key in items:
+            found += [(label, (step,) + path, masked, k) for label, path, masked, k in find(x, sub_key, depth + 1)]
+        memo[mk] = (v, found)
+        return found
+
     def scan(v, where):
-        for path, sub in walk(v):
-            key = next((p for p in reversed(path) if isinstance(p, str)), None)
-            if isinstance(sub, str) and sub and not (sub.startswith("<") and sub.endswith(">")):
-                for label, r in rx:
-                    m = r.search(sub)
-                    if m:
-                        hits.append((label, f"{where}{fmt_path(path)}", _mask(m.group(0)), key))
-                        break
-                else:
-                    if key and SENSITIVE_NAMES.search(key) and _looks_secret(key, sub):
-                        hits.append((f"value of a field named {key!r}", f"{where}{fmt_path(path)}", _mask(sub), key))
+        for label, path, masked, key in find(v, None):
+            hits.append((label, f"{where}{fmt_path(path)}", masked, key))
 
     for n in tr.nodes:
         tag = f"#{n['_id']} {n['name']}"
@@ -305,21 +334,45 @@ def cmd_advise(a):
     c_tot, l_tot = sum(cap.values()), sum(loc.values())
     skipped = sum(1 for n in tr.nodes if n.get("capture_skipped"))
     dropped = [(n["_id"], n["name"], n["locals_dropped"]) for n in tr.nodes if n.get("locals_dropped")]
-    markers = Counter()
-    depth_cut = 0
+    kinds = ("truncated by MAX_SIZE_CAPTURE", "spilled to SPILL_DIR", "dropped (<TypeName>)", "depth")
+    type_name = re.compile(r"^<\w[\w.]*>$")
+    memo: dict = {}  # pooled values are shared objects, counted once per object (kept alive here)
+
+    def count(v, depth=0) -> tuple:
+        """How many of each kind of cut-off marker v holds (same walk as model.walk)."""
+        if isinstance(v, str):
+            if not v.startswith("<"):
+                return (0, 0, 0, 0)
+            if v.endswith(">") and "truncated" in v:
+                return (1, 0, 0, 0)
+            if type_name.match(v):
+                return (0, 0, 1, 0)
+            return (0, 0, 0, 1) if " object at 0x" in v else (0, 0, 0, 0)
+        if not isinstance(v, (dict, list)):
+            return (0, 0, 0, 0)
+        hit = memo.get((id(v), depth))
+        if hit is not None and hit[0] is v:
+            return hit[1]
+        out = [0, 0, 0, 0]
+        if isinstance(v, dict) and "__spilled__" in v:
+            out[1] += 1
+        if depth < 30:
+            for x in (y for k, y in v.items() if k != "__type__") if isinstance(v, dict) else v:
+                for i, c in enumerate(count(x, depth + 1)):
+                    out[i] += c
+        memo[(id(v), depth)] = (v, tuple(out))
+        return memo[(id(v), depth)][1]
+
+    totals = [0, 0, 0, 0]
     for n in tr.nodes:
         for _, v in named_args(n, tr) + ([("result", tr.resolve(n["result"]))] if "result" in n else []):
-            for _, sub in walk(v):
-                if isinstance(sub, str) and sub.startswith("<") and sub.endswith(">") and "truncated" in sub:
-                    markers["truncated by MAX_SIZE_CAPTURE"] += 1
-                elif isinstance(sub, dict) and "__spilled__" in sub:
-                    markers["spilled to SPILL_DIR"] += 1
-                elif isinstance(sub, str) and re.match(r"^<\w[\w.]*>$", sub):
-                    markers["dropped (<TypeName>)"] += 1
-                elif isinstance(sub, str) and sub.startswith("<") and " object at 0x" in sub:
-                    depth_cut += 1
+            for i, c in enumerate(count(v)):
+                totals[i] += c
+    markers = Counter({k: c for k, c in zip(kinds[:3], totals[:3]) if c})
+    depth_cut = totals[3]
+    total += tr.root.get("capture_time") or 0  # the root's own capture runs outside its time
     pct = (c_tot + l_tot) / total * 100 if total else 0
-    print(f"recording cost {fmt_t(c_tot + l_tot)} = {pct:.0f}% of {fmt_t(total)}"
+    print(f"recording cost {fmt_t(c_tot + l_tot)} = {pct:.0f}% of the elapsed {fmt_t(total)}"
           f" (values {fmt_t(c_tot)}, TRACE_LOCALS {fmt_t(l_tot)})")
     tips = []
     if pct >= 20:

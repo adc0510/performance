@@ -56,17 +56,24 @@ def cmd_summary(a):
     print(f"root    #0 {call_line(root, tr)}")
     print(f"when    {root.get('start_timestamp')} → {root.get('end_timestamp')}")
     print(f"total   {fmt_t(total)} wall · {len(tr.nodes)} calls · {len(stats)} functions · depth {max(n['_depth'] for n in tr.nodes)}")
-    if "exception" in root:
+    if "exception" in root and "result" in root:
+        print(f"RESULT  root raised {short(root['exception'], 110)}, suppressed by perf (SUPPRESS_ERRORS):"
+              f" the caller got {short(tr.resolve(root['result']), 60, True)}")
+    elif "exception" in root:
         print(f"RESULT  root raised {short(root['exception'], 150)}")
     elif "result" in root:
         print(f"result  {short(tr.resolve(root['result']), 150, True)}")
     overhead = cap + loc
-    print(f"perf    capture {fmt_t(cap)} + locals {fmt_t(loc)} = {overhead / total * 100 if total else 0:.0f}% of the total is perf's own"
+    # the root's own capture (its args and result) runs outside its "time", so the
+    # elapsed time the recording cost is a share of is time + that capture
+    root_cap = root.get("capture_time") or 0
+    elapsed = total + root_cap
+    print(f"perf    capture {fmt_t(cap)} + locals {fmt_t(loc)} = {overhead / elapsed * 100 if elapsed else 0:.0f}% of the elapsed {fmt_t(elapsed)} is perf's own"
           f" recording cost{f' · {skipped} calls past MAX_CAPTURES_PER_FUNCTION (timed, not captured)' if skipped else ''}"
           f"{f' · TRACE_LOCALS on {with_locals} calls' if with_locals else ''}")
-    if total and overhead / total >= 0.2:
-        print(f"WARNING recording cost is {overhead / total * 100:.0f}% of the total: timings are inflated, worst in"
-              f" capture-heavy functions. Without it this run is roughly {fmt_t(max(total - overhead, 0))} (exact only"
+    if elapsed and overhead / elapsed >= 0.2:
+        print(f"WARNING recording cost is {overhead / elapsed * 100:.0f}% of the elapsed time: timings are inflated, worst in"
+              f" capture-heavy functions. Without it this run is roughly {fmt_t(max(elapsed - overhead, 0))} (exact only"
               f" for sequential code). Self times below already exclude capture; run `advise` for a cheaper setup.")
     unfinished = [n for n in tr.nodes if n.get("time") is None]
     if unfinished:
@@ -159,6 +166,7 @@ def cmd_find(a):
 
 def cmd_node(a):
     tr = Trace(a.trace)
+    tr.load_spills = True
     n = tr.node(a.id)
     w = a.width
     chain = []

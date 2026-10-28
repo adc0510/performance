@@ -28,6 +28,7 @@ class Defn:
     end: int
     kind: str  # "function" | "class"
     is_async: bool = False
+    binding: str = ""  # "classmethod" | "staticmethod" | "" (decorator on a method)
 
     @property
     def importable(self) -> bool:
@@ -54,6 +55,7 @@ class Index:
         self.defs: list[Defn] = []
         self.by_qual: dict[str, list[Defn]] = {}
         self.files: dict[str, list[Defn]] = {}
+        self._props: set = set()
         for f in py_files(self.root):
             try:
                 tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
@@ -69,8 +71,20 @@ class Index:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 q = prefix + node.name
-                self.defs.append(Defn(mod, q, file, node.lineno, node.end_lineno or node.lineno, "function",
-                                      isinstance(node, ast.AsyncFunctionDef)))
+                deco = {d.id if isinstance(d, ast.Name) else d.attr for d in node.decorator_list
+                        if isinstance(d, (ast.Name, ast.Attribute))}  # functools.cached_property, x.setter
+                binding = next((b for b in ("classmethod", "staticmethod") if b in deco), "")
+                if deco & {"property", "cached_property", "setter", "deleter"}:
+                    binding = "property"
+                elif deco & {"contextmanager", "asynccontextmanager"}:
+                    binding = "contextmanager"
+                q_def = Defn(mod, q, file, node.lineno, node.end_lineno or node.lineno, "function",
+                             isinstance(node, ast.AsyncFunctionDef), binding)
+                if binding == "property" and (file, q) in self._props:
+                    continue  # the setter/deleter of a property already indexed by its getter
+                if binding == "property":
+                    self._props.add((file, q))
+                self.defs.append(q_def)
                 self._visit(node.body, mod, file, q + ".<locals>.")
             elif isinstance(node, ast.ClassDef):
                 q = prefix + node.name
@@ -82,8 +96,8 @@ class Index:
                 for h in getattr(node, "handlers", []) or []:
                     self._visit(h.body, mod, file, prefix)
 
-    def lookup(self, name: str, file_hint: str | None = None, prefer: list[str] | tuple = ()) -> Defn | None:
-        """Definition for a trace node name: 'mod.func', 'Class.method', '__main__.func', 'mod.outer.<locals>.inner'."""
+    def candidates(self, name: str) -> list[Defn]:
+        """Every definition a trace node name could refer to."""
         name = re.sub(r" ×\d+$", "", name)
         if name.endswith((".setter", ".deleter")):
             name = name.rsplit(".", 1)[0]
@@ -96,11 +110,26 @@ class Index:
                     candidates.append(d)
             if candidates:
                 break
+        return candidates
+
+    def lookup(self, name: str, file_hint: str | None = None, prefer: list[str] | tuple = ()) -> Defn | None:
+        """Definition for a trace node name: 'mod.func', 'Class.method', '__main__.func', 'mod.outer.<locals>.inner'."""
+        candidates = self.candidates(name)
         for f in ([file_hint] if file_hint else []) + list(prefer):
             hinted = [d for d in candidates if Path(d.file).resolve() == Path(f).resolve()]
             if hinted:
                 return hinted[0]
         return candidates[0] if len(candidates) >= 1 else None
+
+    def files_by_names(self, names) -> list[str]:
+        """Files ranked by how many of these node names they could define, most first: where a
+        `__main__.func` or a module-less `Class.method` that several files define most likely
+        lives is the file that also defines the trace's other functions."""
+        score: dict[str, int] = {}
+        for nm in set(names):
+            for f in {d.file for d in self.candidates(nm)}:
+                score[f] = score.get(f, 0) + 1
+        return sorted(score, key=lambda f: -score[f])
 
     def lookup_class(self, cls: str, near: Defn | None = None) -> Defn | None:
         found = [d for d in self.by_qual.get(cls, []) if d.kind == "class"]
@@ -111,9 +140,10 @@ class Index:
         return found[0] if found else None
 
 
-def trace_files(tr) -> list[str]:
+def trace_files(tr, index: Index | None = None) -> list[str]:
     """Source files the trace itself names (TRACE_LOCALS sources, exception origins), most mentioned first:
-    the best guess for where a `__main__.func` or `Class.method` without a module lives."""
+    the best guess for where a `__main__.func` or `Class.method` without a module lives. With an index,
+    then the files under it that define the most of the trace's function names."""
     from collections import Counter
     c = Counter()
     for n in tr.nodes:
@@ -123,4 +153,7 @@ def trace_files(tr) -> list[str]:
         o = n.get("exception_origin") or {}
         if o.get("file"):
             c[o["file"]] += 1
-    return [f for f, _ in c.most_common()]
+    named = [f for f, _ in c.most_common()]
+    if index is None:
+        return named
+    return named + [f for f in index.files_by_names(n["name"] for n in tr.nodes) if f not in named]

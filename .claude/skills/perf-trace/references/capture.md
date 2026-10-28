@@ -86,6 +86,15 @@ Keeps the tree and the times and drops all values. To keep some values cheaply, 
 `MAX_CAPTURES_PER_FUNCTION=50`: later calls of each function are timed and marked
 `capture_skipped`.
 
+What capture costs depends on the perf version (`perf.__version__`). Since 0.11.0, data
+unchanged since its last capture is reused rather than converted and hashed again: long
+strings, and dicts/lists/tuples of 16+ plain values still holding the same objects. A
+large unchanged `self.config` then costs about a comparison per call; before 0.11.0 it was
+walked and hashed on every call, so a big `self` alone could make capture 40-100x the
+traced code's own time. What still costs is data that is new each call: containers that
+change, fresh large strings, rich objects. So when `capture_time` is high on a function
+whose `self` is large but unchanged, check the version before blaming the code.
+
 **One function's insides** (debugging a value):
 ```python
 @perf.trace(TRACE_LOCALS=["pkg.mod.func"])        # fnmatch on node names; "Class.method", "Cart.*"
@@ -96,7 +105,10 @@ use a smaller input, when `locals_dropped` shows up.
 
 **A smaller file around what matters:**
 - `LOG_FUNCTIONS=["Repo.find", "pkg.mod.handler"]` writes only those calls plus their
-  ancestors (everything is still recorded, then pruned at write time).
+  ancestors (everything is still recorded, then pruned at write time). The file has no
+  marker for what was pruned: the dropped siblings' time shows up as the **self time of the
+  kept ancestors**, and `serial`, `nplus1`, `critical-path` and `to-test --mock-leaves` only
+  see the kept calls. Don't use it for timing questions.
 - `SKIP_FUNCTIONS=["pkg.noisy.*"]` doesn't instrument those calls or anything under them.
   That cuts overhead too, but their time folds into the caller.
 
@@ -106,7 +118,9 @@ limit) and `SPILL_DIR` (oversize values go to their own files), plus
 
 **Library code too:** `SCAN_VENV=True` instruments stdlib and site-packages. Use it
 sparingly: it's much more expensive and noisy, but it splits "self time of the project
-function" into the library calls behind it.
+function" into the library calls behind it. Scope it to the packages in question with
+`perf._SCAN_INCLUDE_PREFIXES = ("httpx", "sqlalchemy")` (or the same key on the decorator):
+those packages are traced in addition to your own code, and no other library is.
 
 **Keeping secrets out:**
 - `SKIP_VARIABLES=["*password*", "*token*", "api_key"]` drops values by name: kwargs,
@@ -119,7 +133,9 @@ Run `secrets` on a sample trace to find what needs covering.
 ones via SIGALRM (Unix main thread only). Calls cut off show in `unfinished`.
 
 **Where files go:** `OUTPUT_DIR` writes one uuid-named file per call, the default for
-services. `OUTPUT_FILE` names a fixed file, overwritten on every call.
+services. `OUTPUT_FILE` names a fixed file, overwritten on every call. With
+`ENDPOINT_URL`, each trace is POSTed to a collector as the same JSON plus `status`
+(`ok`/`error`) and `tags`: save a body to a `.json` file and every command reads it.
 
 ## What gets traced across threads and processes
 
@@ -140,5 +156,9 @@ services. `OUTPUT_FILE` names a fixed file, overwritten on every call.
   slows down.
 - Heavy capture (see `summary`'s recording share). Self times exclude capture, but parents'
   wall times include their children's.
-- `SUPPRESS_ERRORS=True`: perf swallows exceptions and returns a default value derived
-  from the return annotation, so a failure looks like an empty result.
+- `SUPPRESS_ERRORS=True`: perf swallows exceptions at the innermost traced call and returns
+  a default value derived from its return annotation (or `DEFAULT_RETURN`), so a failure
+  looks like an empty result. Such a node has both `exception` and `result`; `errors` and
+  `summary` report it as "suppressed by perf". Without a captured result (`CAPTURE_IO=False`,
+  `capture_skipped`) it can't be told apart from a caught exception.
+- `LOG_FUNCTIONS`: pruned calls fold into their ancestors' self time (see above).

@@ -46,8 +46,9 @@ python3 <skill-dir>/scripts/perf_trace.py --help          # every command, group
    only (`uv pip install`, then `uv sync --inexact`), a `perf_driver.py` that wraps the
    entry point, and both excluded from git via `.git/info/exclude`.
 2. **Baseline.** Run `summary TRACE` and note the total, perf's own recording share, the
-   exceptions and any unfinished calls. If recording is 20% or more of the total, timings
-   are inflated (see `capture.md`).
+   exceptions and any unfinished calls. If recording is 20% or more of the elapsed time,
+   timings are inflated (see `capture.md`). An exception "suppressed by perf" means
+   `SUPPRESS_ERRORS` turned it into a default return value.
 3. **Pick the task and load its reference** (table below). Follow its method until every
    claim points at a node id `#N` and a `file:line`.
 4. **Read the source.** The trace tells you what happened. The code tells you why. Use
@@ -104,7 +105,8 @@ rather than stop at the first familiar thing:
 - Compare several traces (`stats`) before calling a remote-call timing a regression or an
   improvement: DB, HTTP and LLM latency varies run to run.
 - Say what the trace could not show: uncaptured values, timing inflated by capture, code
-  outside the project.
+  outside the project, calls pruned by `LOG_FUNCTIONS` (their time sits in the kept
+  parents' self time, unmarked).
 
 ## MUST NOT DO
 

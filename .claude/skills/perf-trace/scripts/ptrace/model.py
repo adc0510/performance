@@ -10,6 +10,9 @@ from collections import defaultdict
 # ── loading ───────────────────────────────────────────────────────────────────
 
 
+_MISSING = object()
+
+
 class Trace:
     def __init__(self, path: str):
         self.path = path
@@ -28,6 +31,10 @@ class Trace:
             self.nodes.append(node)
             stack.extend((c, node, depth + 1) for c in reversed(node.get("children", [])))
         self._resolved: dict = {}
+        # resolve() reads SPILL_DIR files into values only when a command asks for it
+        # (node, value): codegen keeps the {"__spilled__"} reference to load at test time
+        self.load_spills = False
+        self._spills: dict = {}
         self.params: dict[str, list] = {}  # function name -> positional parameter names, from any call that recorded them
         for n in self.nodes:
             if n.get("params") and n["name"] not in self.params:
@@ -59,10 +66,29 @@ class Trace:
                 if len(value) > 1 and isinstance(target, dict):  # {"__type__": T, "__ref__": r}
                     return {**{k: self.resolve(v, depth + 1) for k, v in value.items() if k != "__ref__"}, **target}
                 return target
+            if "__spilled__" in value and self.load_spills:
+                loaded = self._spill(value["__spilled__"])
+                return value if loaded is _MISSING else self.resolve(loaded, depth + 1)
             return {k: self.resolve(v, depth + 1) for k, v in value.items()}
         if isinstance(value, list):
             return [self.resolve(v, depth + 1) for v in value]
         return value
+
+    def _spill(self, path: str):
+        """Content of a SPILL_DIR file: at its recorded path, or next to this trace when the
+        files were moved together (<trace dir>/<spill dir name>/<file>)."""
+        if path not in self._spills:
+            from pathlib import Path
+            p = Path(path)
+            self._spills[path] = _MISSING
+            for cand in (p, Path(self.path).parent / p.parent.name / p.name):
+                try:
+                    with open(cand, encoding="utf-8") as f:
+                        self._spills[path] = json.load(f)
+                    break
+                except (OSError, ValueError):
+                    continue
+        return self._spills[path]
 
     def line_text(self, node: dict, line: int) -> str:
         src = self.sources.get(node.get("source") or "", {})
@@ -215,6 +241,20 @@ def canon(value) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
 
+_canon_memo: dict = {}  # id(container) -> (container, canon text)
+
+
+def canon_shared(value) -> str:
+    """canon() remembered per container object: resolved pool values and replayed locals are
+    shared objects that come up again and again. Only for values that are not edited afterwards."""
+    if not isinstance(value, (dict, list)):
+        return canon(value)
+    hit = _canon_memo.get(id(value))
+    if hit is None or hit[0] is not value:
+        hit = _canon_memo[id(value)] = (value, canon(value))
+    return hit[1]
+
+
 def walk(value, path: tuple = (), depth: int = 0, max_depth: int = 30):
     """Yield (path, sub-value) for the value and everything inside it."""
     yield path, value
@@ -259,7 +299,7 @@ def is_trivial(value) -> bool:
 def diff_values(a, b, path: tuple = (), out: list | None = None, limit: int = 200) -> list:
     """[(path, before, after)] where two captured values differ. A missing side is the string '<absent>'."""
     out = [] if out is None else out
-    if len(out) >= limit:
+    if len(out) >= limit or a is b:  # one object (a shared pool value, an unchanged local): no difference
         return out
     if isinstance(a, dict) and isinstance(b, dict):
         for k in list(a) + [k for k in b if k not in a]:

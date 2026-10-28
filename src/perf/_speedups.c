@@ -12,6 +12,9 @@
  *   - rare paths (SKIP_FUNCTIONS set, inside a skipped call, a pending
  *     TIMEOUT) are handed to the pure-Python wrapper (`slow`) unchanged.
  *
+ * leaf_items / same_items back value capture's reuse of an unchanged
+ * container's conversion (see _reused_conversion in __init__.py).
+ *
  * perf/__init__.py calls init(globals()) once, after every name used here
  * is defined. Python 3.12+ only (PyErr_GetRaisedException); older versions
  * use the pure-Python wrapper.
@@ -689,6 +692,110 @@ static PyType_Spec nw_spec = {
     .slots = nw_slots,
 };
 
+/* ── leaf_items / same_items: reusing an unchanged container's conversion ── */
+/* See _reused_conversion in __init__.py. A dict/list/tuple whose entries are
+ * all plain values converts to a pure function of those exact objects, so it
+ * is identified by them: leaf_items takes the snapshot, same_items checks a
+ * container against one by identity (no __eq__, no hashing). */
+
+static int
+leaf_type_ok(PyObject *v, PyObject **types, Py_ssize_t ntypes)
+{
+    PyObject *t = (PyObject *)Py_TYPE(v);
+    for (Py_ssize_t i = 0; i < ntypes; i++) {
+        if (types[i] == t) return 1;
+    }
+    return 0;
+}
+
+static PyObject *
+sp_leaf_items(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 2 || !PyAnySet_Check(args[1])) {
+        PyErr_SetString(PyExc_TypeError, "leaf_items(container, leaf_types: frozenset)");
+        return NULL;
+    }
+    PyObject *value = args[0];
+    PyObject *types[8];
+    Py_ssize_t ntypes = PySet_GET_SIZE(args[1]);
+    if (ntypes > 8) Py_RETURN_NONE;
+    PyObject *it = PyObject_GetIter(args[1]), *item;
+    if (it == NULL) return NULL;
+    for (Py_ssize_t i = 0; i < ntypes && (item = PyIter_Next(it)) != NULL; i++) {
+        types[i] = item;  /* kept alive by the set */
+        Py_DECREF(item);
+    }
+    Py_DECREF(it);
+    if (PyErr_Occurred()) return NULL;
+    if (PyDict_CheckExact(value)) {
+        Py_ssize_t n = PyDict_GET_SIZE(value), pos = 0, i = 0;
+        PyObject *k, *v;
+        while (PyDict_Next(value, &pos, &k, &v)) {
+            if (!PyUnicode_CheckExact(k) || !leaf_type_ok(v, types, ntypes)) Py_RETURN_NONE;
+        }
+        PyObject *keys = PyTuple_New(n), *values = PyTuple_New(n);
+        if (keys == NULL || values == NULL) {
+            Py_XDECREF(keys);
+            Py_XDECREF(values);
+            return NULL;
+        }
+        pos = 0;
+        while (PyDict_Next(value, &pos, &k, &v) && i < n) {
+            PyTuple_SET_ITEM(keys, i, Py_NewRef(k));
+            PyTuple_SET_ITEM(values, i, Py_NewRef(v));
+            i++;
+        }
+        PyObject *out = PyTuple_Pack(2, keys, values);
+        Py_DECREF(keys);
+        Py_DECREF(values);
+        return out;
+    }
+    if (PyList_CheckExact(value) || PyTuple_CheckExact(value)) {
+        Py_ssize_t n = PySequence_Fast_GET_SIZE(value);
+        PyObject **items = PySequence_Fast_ITEMS(value);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            if (!leaf_type_ok(items[i], types, ntypes)) Py_RETURN_NONE;
+        }
+        PyObject *values = PyTuple_New(n);
+        if (values == NULL) return NULL;
+        for (Py_ssize_t i = 0; i < n; i++) PyTuple_SET_ITEM(values, i, Py_NewRef(items[i]));
+        PyObject *out = PyTuple_Pack(2, Py_None, values);
+        Py_DECREF(values);
+        return out;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+sp_same_items(PyObject *module, PyObject *const *args, Py_ssize_t nargs)
+{
+    if (nargs != 3 || !PyTuple_CheckExact(args[2]) || (args[1] != Py_None && !PyTuple_CheckExact(args[1]))) {
+        PyErr_SetString(PyExc_TypeError, "same_items(container, keys: tuple | None, values: tuple)");
+        return NULL;
+    }
+    PyObject *value = args[0], *keys = args[1], *values = args[2];
+    Py_ssize_t n = PyTuple_GET_SIZE(values);
+    if (PyDict_CheckExact(value)) {
+        if (keys == Py_None || PyDict_GET_SIZE(value) != n || PyTuple_GET_SIZE(keys) != n) Py_RETURN_FALSE;
+        Py_ssize_t pos = 0, i = 0;
+        PyObject *k, *v;
+        while (PyDict_Next(value, &pos, &k, &v)) {
+            if (i >= n || PyTuple_GET_ITEM(keys, i) != k || PyTuple_GET_ITEM(values, i) != v) Py_RETURN_FALSE;
+            i++;
+        }
+        return PyBool_FromLong(i == n);
+    }
+    if (keys == Py_None && (PyList_CheckExact(value) || PyTuple_CheckExact(value))) {
+        if (PySequence_Fast_GET_SIZE(value) != n) Py_RETURN_FALSE;
+        PyObject **items = PySequence_Fast_ITEMS(value);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            if (items[i] != PyTuple_GET_ITEM(values, i)) Py_RETURN_FALSE;
+        }
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
 /* ── module ───────────────────────────────────────────────────────────────── */
 
 static PyObject *
@@ -739,6 +846,10 @@ sp_init(PyObject *module, PyObject *globals)
 
 static PyMethodDef sp_methods[] = {
     {"init", sp_init, METH_O, "Bind to perf's module globals (called once by perf)."},
+    {"leaf_items", (PyCFunction)(void (*)(void))sp_leaf_items, METH_FASTCALL,
+     "(keys or None, values) of a dict/list/tuple of only leaf_types values (str keys), else None."},
+    {"same_items", (PyCFunction)(void (*)(void))sp_same_items, METH_FASTCALL,
+     "Whether a container holds exactly these key/value objects, in order (identity)."},
     {NULL}
 };
 

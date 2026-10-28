@@ -33,23 +33,37 @@ def _build(cls, fields):
         return obj
 
 
-def _plain(value):
+def _plain(value, _seen=()):
     """A value in the shape perf captures it, so it can be compared with the recorded result."""
-    import dataclasses, enum, inspect
+    import dataclasses, enum, inspect, re, sys, sysconfig, types
+    if id(value) in _seen:  # perf cuts cycles at the repeated container
+        return f"<circular {type(value).__name__}>"
+    seen = _seen + (id(value),)
     if isinstance(value, enum.Enum):
-        return {"__enum__": f"{type(value).__qualname__}.{value.name}", "value": _plain(value.value)}
+        return {"__enum__": f"{type(value).__qualname__}.{value.name}", "value": _plain(value.value, seen)}
+    if isinstance(value, types.ModuleType):
+        return {"__module__": value.__name__}
+    if isinstance(value, type):
+        return {"__class__": f"{value.__module__}.{value.__qualname__}"}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_plain(v) for v in value]
+        return [_plain(v, seen) for v in value]
     if isinstance(value, dict):
-        return {str(k): _plain(v) for k, v in value.items()}
+        return {str(k): _plain(v, seen) for k, v in value.items()}
     if inspect.isroutine(value):
         return {"__type__": "function", "qualname": value.__qualname__, "module": value.__module__}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {"__type__": type(value).__name__, **{f.name: _plain(getattr(value, f.name)) for f in dataclasses.fields(value)}}
+        return {"__type__": type(value).__name__, **{f.name: _plain(getattr(value, f.name), seen) for f in dataclasses.fields(value)}}
     if hasattr(value, "model_dump"):
-        return {"__type__": type(value).__name__, **_plain(value.model_dump())}
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return {"__type__": type(value).__name__, **{k: _plain(v) for k, v in vars(value).items()}}
+        return {"__type__": type(value).__name__, **_plain(value.model_dump(), seen)}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    module_file = getattr(sys.modules.get(type(value).__module__), "__file__", None) or ""
+    lib_dirs = {sysconfig.get_paths()[k] for k in ("stdlib", "platstdlib", "purelib", "platlib")}
+    if not module_file or module_file.startswith(tuple(lib_dirs)):  # library object: perf keeps its repr
+        r = repr(value)
+        return ANY if re.match(r"^<[\\w.<>]+ object at 0x[0-9a-fA-F]+>$", r) else r
+    if hasattr(value, "__dict__"):
+        return {"__type__": type(value).__name__, **{k: _plain(v, seen) for k, v in vars(value).items()}}
     return value
 '''
 
@@ -90,6 +104,11 @@ class Emitter:
                 self.imports.add("import json")
                 return f"json.load(open({v['__spilled__']!r}))"
             if expected:  # compare against the captured shape directly
+                main = self.near.module if self.near else None  # a script's __main__ is a module under test
+                if main and v.get("__type__") in ("function", "method") and v.get("module") == "__main__":
+                    v = {**v, "module": main}
+                if main and isinstance(v.get("__class__"), str) and v["__class__"].startswith("__main__."):
+                    v = {**v, "__class__": main + v["__class__"][len("__main__"):]}
                 return "{" + ", ".join(f"{k!r}: {self.value(x, True)}" for k, x in v.items()) + "}"
             if v.get("__type__") in ("function", "method") and "qualname" in v:
                 if "<locals>" in str(v["qualname"]) or v["__type__"] == "method":
@@ -144,12 +163,27 @@ def _ident(text: str) -> str:
 
 def _defn_for(tr: Trace, n: dict, index: Index) -> Defn:
     hint = tr.source_file(n) or (n.get("exception_origin") or {}).get("file")
-    d = index.lookup(n["name"], hint, trace_files(tr))
+    d = index.lookup(n["name"], hint, trace_files(tr, index))
     if d is None:
         sys.exit(f"could not find {n['name']!r} under {index.root}: pass --root (the directory you import from)")
+    others = sorted({c.file for c in index.candidates(n["name"])} - {d.file})
+    if others and not (hint or trace_files(tr)):
+        print(f"note: {n['name']} is defined in several files; picked {d.file} (it defines the most of this"
+              f" trace's functions). Also in: {', '.join(others[:5])}", file=sys.stderr)
     if not d.importable:
         sys.exit(f"{n['name']} is a nested function: it cannot be imported. Test its enclosing function instead.")
     return d
+
+
+def _cut_off(n: dict, root: dict | None = None) -> str | None:
+    """Why a call can't be replayed as a test: it never ended on its own."""
+    exc = n.get("exception") or ""
+    if exc.startswith("TraceTimeout(") or (exc.startswith("CancelledError(") and root is not None
+                                            and (root.get("exception") or "").startswith("TraceTimeout(")):
+        return "perf's TIMEOUT interrupted it"
+    if n.get("time") is None:
+        return "it was still running when the trace closed"
+    return None
 
 
 def _call_src(tr: Trace, n: dict, d: Defn, em: Emitter, indent: str) -> tuple[list[str], str]:
@@ -161,6 +195,8 @@ def _call_src(tr: Trace, n: dict, d: Defn, em: Emitter, indent: str) -> tuple[li
     owner = d.qualname.rsplit(".", 1)[0] if is_method else None
     target = d.top
     em.imports.add(f"from {d.module} import {target}")
+    if is_method and d.binding == "classmethod" and args:
+        args = args[1:]  # the class itself: Class.method(...) binds it
     for name, v in args:
         var = re.sub(r"\W", "_", name)
         lines.append(f"{indent}{var} = {em.value(v)}")
@@ -171,14 +207,70 @@ def _call_src(tr: Trace, n: dict, d: Defn, em: Emitter, indent: str) -> tuple[li
         pos = pos[1:]
     elif is_method:
         callee = d.qualname  # static/class method or self not captured
+    if d.binding == "property" and is_method:
+        obj = pos[0][1] if pos else "None  # TODO: the instance"
+        attr = d.qualname.rsplit(".", 1)[1]
+        if n["name"].endswith(".setter") and len(pos) > 1:
+            return lines, f"setattr({obj}, {attr!r}, {pos[1][1]})"
+        return lines, f"{obj}.{attr}"
     expr = f"{callee}(" + ", ".join([v for _, v in pos] + [f"{k}={v}" for k, v in kw]) + ")"
+    if "yields" in n:  # a generator: _assert_src drives it
+        return lines, expr
     if d.is_async:
         em.imports.add("import asyncio")
         expr = f"asyncio.run({expr})"
     return lines, expr
 
 
+def _gen_assert_src(tr: Trace, n: dict, em: Emitter, expr: str, indent: str) -> list[str]:
+    """A generator node: what it yielded (first MAX_YIELDS_CAPTURE values) and how it ended."""
+    yielded = [tr.resolve(y) for y in n.get("yielded") or []]
+    total = n.get("yields") or 0
+    origin = (n.get("exception_origin") or {}).get("function")
+    if em.near and em.near.is_async:
+        em.todos.append(f"{n['name']} is an async generator: drive it with `[x async for x in ...]` in an async test")
+        return [f"{indent}gen = {expr}  # TODO async generator, see below"]
+    if em.near and em.near.binding == "contextmanager":
+        em.imports.update({"import pytest", "import re"} if "exception" in n else set())
+        body = [f"{indent}with {expr} as value:",
+                f"{indent}    assert _plain(value) == {em.value(yielded[0] if yielded else None, expected=True)}"]
+        if "exception" in n and origin != n["name"].rsplit(".", 1)[-1]:
+            em.todos.append(f"{n['exception']} was raised by the `with` body ({origin}) and thrown into the"
+                            " context manager: add that body to reproduce it")
+            return body
+        if "exception" in n:
+            cls, msg = em.exception(n["exception"])
+            inner = body if yielded else [f"{indent}with {expr}:", f"{indent}    pass"]
+            return [f"{indent}with pytest.raises({cls}, match=re.escape({msg!r})):"] + ["    " + x for x in inner]
+        return body
+    if "exception" in n and origin and origin != n["name"].rsplit(".", 1)[-1]:
+        em.todos.append(f"{n['exception']} was raised in {origin} (the consumer) and thrown into the generator:"
+                        " replay that consumer instead")
+        return [f"{indent}gen = {expr}  # TODO exception came from the consumer, see below"]
+    em.imports.add("import itertools")
+    out = [f"{indent}gen = {expr}"]
+    if "exception" in n:
+        cls, msg = em.exception(n["exception"])
+        em.imports.update({"import pytest", "import re"})
+        out += [f"{indent}got = []",
+                f"{indent}with pytest.raises({cls}, match=re.escape({msg!r})):",
+                f"{indent}    for x in gen:",
+                f"{indent}        got.append(x)",
+                f"{indent}assert _plain(got[:{len(yielded)}]) == {em.value(yielded, expected=True)}"]
+        return out
+    out.append(f"{indent}got = list(itertools.islice(gen, {total}))  # it yielded {total} value(s)"
+               + (" before the consumer closed it" if n.get("closed") else ""))
+    out.append(f"{indent}assert _plain(got[:{len(yielded)}]) == {em.value(yielded, expected=True)}")
+    if len(yielded) < total:
+        out.append(f"{indent}assert len(got) == {total}  # only the first {len(yielded)} were captured (MAX_YIELDS_CAPTURE)")
+    if not n.get("closed"):
+        out.append(f"{indent}assert next(gen, StopIteration) is StopIteration  # and then it was exhausted")
+    return out
+
+
 def _assert_src(tr: Trace, n: dict, em: Emitter, expr: str, indent: str) -> list[str]:
+    if "yields" in n:
+        return _gen_assert_src(tr, n, em, expr, indent)
     if "exception" in n:
         cls, msg = em.exception(n["exception"])
         em.imports.add("import pytest")
@@ -197,7 +289,7 @@ def _mock_src(tr: Trace, n: dict, index: Index, em: Emitter, indent: str) -> lis
         if not c.get("children"):
             groups.setdefault(c["name"], []).append(c)
     for name, calls in groups.items():
-        d = index.lookup(name, None, [em.near.file] + trace_files(tr) if em.near else trace_files(tr))
+        d = index.lookup(name, None, [em.near.file] + trace_files(tr, index) if em.near else trace_files(tr, index))
         if d is None or not d.importable:
             out.append(f"{indent}# not mocked: {name} (definition not found or nested)")
             continue
@@ -249,8 +341,23 @@ def cmd_to_test(a):
     tr = Trace(a.trace)
     index = Index(a.root)
     n = tr.node(a.id)
+    why = _cut_off(n, tr.root)
+    if why:
+        sys.exit(f"#{n['_id']} {n['name']} did not finish on its own ({why}): a test replaying it would hang or"
+                 " only reproduce the cut-off. Test a call that finished, or reproduce this one under a timeout"
+                 " (pytest-timeout) once the hang is understood.")
     d = _defn_for(tr, n, index)
     em = Emitter(index, d)
+    stack, swallowed = list(n.get("children", [])), []
+    while stack:
+        x = stack.pop()
+        if "exception" in x and "result" in x:
+            swallowed.append(x)
+        stack.extend(x.get("children", []))
+    for x in swallowed[:3]:
+        em.todos.append(f"#{x['_id']} {x['name']} raised {short(x['exception'], 60)} and perf's SUPPRESS_ERRORS returned a"
+                        " default instead: without perf this call raises there, so the captured result is not what"
+                        " the code returns")
     body = []
     fixture = "monkeypatch" if a.mock_leaves else ""
     body.append(f"def test_{_ident(d.qualname)}_trace_node_{n['_id']}({fixture}):")
@@ -269,7 +376,7 @@ def cmd_snapshot(a):
     tr = Trace(a.trace)
     index = Index(a.root)
     calls = [n for n in tr.nodes if n["name"] == a.fn or (a.fn not in [x["name"] for x in tr.nodes] and a.fn in n["name"])]
-    calls = [n for n in calls if tr.captured(n) and ("result" in n or "exception" in n)]
+    calls = [n for n in calls if tr.captured(n) and ("result" in n or "exception" in n) and not _cut_off(n, tr.root)]
     if not calls:
         sys.exit(f"no captured calls of {a.fn!r} (need args and a result or exception)")
     d = _defn_for(tr, calls[0], index)

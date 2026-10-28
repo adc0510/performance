@@ -23,6 +23,24 @@ python3 <skill-dir>/scripts/perf_trace.py to-test TRACE ID --root SRC --mock-lea
 - The file ends with a TODO list for anything it couldn't rebuild: repr-only library
   objects, nested functions, bound methods. Supply those by hand.
 - Tuples and sets were captured as lists. If the code depends on the exact type, adjust it.
+- Call shapes it handles: methods (`self` rebuilt), classmethods (called on the class),
+  properties and setters (attribute access), generators (the yielded values, then
+  exhaustion, or the exception), `@contextmanager` functions (a `with` block checking the
+  yielded value), async functions (`asyncio.run`). Async generators get a TODO.
+- `__main__.func` names say nothing about the file. When several files under `--root`
+  define it, the one defining the most of the trace's other functions is chosen and a
+  `note:` on stderr names the alternatives. Check the import line.
+- It refuses calls that never finished on their own (cut off by `TIMEOUT`, or still
+  running when the trace closed): replaying them would hang.
+
+What a generated test can't reproduce (it fails, or needs editing, for these):
+- Values perf dropped by name (`SKIP_VARIABLES`) leave no marker, so the expected value
+  lacks those keys while the real result has them.
+- A repr string where `MAX_DEPTH` cut a nested value is compared as that string.
+- A generator driven by `send()`/`throw()`, or an exception thrown into a context manager
+  by its `with` body (TODO): only plain iteration is replayed.
+- Code that depends on state outside the arguments (globals, files, time, a pool or
+  client passed as a repr-only object, which becomes a TODO).
 
 Workflow: generate the test → run it on the current code. It reproduces the captured
 behaviour, so it passes as long as that behaviour still holds. Edit the expected value
