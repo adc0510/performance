@@ -1,40 +1,104 @@
 # perf
 
-A zero-dependency call-tree profiler / tracer for Python. Decorate an entry
-point with `@perf.trace` and every project function and method reached during
-that call is automatically instrumented, producing a wall / self / cumulative
-call tree — with async support, concurrency-aware "wall vs. self" timing, and a
-flat hot-spots summary.
+A zero-dependency call-tree tracer for Python. Point it at one entry point and
+every project function and method reached from it is instrumented
+automatically: wall / self / cumulative time per call, the arguments each call
+received, what it returned, the exceptions it raised (swallowed ones included)
+and, if you ask, every local variable change line by line. Async, threads and
+process pools are followed.
 
-## Install
+## Set up tracing in your repo
 
-This is a **private** library hosted in a private GitHub repository, so
-installing it requires a GitHub account with read access to the repo (SSH key,
-or a personal access token: replace `git+ssh://git@github.com/` with
-`git+https://<TOKEN>@github.com/` in the URLs below).
+Five steps from nothing to a trace file you can read. Nothing in your project's
+`pyproject.toml`, lockfile or git history has to change.
 
-### Into a uv project, without changing the project
-
-To trace a project without adding perf to its dependencies, install it into
-the project's `.venv` only:
+**1. Install perf into the project's virtualenv** (it is a private repository,
+so you need read access; see [Install](#install) for tokens, pinning and other
+ways):
 
 ```bash
 cd your-project
 uv pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
+# without uv: .venv/bin/pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
-`pyproject.toml`, `uv.lock` and `git status` stay unchanged (uv's default
-`.gitignore` covers `.venv`), and `uv run` / `uv add` keep perf installed. A plain `uv sync`
-removes it, because it is not in the lockfile: use `uv sync --inexact`, or run
-the `uv pip install` again. Add `--upgrade` to that command to move to the
-latest version.
-
-Keep trace files, and any driver script you put in the project, out of git with
-the clone-local exclude file (never committed):
+**2. Keep traces and the driver script out of git** (a clone-local exclude,
+never committed):
 
 ```bash
 printf 'perf_traces/\nperf_driver.py\n' >> .git/info/exclude
 ```
+
+**3. Wrap the entry point.** Either decorate it:
+
+```python
+import perf
+
+perf.OUTPUT_DIR = "perf_traces"     # one JSON file per traced call
+
+@perf.trace
+def handle_request(payload): ...
+```
+
+or, to leave the app's code untouched, wrap it from a driver script:
+
+```python
+# perf_driver.py
+import runpy, sys
+import perf
+
+perf.OUTPUT_DIR = "perf_traces"
+# perf.TRACE_LOCALS = ["Pipeline.handle"]          # optional: local variables, line by line
+
+import app.pipeline as m
+m.Pipeline.handle = perf.trace(m.Pipeline.handle)  # a method, patched on its class
+# m.process = perf.trace(m.process)                # or a module-level function
+
+sys.argv = ["app.main", *sys.argv[1:]]
+runpy.run_module("app.main", run_name="__main__")  # same as `python -m app.main ...`
+```
+
+Patch the function where callers look it up: a `from app.pipeline import process`
+done before the patch keeps the original, so patch before the app imports it, or
+patch the importer's name too.
+
+**4. Run the app as usual:**
+
+```bash
+uv run python perf_driver.py        # with any arguments the app normally takes
+```
+
+Each traced call prints a call tree and hot-spots table and writes
+`perf_traces/<uuid>.json`.
+
+**5. Read the trace.** Open the JSON (see [What a trace contains](#what-a-trace-contains)),
+or use the bundled reader, which works with or without Claude Code:
+
+```bash
+python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py summary perf_traces/<uuid>.json
+```
+
+With the [perf-trace skill](#claude-code-skill-perf-trace) installed, ask Claude
+Code things like "why is `handle_request` slow in this trace" or "where did this
+wrong value come from".
+
+## Install
+
+perf is hosted in a **private** GitHub repository: you need a GitHub account with
+read access (an SSH key, or a personal access token: replace
+`git+ssh://git@github.com/` with `git+https://<TOKEN>@github.com/` in the URLs
+below). It runs on CPython 3.10+; `TRACE_LOCALS` and the C extension need 3.12+.
+
+### Into a project's `.venv` only
+
+```bash
+uv pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
+```
+
+`pyproject.toml`, `uv.lock` and `git status` stay unchanged (uv's default
+`.gitignore` covers `.venv`), and `uv run` / `uv add` keep perf installed. A plain
+`uv sync` removes it because it is not in the lockfile: use `uv sync --inexact`,
+or run the `uv pip install` again. Add `--upgrade` to move to the latest version.
 
 ### As a regular dependency
 
@@ -43,8 +107,8 @@ uv add "perf @ git+ssh://git@github.com/adc0510/performance.git"
 pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
-These install the latest version (the `main` branch). To pin a version, append
-`@<tag>` to the URL, using a tag from
+These install the latest version (the `main` branch). To pin one, append
+`@<tag>` to the URL (e.g. `...performance.git@v0.11.0`), using a tag from
 [Releases](https://github.com/adc0510/performance/releases).
 
 ### From a clone, for development
@@ -55,13 +119,14 @@ pip install -e .
 
 ### Optional C extension
 
-On CPython 3.12+ the install also compiles `perf._speedups`
-(`src/perf/_speedups.c`), a C version of the per-call wrapper: a call made
-outside any trace costs ~40 ns instead of ~130 ns, and recording a traced call
-is about twice as cheap. It needs a C compiler and the Python headers
-(`python3-dev` on Debian/Ubuntu). Without them, or on Python 3.10/3.11, PyPy
-or a free-threaded build, the install still succeeds and perf runs pure Python,
-recording exactly the same traces. Check which one you got:
+On CPython 3.12+ (with the GIL) the install also compiles `perf._speedups`
+(`src/perf/_speedups.c`): the per-call wrapper and the checks that let value
+capture reuse unchanged data are done in C. A call made outside any trace costs
+~40 ns instead of ~130 ns, and recording a traced call is about twice as cheap.
+It needs a C compiler and the Python headers (`python3-dev` on Debian/Ubuntu).
+Without them, or on Python 3.10/3.11, PyPy or a free-threaded build, the install
+still succeeds and perf runs pure Python, recording exactly the same traces.
+Check which one you got:
 
 ```bash
 python -c "import perf; print(perf._speedups is not None)"
@@ -76,17 +141,17 @@ The repo ships a [Claude Code](https://claude.com/claude-code) skill,
 `.claude/skills/perf-trace`, for debugging, fixing and optimizing code from
 trace files. It finds the critical path, where a wrong value came from,
 swallowed exceptions and N+1 calls, and it writes regression tests from
-captured calls. It is not part of the pip package. Install it once
-for every project by linking it into your personal skills folder:
+captured calls. It is not part of the pip package. Install it once for every
+project by linking it into your personal skills folder:
 
 ```bash
 git clone git@github.com:adc0510/performance.git ~/code/performance
 ln -s ~/code/performance/.claude/skills/perf-trace ~/.claude/skills/perf-trace
 ```
 
-Update it with `git -C ~/code/performance pull`. It needs only `python3`
-(3.9+); perf itself does not have to be installed where traces are read. The
-bundled reader also works on its own:
+Update it with `git -C ~/code/performance pull`. It needs only `python3` (3.9+);
+perf itself does not have to be installed where traces are read. The bundled
+reader also works on its own (`--help` lists its 42 commands):
 
 ```bash
 python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py --help
@@ -122,75 +187,16 @@ call                     wall/cumul     self    %tot  %parent
 └─ run ×3                   980.0 ms   12.0 ms    82%   82%
 ```
 
-### Tracing code you don't want to edit
-
-`perf.trace` also works as a plain function on anything you can import. A small
-driver script wraps the entry point at runtime and then starts the app as usual,
-so the app's code stays untouched. Keep it in the project but excluded from git
-(see Install), or anywhere outside the project:
-
-```python
-# perf_driver.py
-import runpy, sys
-import perf
-
-perf.OUTPUT_DIR = "perf_traces"  # one file per traced call
-
-import app.pipeline as m
-m.Pipeline.handle = perf.trace(m.Pipeline.handle)  # a method, patched on its class
-# m.process = perf.trace(m.process)                # or a module-level function
-
-sys.argv = ["app.main", *sys.argv[1:]]
-runpy.run_module("app.main", run_name="__main__")  # same as `python -m app.main ...`
-```
-
-```bash
-uv run python perf_driver.py      # with any arguments the app normally takes
-```
-
-Everything the wrapped function calls is traced under it. Patch the function
-where callers look it up: a `from app.pipeline import process` done before the
-patch keeps the original. Patch before the app imports it, or patch the
-importer's name too.
-
-## Configuration
-
-Configuration is done via module-level attributes (set them before calling the
-traced function):
-
-| Attribute        | Default | Meaning |
-|------------------|---------|---------|
-| `perf.OUTPUT_FILE`  | `None` | Path to write the raw trace tree as JSON (e.g. `"perf.json"`). |
-| `perf.ENDPOINT_URL` | `None` | POST the raw trace tree to this collector URL. |
-| `perf.API_KEY`      | `None` | Pre-shared key sent as the `X-API-Key` header on every POST to `ENDPOINT_URL`, for collectors that require API-key auth on their ingestion route. |
-| `perf.TAGS`         | `["dev"]` | Tags attached to every posted trace. |
-| `perf.TIMEOUT`      | `None` | Auto-terminate a traced call after N seconds. |
-| `perf.CAPTURE_IO`   | `True` | Record each call's arguments and return value. |
-| `perf.MAX_DEPTH`    | `20` | Max recursion depth when serializing captured values. |
-| `perf.MAX_CAPTURES_PER_FUNCTION` | `None` | Capture args/result for only the first N calls of each function per trace (all calls are still timed; later ones get `"capture_skipped": true`). Bounds capture cost in hot loops. |
-| `perf.MIN_PCT`      | `0.0` | Hide tree nodes below this fraction of total time. |
-| `perf.HOT_SPOTS`    | `15` | Number of functions in the flat hot-spots summary (`0` disables). |
-| `perf.SCAN_VENV`    | `False` | Also instrument code under stdlib / site-packages. |
-
-Example:
-
-```python
-import perf
-
-perf.OUTPUT_FILE = "perf.json"
-perf.ENDPOINT_URL = "http://localhost:7999/api/traces"
-perf.TIMEOUT = 30
-
-@perf.trace
-def main() -> None:
-    ...
-```
+`perf.trace` also works as a plain function on anything you can import
+(`perf.trace(fn)(...)`, `Class.method = perf.trace(Class.method)`), which is what
+the driver script in [Set up tracing in your repo](#set-up-tracing-in-your-repo)
+relies on.
 
 ### Per-decorator overrides
 
-Any of the config attributes above can also be passed directly to `@trace(...)`
-to override the global value **just for that function's calls** (the globals are
-restored afterwards). Both the bare and parametrized forms work:
+Any setting in [Configuration](#configuration) can also be passed to
+`@trace(...)` to override the global value **just for that function's calls**
+(the globals are restored afterwards):
 
 ```python
 @perf.trace                          # uses the current global config
@@ -200,10 +206,139 @@ def a(): ...
 def b(): ...                         # these three settings apply only to b()
 ```
 
-Passing an unknown key raises `TypeError` at decoration time. Note: overrides
-work by temporarily setting the module globals, so two traced calls running
+Passing an unknown key raises `TypeError` at decoration time. Overrides work by
+temporarily setting the module globals, so two traced calls running
 concurrently with *different* overrides can transiently see each other's values.
 
-> **Note:** unlike the original script, the library defaults `OUTPUT_FILE` and
-> `ENDPOINT_URL` to `None` so importing `perf` never writes files or makes
-> network calls unless you opt in.
+## What a trace contains
+
+A trace file is `{"variables": {...}, "trace": {...}}` (plus `"sources"` with
+`TRACE_LOCALS`). `trace` is the call tree: one node per call, with its timing,
+`args` / `kwargs` as received, `result` as returned, `exception` if it raised,
+and `children`. Any value of 64+ serialized bytes is stored once in `variables`
+and referenced as `{"__ref__": "vN"}`, so an object passed to many calls costs
+its size once. Abridged, from a `Service.handle(self, item_id, flag=False)`
+call traced with `TRACE_LOCALS = ["Service.handle"]`:
+
+```json
+{
+  "variables": {
+    "v20": {"setting_00": {"__ref__": "v0"}, "...": "..."},
+    "v22": {"__type__": "Service", "config": {"__ref__": "v20"}, "cache": {"item-1": 10}, "counter": 1}
+  },
+  "trace": {"name": "main", "children": [
+    {"name": "Service.handle", "time": 0.00071,
+     "args": [{"__ref__": "v22"}, 2], "kwargs": {"flag": true},
+     "result": {"name": "item-2", "total": 5, "tags": ["new", "item-2", "flagged"]},
+     "locals": [
+       [28, {"name": "item-2"}],
+       [29, 0, {"self": [["=", ["counter"], 2]]}],
+       [31, {"tags": ["new", "item-2"]}],
+       [33, 0, {"tags": [["+", [], ["flagged"]]]}],
+       [34, {"total": 5}]
+     ]}
+  ]}
+}
+```
+
+Each `locals` entry is `[line, values set, in-place edits, ...]` (`0` = empty
+part): line 29 changed `self.counter` to 2, line 33 appended `"flagged"` to
+`tags`. `perf.expand_locals(trace)` rewrites the entries as full values (in
+place), and the perf-trace skill's reference `trace-format.md` documents every
+field.
+
+## What capture costs
+
+Recording values is most of perf's overhead: every call's arguments (including
+`self`) and result are converted to JSON-ready data **at the moment of the
+call**, because they can change afterwards, and stored once per distinct
+content. Since 0.11.0, data that has not changed since its last capture is
+recognised instead of being converted and hashed again: long strings, and
+dicts / lists / tuples (16+ entries) of plain values that still hold the same
+objects. A large, unchanged `self.config` therefore costs a comparison per
+call, not a walk. What still costs is data that really is new: containers that
+change every call, fresh large strings, rich objects.
+
+Measured on CPython 3.13 with the C extension, 3,000 calls whose `self` holds
+a 2,000-entry dict (`lab/workload_matrix.py`):
+
+| workload | untraced | perf 0.10.3 | perf 0.11.0 |
+|---|---|---|---|
+| one method per call | 0.72 s | 34.5 s | 1.5 s |
+| three nested methods per call | 0.73 s | 104.7 s | 2.3 s |
+| TRACE_LOCALS on the method, 300 calls | — | 4.1 s | 0.8 s |
+
+Traces are identical between the two versions. To keep overhead down:
+
+- **Timing only:** `CAPTURE_IO=False` (and no `TRACE_LOCALS`) keeps the tree and
+  the times and drops all values.
+- **Hot loops:** `MAX_CAPTURES_PER_FUNCTION=50` captures the first 50 calls of
+  each function and only times the rest.
+- **Huge values:** `MAX_SIZE_CAPTURE` drops (or, with `SPILL_DIR`, spills to a
+  file) any single value above a size.
+- **TRACE_LOCALS** runs on every line of the functions it matches: keep the
+  pattern to the function you are debugging.
+
+Self times in the report exclude capture time; a parent's wall time includes
+its children's capture. The perf-trace reader's `summary` and `advise` commands
+show how much of a trace was perf's own recording cost.
+
+## Configuration
+
+Set these as module attributes before the traced call (`perf.OUTPUT_DIR = ...`),
+or per entry point via [overrides](#per-decorator-overrides).
+
+**Output**
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OUTPUT_DIR` | `None` | Write each trace to `<dir>/<uuid>.json` (or `<dir>/<OUTPUT_FILE>.json`). |
+| `OUTPUT_FILE` | `None` | Write to this fixed path, overwritten on every traced call. |
+| `ENDPOINT_URL` | `None` | POST each trace to this collector URL, as `{"status", "tags", "trace"}`. |
+| `API_KEY` | built-in | Sent as the `X-API-Key` header on every POST to `ENDPOINT_URL`. |
+| `TAGS` | `["dev"]` | Tags attached to every posted trace. |
+| `LOG_FUNCTIONS` | `[]` | Write only these calls (fnmatch on node names) plus their ancestors. Pruned calls fold into their ancestors' self time, so don't use it for timing questions. |
+| `MIN_PCT` | `0.0` | Hide printed tree nodes below this fraction of the total time. |
+| `HOT_SPOTS` | `15` | Rows in the printed hot-spots table (`0` disables it). |
+
+**What is traced**
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SKIP_FUNCTIONS` | `[]` | Don't trace these functions (fnmatch, e.g. `"Class._*"`) or anything under them; their time folds into the caller. |
+| `SCAN_VENV` | `False` | Also instrument stdlib / site-packages (expensive). |
+| `TIMEOUT` | `None` | Stop a traced call after N seconds, keeping the partial tree. |
+| `SUPPRESS_ERRORS` | `False` | Swallow exceptions at the innermost traced call and return a default from its return annotation (or `DEFAULT_RETURN`). |
+| `DEFAULT_RETURN` | unset | The value (or a callable producing it) returned for a suppressed exception. |
+
+**Values**
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `CAPTURE_IO` | `True` | Record each call's arguments and return value. |
+| `TRACE_LOCALS` | `[]` | Functions (fnmatch on node names, e.g. `"Cart.*"`) whose local variables are recorded line by line. Python 3.12+. |
+| `MAX_LOCALS_EVENTS` | `1000` | Cap on `TRACE_LOCALS` entries per call (beyond it: `locals_dropped`). |
+| `MAX_CAPTURES_PER_FUNCTION` | `None` | Capture args/result for only the first N calls of each function per trace; later calls are timed and marked `"capture_skipped": true`. |
+| `MAX_YIELDS_CAPTURE` | `10` | Values recorded per generator (the total count is always kept). |
+| `MAX_DEPTH` | `20` | Nesting depth at which captured values are cut off (shown as their repr). |
+| `MAX_SIZE_CAPTURE` | `None` | Drop any single captured value above this size (characters of content). |
+| `SPILL_DIR` | `None` | With `MAX_SIZE_CAPTURE`: write oversized values to their own files here instead of dropping them. |
+| `SKIP_VARIABLES` | `[]` | Leave out values by name (fnmatch: kwargs, object fields, dict keys, locals), e.g. `["*password*", "*token*"]`. |
+| `REDACT_PATTERNS` | `[]` | Regexes replaced by `<redacted>` in every captured string (dict keys included), repr, exception message, traceback line and recorded source line. |
+
+Example:
+
+```python
+import perf
+
+perf.OUTPUT_DIR = "perf_traces"
+perf.SKIP_VARIABLES = ["*password*", "*token*"]
+perf.TIMEOUT = 30
+
+@perf.trace
+def main() -> None:
+    ...
+```
+
+Importing perf never writes files or makes network calls on its own: output
+starts only once `OUTPUT_DIR`, `OUTPUT_FILE` or `ENDPOINT_URL` is set.

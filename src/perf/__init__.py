@@ -29,6 +29,7 @@ import inspect
 import itertools
 import linecache
 import marshal
+import operator
 import os
 import json as _json
 import re
@@ -65,7 +66,7 @@ def _is_function(obj: Any) -> bool:
     in for a wrapped Python function)."""
     return inspect.isfunction(obj) or (_NodeWrapper is not None and type(obj) is _NodeWrapper)
 
-__version__ = "0.10.3"
+__version__ = "0.11.0"
 __all__ = [
     "TraceTimeout",
     "API_KEY",
@@ -155,7 +156,8 @@ class _TraceState:
     (``time: null``) in the output — which is exactly what it was.
     """
 
-    __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix", "captures", "line_sources")
+    __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix", "captures", "line_sources",
+                 "reuse", "reuse_by_out")
 
     def __init__(self, source_prefix: str = "") -> None:
         # Re-entrant: an asynchronous exception perf can't defer (Ctrl-C)
@@ -177,6 +179,10 @@ class _TraceState:
         # (filename, line) -> source id ("" when the line has no text), so a
         # TRACE_LOCALS line in a loop looks its statement up once per trace
         self.line_sources: dict = {}
+        # Conversions of plain-valued containers, reused while unchanged (see
+        # _reused_conversion): id(container) -> entry, id(converted) -> entry.
+        self.reuse: dict = {}
+        self.reuse_by_out: dict = {}
 
     def capture_allowed(self, name: str, limit: int) -> bool:
         """Whether a call of `name` still gets its IO captured, counting it if so."""
@@ -687,6 +693,76 @@ _DEFAULT_REPR = re.compile(r"^<[\w.<>]+ object at 0x[0-9a-fA-F]+>$")  # <> : loc
 _ADDRESS_REPR = re.compile(r"^<.* at (0x[0-9a-fA-F]+)>$", re.S)  # any repr naming its object's address
 
 
+# ── reusing an unchanged container's conversion across captures ─────────────
+#
+# A dict (str keys) / list / tuple whose values are all leaves converts to a
+# pure function of those exact objects (and the redaction pattern), so while
+# a container still holds the very same objects -- checked by identity, not
+# equality -- its previous conversion is still exact, and so is the ref the
+# pool gave it (see _ValuePool._intern). This is what makes an unchanged
+# `self.config` cost one comparison per call instead of a walk + a digest.
+# The snapshot holds the keys and values themselves, so none of them can be
+# freed and another object take its address while the entry exists.
+
+_REUSE_MIN = 16  # smaller containers convert faster than they are compared
+_REUSE_MAX_ENTRIES = 4096  # per trace; the tables are emptied when full
+
+
+def _py_leaf_items(value: Any, leaf_types: frozenset) -> "tuple | None":
+    if type(value) is dict:
+        items = tuple(value.items())  # one step: consistent even if another thread writes
+        keys = tuple(k for k, _ in items)
+        values = tuple(v for _, v in items)
+        if all(type(k) is str for k in keys) and leaf_types.issuperset(map(type, values)):
+            return keys, values
+        return None
+    values = tuple(value)
+    return (None, values) if leaf_types.issuperset(map(type, values)) else None
+
+
+def _py_same_items(value: Any, keys: "tuple | None", values: tuple) -> bool:
+    if len(value) != len(values):
+        return False
+    if keys is None:
+        return type(value) is not dict and all(map(operator.is_, value, values))
+    return (type(value) is dict and all(map(operator.is_, value, keys))
+            and all(map(operator.is_, value.values(), values)))
+
+
+# getattr: an extension built from an older _speedups.c lacks them.
+_leaf_items = getattr(_speedups, "leaf_items", None) or _py_leaf_items
+_same_items = getattr(_speedups, "same_items", None) or _py_same_items
+
+
+def _reused_conversion(state: "_TraceState", value: Any, rx: Any, leaf_types: frozenset) -> Any:
+    """`value`'s conversion if it holds only leaves (else None): the previous
+    one while it still holds the same objects, otherwise built from a fresh
+    snapshot and remembered. Each entry: [keys, values, rx, converted,
+    (pool, interned result) or None]."""
+    entry = state.reuse.get(id(value))
+    if entry is not None and entry[2] is rx and _same_items(value, entry[0], entry[1]):
+        return entry[3]
+    snap = _leaf_items(value, leaf_types)
+    if snap is None:
+        return None
+    keys, values = snap
+    if keys is None:
+        out: Any = list(values)
+    elif rx is None:
+        out = dict(zip(keys, values))
+    else:
+        out = {rx.sub("<redacted>", k): v for k, v in zip(keys, values)}
+    if len(state.reuse) >= _REUSE_MAX_ENTRIES:
+        state.reuse.clear()
+        state.reuse_by_out.clear()
+    if entry is not None:
+        state.reuse_by_out.pop(id(entry[3]), None)
+    entry = [keys, values, rx, out, None]
+    state.reuse[id(value)] = entry
+    state.reuse_by_out[id(out)] = entry
+    return out
+
+
 def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budget: list | None = None,
               _memo: dict | None = None) -> Any:
     """Convert a value to a JSON-serializable form.
@@ -749,6 +825,8 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
         _memo["max_depth"] = _cfg.MAX_DEPTH
         _memo["rx"] = _redactor()
         _memo["skip"] = bool(_cfg.SKIP_VARIABLES)
+        state = _current_trace.get()
+        _memo["reuse"] = state if _budget is None and state is not None and not _memo["skip"] else None
     if value is None or isinstance(value, (bool, int, float)):
         if _budget is not None:
             # Numbers count too: a huge list of ints must hit MAX_SIZE_CAPTURE
@@ -843,6 +921,11 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                     _charge((rx.sub("<redacted>", k) if rx else k) if isinstance(k, str) else _safe_repr(k), _budget)
                     for k in value if not (skip_keys and isinstance(k, str) and _is_skipped_variable(k))]}
             leaf_types = _NON_STR_LEAF_TYPES if rx else _LEAF_TYPES
+            reuse = _memo.get("reuse") if type(value) is dict and len(value) >= _REUSE_MIN else None
+            if reuse is not None:
+                reused = _reused_conversion(reuse, value, rx, leaf_types)
+                if reused is not None:
+                    return reused
             for k, v in value.items():
                 if skip_keys and isinstance(k, str) and _is_skipped_variable(k):
                     continue
@@ -861,6 +944,11 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
             seen = _seen | {id(value)}
             out = []
             leaf_types = _NON_STR_LEAF_TYPES if _memo["rx"] is not None else _LEAF_TYPES
+            reuse = _memo.get("reuse") if (type(value) is list or type(value) is tuple) and len(value) >= _REUSE_MIN else None
+            if reuse is not None:
+                reused = _reused_conversion(reuse, value, _memo["rx"], leaf_types)
+                if reused is not None:
+                    return reused
             for v in value:
                 if _budget is None:
                     if type(v) in leaf_types:  # fast path: same result as recursing
@@ -1205,6 +1293,13 @@ class _ValuePool:
         self._lock = self._state.lock
         self._prefix = prefix
         self._next = 0
+        # Shortcuts past serialize + digest + lock for content already pooled
+        # (an unchanged `self` re-captured at every call): a long string by
+        # itself (immutable, and its hash is cached on the object), a large
+        # container of str/int/None values by its contents. Only results that
+        # really are refs are remembered, so both stay valid for the trace.
+        self._ref_by_str: dict[str, tuple] = {}
+        self._ref_by_leaves: dict[tuple, tuple] = {}
 
     def intern(self, value: Any, _memo: dict | None = None) -> Any:
         # A converted value can share sub-structures (_jsonable reuses the
@@ -1218,12 +1313,47 @@ class _ValuePool:
     # records). Either way nothing is serialized once per nesting level.
     COMPOSE_MAX_LEAVES = 6
 
+    # Containers with at least this many entries, all of an exact type in
+    # _LEAF_KEY_TYPES, are looked up by their contents before being walked.
+    # bool and float are left out so equal-but-different values (1 / True /
+    # 1.0, 0.0 / -0.0) never share a key; such containers take the long way.
+    LEAF_KEY_MIN = 16
+    _LEAF_KEY_TYPES = frozenset({str, int, type(None)})
+
+    def _leaf_key(self, value: Any) -> "tuple | None":
+        """Content key of a large container of str/int/None values, else None."""
+        if type(value) is dict:
+            values = tuple(value.values())
+            if self._LEAF_KEY_TYPES.issuperset(map(type, values)) and all(type(k) is str for k in value):
+                return (tuple(value), values)
+        elif type(value) is list:
+            values = tuple(value)
+            if self._LEAF_KEY_TYPES.issuperset(map(type, values)):
+                return (None, values)
+        return None
+
     def _intern(self, value: Any, memo: dict) -> tuple:
         """(interned value, its serialized form or None if unknown)."""
         if isinstance(value, (dict, list)):
             done = memo.get(id(value))
             if done is not None:
                 return done
+            # A conversion reused while its container is unchanged (see
+            # _reused_conversion) carries the result it was interned to.
+            reused = self._state.reuse_by_out.get(id(value))
+            if reused is not None and reused[3] is value:
+                done = reused[4]
+                if done is not None and done[0] is self:
+                    memo[id(value)] = done[1]
+                    return done[1]
+            else:
+                reused = None
+            key = self._leaf_key(value) if len(value) >= self.LEAF_KEY_MIN else None
+            if key is not None:
+                done = self._ref_by_leaves.get(key)
+                if done is not None:
+                    memo[id(value)] = done
+                    return done
             original = value
             leaves = 0
             composable = True
@@ -1262,10 +1392,23 @@ class _ValuePool:
                     serialized = "[" + ",".join(_leaf_json(v) if sv is None else sv for v, sv in zip(out, sers)) + "]"
             result = self._store(out, serialized)
             memo[id(original)] = result
+            if type(result[0]) is dict and "__ref__" in result[0]:
+                if key is not None:
+                    self._ref_by_leaves[key] = result
+                if reused is not None:
+                    reused[4] = (self, result)
             return result
         if not isinstance(value, str) or len(value) < self.MIN_SIZE:
             return value, _leaf_json(value)
-        return self._store(value, _encode_str(value) if type(value) is str else None)
+        if type(value) is not str:
+            return self._store(value)
+        done = self._ref_by_str.get(value)
+        if done is not None:
+            return done
+        result = self._store(value, _encode_str(value))
+        if type(result[0]) is dict:  # pooled, not left inline by a closed trace
+            self._ref_by_str[value] = result
+        return result
 
     def _store(self, value: Any, serialized: "str | None" = None) -> tuple:
         if serialized is None:
