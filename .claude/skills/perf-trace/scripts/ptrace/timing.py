@@ -6,7 +6,7 @@ import json
 import math
 from collections import defaultdict
 
-from .model import (Trace, call_line, canon, diff_values, fmt_path, fmt_t, is_marker, is_trivial, named_args,
+from .model import (Trace, call_line, canon, canon_shared, diff_values, fmt_path, fmt_t, is_marker, is_trivial, named_args,
                     percentile, self_time, short, walk)
 
 EPS = 1e-7
@@ -153,7 +153,7 @@ def cmd_timeline(a):
 
 
 def _atoms(v) -> set[str]:
-    return {canon(sub) for _, sub in walk(v, max_depth=6) if not is_trivial(sub) and not is_marker(sub)}
+    return {canon_shared(sub) for _, sub in walk(v, max_depth=6) if not is_trivial(sub) and not is_marker(sub)}
 
 
 def _result_atoms(tr: Trace, n: dict) -> set[str]:
@@ -187,12 +187,7 @@ def _depends(tr: Trace, later: list[dict], earlier: list[dict]) -> bool:
     atoms -= _arg_atoms(tr, earlier[0]["_parent"])
     if not atoms:
         return False
-    for n in later:
-        for _, v in named_args(n, tr):
-            for _, sub in walk(v, max_depth=6):
-                if not is_trivial(sub) and canon(sub) in atoms:
-                    return True
-    return False
+    return any(_arg_atoms(tr, n) & atoms for n in later)
 
 
 def cmd_serial(a):

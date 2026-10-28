@@ -9,7 +9,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .model import (Trace, call_line, canon, diff_values, expand_locals, fmt_path, fmt_t, is_marker, is_trivial,
+from .model import (Trace, call_line, canon, canon_shared, diff_values, expand_locals, fmt_path, fmt_t, is_marker, is_trivial,
                     named_args, parse_literal, replay_state, short, walk)
 
 # ── value: where does a value appear ─────────────────────────────────────────
@@ -27,6 +27,7 @@ def _same(v, target, contains: bool) -> bool:
 
 def cmd_value(a):
     tr = Trace(a.trace)
+    tr.load_spills = True  # search inside values spilled to SPILL_DIR too
     target = parse_literal(a.value)
     events = []
     uncaptured = 0
@@ -368,7 +369,7 @@ def cmd_mutations(a):
         for row in expand_locals(p, tr):
             text = tr.line_text(p, row["line"])
             for name in row["edited"]:
-                before = canon(row["before"].get(name))
+                before = None  # canonical text, computed only once a child call on this line needs it
                 cands = []
                 for c in p.get("children", []):
                     if (a.fn and a.fn not in c["name"]) or not tr.captured(c):
@@ -376,8 +377,10 @@ def cmd_mutations(a):
                     fn = c["name"].replace(".<locals>.", ".").rsplit(".", 1)[-1]
                     if not re.search(rf"\b{re.escape(fn)}\s*\(", text):
                         continue  # this line does not call it
+                    if before is None:
+                        before = canon_shared(row["before"].get(name))
                     for argname, v in named_args(c, tr):
-                        if canon(v) == before:
+                        if canon_shared(v) == before:
                             cands.append((c, argname))
                             break
                 if cands and shown < a.n:  # the latest matching call is the one this line made

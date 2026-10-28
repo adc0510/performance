@@ -24,6 +24,11 @@ field or marker in a trace is unclear; `scripts/perf_trace.py` already decodes a
   means an object of type Foo whose fields are the dict `variables["v3"]`.
 - `trace` -- the root node: the function decorated with `@perf.trace` (one file per call).
 - `sources` -- only with TRACE_LOCALS: the text of every recorded line, once per file.
+- `status` / `tags` -- only in bodies POSTed to `ENDPOINT_URL`; otherwise the same shape.
+
+With `LOG_FUNCTIONS` set, `children` lists were pruned to the matching calls and their
+ancestors before writing, with no marker: the time of what was dropped counts as the
+self time of the nodes that remain.
 
 ## Node fields
 
@@ -39,7 +44,7 @@ field or marker in a trace is unclear; `scripts/perf_trace.py` already decodes a
 | `result` | return value, captured at return |
 | `capture_time` | seconds perf spent converting this call's values (perf overhead, excluded from self time) |
 | `capture_skipped` | true: call past `MAX_CAPTURES_PER_FUNCTION` -- timed, but no args/result |
-| `exception` | repr of the exception the call raised (also on every ancestor it propagated through) |
+| `exception` | repr of the exception the call raised (also on every ancestor it propagated through). With `result` on the same node: SUPPRESS_ERRORS swallowed it there and the call returned that default |
 | `exception_origin` | `{file, line, function, text}` of the innermost frame -- where it was raised |
 | `exception_debug` | `{frames: [...], formatted: "<full traceback>", caused_by: {...}}` -- full chain, untruncated |
 | `yields` / `yielded` / `active_time` / `closed` | generators: number of yields, first values yielded (`MAX_YIELDS_CAPTURE`), time actually running (excl. the consumer between yields), closed early by the consumer |
@@ -94,6 +99,8 @@ line that changed something, positional with `0` for an empty part (trailing par
 
 ## Timing semantics
 
+- The root's own `capture_time` (its args and result) is outside its `time`: the elapsed
+  time of the traced call is `time + capture_time`, and `summary` uses that.
 - self = `time` (or `active_time` for generators) minus the union of the children's
   `[start, start + time + capture_time]` intervals, minus `locals_capture_time`.
 - wall of a function across calls = union of its calls' intervals; cumul = plain sum.

@@ -7,8 +7,17 @@ from collections import defaultdict
 from .model import Trace, call_line, canon, fmt_t, short
 
 
+def _suppressed(n: dict) -> bool:
+    """n both raised and returned: perf's SUPPRESS_ERRORS swallowed the exception right there and
+    returned a default value. (Only visible when the result was captured.)"""
+    return "exception" in n and "result" in n
+
+
 def _catcher(n: dict) -> dict | None:
-    """First ancestor that did not re-raise n's exception (None: it reached the root)."""
+    """First ancestor that did not re-raise n's exception (None: it reached the root; n itself:
+    perf suppressed it in n)."""
+    if _suppressed(n):
+        return n
     exc, p = n.get("exception"), n["_parent"]
     while p is not None and p.get("exception") == exc:
         p = p["_parent"]
@@ -32,7 +41,13 @@ def _error_groups(tr: Trace) -> list[dict]:
         p, last = n["_parent"], n
         while p is not None and p.get("exception") == exc:
             last, p = p, p["_parent"]
-        fate = "reached the root (the traced call raised)" if p is None else f"caught in #{p['_id']} {p['name']} (did not propagate further)"
+        if _suppressed(last):
+            fate = (f"suppressed by perf (SUPPRESS_ERRORS) in #{last['_id']} {last['name']}, which returned"
+                    f" {short(tr.resolve(last['result']), 40, True)} instead of raising")
+        elif p is None:
+            fate = "reached the root (the traced call raised)"
+        else:
+            fate = f"caught in #{p['_id']} {p['name']} (did not propagate further)"
         key = (exc, o.get("file"), o.get("line"))
         g = groups.setdefault(key, {"exception": exc, "origin": n, "where": o, "count": 0, "fate": fate, "ids": [], "top": last,
                                     "fates": defaultdict(int)})
@@ -122,7 +137,7 @@ def cmd_exc_flow(a):
         if not _is_origin(n):
             continue
         p = _catcher(n)
-        if p is None:
+        if p is None or p is n:  # reached the root, or perf (not the code) suppressed it
             continue
         exc_type = n["exception"].split("(", 1)[0]
         g = groups.setdefault((n["name"], exc_type, p["name"]), {"count": 0, "time": 0.0, "parents": set(), "ids": []})

@@ -15,8 +15,9 @@ function where levels 1 and 2 stop explaining things.
    it and returned something degraded. `replaces` means the catcher raised a different
    exception. "NOT chained" means the original traceback is lost from logs, but the trace
    still has it on that node. Run `exc-flow` to see exceptions raised and caught in a loop.
-   If `SUPPRESS_ERRORS` was on, "caught" can also mean perf itself turned the exception
-   into a default return value.
+   A fate of "suppressed by perf (SUPPRESS_ERRORS)" means perf itself turned the exception
+   into a default return value in that call: the code has no handler there, and the
+   caller carried on with the default.
 2. **Locate the bad value.** Run `value TRACE <literal> [--locals]` with the wrong output
    (a number, a status string, an id). The first hit is where the value entered the
    recording:
