@@ -13,9 +13,10 @@ Six steps from nothing to a trace you can read, alone or with Claude Code.
 Nothing in your project's `pyproject.toml`, lockfile or git history has to
 change.
 
-**1. Install perf into the project's virtualenv** (it is a private repository,
-so you need read access; see [Install](#install) for tokens, pinning and other
-ways):
+**1. Install perf into the project's virtualenv.** It is a private repository,
+so you need read access; on a fresh machine, check
+[On a new server or in a new repo](#on-a-new-server-or-in-a-new-repo) first
+(git, a C compiler, and how to confirm the fast C extension is in use):
 
 ```bash
 cd your-project
@@ -106,6 +107,48 @@ read access (an SSH key, or a personal access token: replace
 `git+ssh://git@github.com/` with `git+https://<TOKEN>@github.com/` in the URLs
 below). It runs on CPython 3.10+; `TRACE_LOCALS` and the C extension need 3.12+.
 
+### On a new server or in a new repo
+
+**What the machine needs first** (once):
+
+| need | why | how |
+|---|---|---|
+| Read access to this GitHub repo | it is private | an SSH key on your GitHub account (or a read-only deploy key on the repo); `ssh -T git@github.com` should greet you. Or use a token URL (above). |
+| `git` | uv and pip clone the repo with it | `sudo apt install -y git` · `sudo dnf install -y git` |
+| A C compiler | builds the C extension | `sudo apt install -y gcc` · `sudo dnf install -y gcc` |
+| Python 3.12+ headers | builds the C extension | Pythons installed by uv already have them. A system Python needs `python3-dev` (apt) or `python3-devel` (dnf). |
+| [uv](https://docs.astral.sh/uv/) (recommended) | installs into the project's `.venv` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+
+Without a compiler or headers the install still succeeds, but perf runs pure
+Python (the same traces, slower capture).
+
+**Then, in the repo** (with no other virtualenv activated: `uv pip install`
+installs into an active one, not the project's `.venv`, so run `deactivate`
+first if your prompt shows one):
+
+```bash
+cd your-project
+uv venv                      # only if the project has no .venv yet (add --python 3.12 to pick one)
+uv pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
+uv run python -c "import perf; print(perf.__version__, perf._speedups is not None)"
+```
+
+The last line should print the latest version and `True`. `True` means the C
+extension loaded; `False` means pure Python. To find out why:
+
+```bash
+uv run python -c "import perf, sys, os, sysconfig; print(perf.__file__, sys.version.split()[0], 'free-threaded' if sysconfig.get_config_var('Py_GIL_DISABLED') else 'GIL', os.environ.get('PERF_PURE_PYTHON'))"
+```
+
+| what it shows | cause | fix |
+|---|---|---|
+| `No module named 'perf'` | it went into another virtualenv that was active (`echo $VIRTUAL_ENV` shows it) | `deactivate`, then run the `uv pip install` again in the project |
+| a path outside the project's `.venv` | another copy of perf comes first, usually from `PYTHONPATH` (an old machine-wide install) | remove that `PYTHONPATH` entry (check `~/.bashrc`), open a new shell, reinstall |
+| Python 3.10 / 3.11 | the C extension needs 3.12+ | recreate the venv with `uv venv --python 3.12` and reinstall |
+| `free-threaded` | not built for free-threaded Python | use a regular (GIL) build |
+| last value is not `None` | `PERF_PURE_PYTHON` is set | `unset PERF_PURE_PYTHON` |
+| everything above is fine | it was built before a compiler or headers were available, and uv reuses that cached build | install them, then `uv pip install --reinstall --no-cache "perf @ git+ssh://git@github.com/adc0510/performance.git"` |
+
 ### Into a project's `.venv` only
 
 ```bash
@@ -125,7 +168,7 @@ pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
 These install the latest version (the `main` branch). To pin one, append
-`@<tag>` to the URL (e.g. `...performance.git@v0.11.1`), using a tag from
+`@<tag>` to the URL (e.g. `...performance.git@v0.11.2`), using a tag from
 [Releases](https://github.com/adc0510/performance/releases).
 
 ### From a clone, for development
@@ -149,7 +192,9 @@ Check which one you got:
 python -c "import perf; print(perf._speedups is not None)"
 ```
 
-Set `PERF_PURE_PYTHON=1` to ignore an installed extension. After editing
+If it prints `False`, see the table in
+[On a new server or in a new repo](#on-a-new-server-or-in-a-new-repo). Set
+`PERF_PURE_PYTHON=1` to ignore an installed extension. After editing
 `_speedups.c` in a clone, rebuild it with `pip install -e .` again.
 
 ### Claude Code skill: perf-trace
