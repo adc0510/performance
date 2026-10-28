@@ -66,7 +66,7 @@ def _is_function(obj: Any) -> bool:
     in for a wrapped Python function)."""
     return inspect.isfunction(obj) or (_NodeWrapper is not None and type(obj) is _NodeWrapper)
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 __all__ = [
     "TraceTimeout",
     "API_KEY",

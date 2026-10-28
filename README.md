@@ -9,8 +9,9 @@ process pools are followed.
 
 ## Set up tracing in your repo
 
-Five steps from nothing to a trace file you can read. Nothing in your project's
-`pyproject.toml`, lockfile or git history has to change.
+Six steps from nothing to a trace you can read, alone or with Claude Code.
+Nothing in your project's `pyproject.toml`, lockfile or git history has to
+change.
 
 **1. Install perf into the project's virtualenv** (it is a private repository,
 so you need read access; see [Install](#install) for tokens, pinning and other
@@ -71,16 +72,32 @@ uv run python perf_driver.py        # with any arguments the app normally takes
 Each traced call prints a call tree and hot-spots table and writes
 `perf_traces/<uuid>.json`.
 
-**5. Read the trace.** Open the JSON (see [What a trace contains](#what-a-trace-contains)),
-or use the bundled reader, which works with or without Claude Code:
+**5. Give Claude Code the perf-trace skill** (once per machine; skip it if you
+don't use [Claude Code](https://claude.com/claude-code)). The skill is not part
+of the pip package: it lives in this repo, and linking it into your personal
+skills folder makes it available in every project on the machine, with or
+without perf installed there:
+
+```bash
+git clone git@github.com:adc0510/performance.git ~/code/performance   # skip if already cloned
+mkdir -p ~/.claude/skills
+ln -s ~/code/performance/.claude/skills/perf-trace ~/.claude/skills/perf-trace
+ls ~/.claude/skills/perf-trace/SKILL.md                                  # check: the link resolves
+```
+
+Start a new Claude Code session afterwards. Keep it current with
+`git -C ~/code/performance pull`. More in
+[Claude Code skill: perf-trace](#claude-code-skill-perf-trace).
+
+**6. Read the trace.** Ask Claude Code about it, e.g. "why is `handle_request`
+slow in perf_traces/<uuid>.json" or "where did this wrong value come from": the
+skill loads when you mention a perf trace (or name it: "use perf-trace"). Or
+open the JSON yourself (see [What a trace contains](#what-a-trace-contains)), or
+run the skill's reader directly, which needs only `python3`:
 
 ```bash
 python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py summary perf_traces/<uuid>.json
 ```
-
-With the [perf-trace skill](#claude-code-skill-perf-trace) installed, ask Claude
-Code things like "why is `handle_request` slow in this trace" or "where did this
-wrong value come from".
 
 ## Install
 
@@ -108,7 +125,7 @@ pip install "perf @ git+ssh://git@github.com/adc0510/performance.git"
 ```
 
 These install the latest version (the `main` branch). To pin one, append
-`@<tag>` to the URL (e.g. `...performance.git@v0.11.0`), using a tag from
+`@<tag>` to the URL (e.g. `...performance.git@v0.11.1`), using a tag from
 [Releases](https://github.com/adc0510/performance/releases).
 
 ### From a clone, for development
@@ -141,13 +158,20 @@ The repo ships a [Claude Code](https://claude.com/claude-code) skill,
 `.claude/skills/perf-trace`, for debugging, fixing and optimizing code from
 trace files. It finds the critical path, where a wrong value came from,
 swallowed exceptions and N+1 calls, and it writes regression tests from
-captured calls. It is not part of the pip package. Install it once for every
-project by linking it into your personal skills folder:
+captured calls. It is not part of the pip package, so a project that installs
+perf does not get it: install it once per machine by linking it into your
+personal skills folder, which Claude Code reads in every project:
 
 ```bash
 git clone git@github.com:adc0510/performance.git ~/code/performance
+mkdir -p ~/.claude/skills
 ln -s ~/code/performance/.claude/skills/perf-trace ~/.claude/skills/perf-trace
 ```
+
+Claude Code picks it up in new sessions. The link follows the clone's checked-out
+branch, so keep that clone on `main`. To make it available in one project only,
+link it into that project's `.claude/skills/` instead and keep it out of git with
+`echo '.claude/skills/perf-trace' >> .git/info/exclude`.
 
 Update it with `git -C ~/code/performance pull`. It needs only `python3` (3.9+);
 perf itself does not have to be installed where traces are read. The bundled
