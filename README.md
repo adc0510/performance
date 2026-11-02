@@ -363,8 +363,8 @@ Traces are identical between the two versions. To keep overhead down:
 
 - **Timing only:** `CAPTURE_IO=False` (and no `TRACE_LOCALS`) keeps the tree and
   the times and drops all values.
-- **Hot loops:** `MAX_CAPTURES_PER_FUNCTION=50` captures the first 50 calls of
-  each function and only times the rest.
+- **Hot loops:** by default only the first 20 calls of each function are
+  captured; the rest are timed only (`MAX_CAPTURES_PER_FUNCTION`, `None` = every call).
 - **Huge values:** `MAX_SIZE_CAPTURE` drops (or, with `SPILL_DIR`, spills to a
   file) any single value above a size.
 - **TRACE_LOCALS** runs on every line of the functions it matches: keep the
@@ -386,7 +386,8 @@ or per entry point via [overrides](#per-decorator-overrides).
 | `OUTPUT_DIR` | `None` | Write each trace to `<dir>/<uuid>.json` (or `<dir>/<OUTPUT_FILE>.json`). |
 | `OUTPUT_FILE` | `None` | Write to this fixed path, overwritten on every traced call. |
 | `ENDPOINT_URL` | `None` | POST each trace to this collector URL, as `{"status", "tags", "trace"}`. |
-| `API_KEY` | built-in | Sent as the `X-API-Key` header on every POST to `ENDPOINT_URL`. |
+| `API_KEY` | `$PERF_API_KEY` or `None` | Sent as the `X-API-Key` header on every POST to `ENDPOINT_URL`. No key is built in: set it, or export `PERF_API_KEY`. |
+| `SEND_TIMEOUT` | `5.0` | Seconds a POST to `ENDPOINT_URL` may take. Error traces are sent before the failing call returns, so this bounds how long a slow collector can delay it. |
 | `TAGS` | `["dev"]` | Tags attached to every posted trace. |
 | `LOG_FUNCTIONS` | `[]` | Write only these calls (fnmatch on node names) plus their ancestors. Pruned calls fold into their ancestors' self time, so don't use it for timing questions. |
 | `MIN_PCT` | `0.0` | Hide printed tree nodes below this fraction of the total time. |
@@ -399,7 +400,7 @@ or per entry point via [overrides](#per-decorator-overrides).
 | `SKIP_FUNCTIONS` | `[]` | Don't trace these functions (fnmatch, e.g. `"Class._*"`) or anything under them; their time folds into the caller. |
 | `SCAN_VENV` | `False` | Also instrument stdlib / site-packages (expensive). |
 | `TIMEOUT` | `None` | Stop a traced call after N seconds, keeping the partial tree. |
-| `SUPPRESS_ERRORS` | `False` | Swallow exceptions at the innermost traced call and return a default from its return annotation (or `DEFAULT_RETURN`). |
+| `SUPPRESS_ERRORS` | `False` | Swallow exceptions at the innermost traced call and return a default from its return annotation (or `DEFAULT_RETURN`). Only `Exception` subclasses: `SystemExit`, `KeyboardInterrupt`, `asyncio.CancelledError` and `TraceTimeout` always propagate. |
 | `DEFAULT_RETURN` | unset | The value (or a callable producing it) returned for a suppressed exception. |
 
 **Values**
@@ -409,7 +410,8 @@ or per entry point via [overrides](#per-decorator-overrides).
 | `CAPTURE_IO` | `True` | Record each call's arguments and return value. |
 | `TRACE_LOCALS` | `[]` | Functions (fnmatch on node names, e.g. `"Cart.*"`) whose local variables are recorded line by line. Python 3.12+. |
 | `MAX_LOCALS_EVENTS` | `1000` | Cap on `TRACE_LOCALS` entries per call (beyond it: `locals_dropped`). |
-| `MAX_CAPTURES_PER_FUNCTION` | `None` | Capture args/result for only the first N calls of each function per trace; later calls are timed and marked `"capture_skipped": true`. |
+| `MAX_CAPTURES_PER_FUNCTION` | `20` | Capture args/result for only the first N calls of each function per trace; later calls are timed and marked `"capture_skipped": true`. Set `None` to capture every call (much slower on real code: see review/06). |
+| `PRINT_REPORT` | `True` | Print the call tree and hot-spots table when a traced call ends. `False` skips building it (services that only read written/sent traces). |
 | `MAX_YIELDS_CAPTURE` | `10` | Values recorded per generator (the total count is always kept). |
 | `MAX_DEPTH` | `20` | Nesting depth at which captured values are cut off (shown as their repr). |
 | `MAX_SIZE_CAPTURE` | `None` | Drop any single captured value above this size (characters of content). |

@@ -41,6 +41,7 @@ static PyObject *g_record_output;    /* _record_output(done, result) */
 static PyObject *g_sync_failure;     /* _sync_failure(done, exc, suppress, default_factory) */
 static PyObject *g_reraise;          /* sentinel returned by _sync_failure */
 static PyObject *g_locals_wanted;    /* _locals_wanted(name) */
+static PyObject *g_is_skipped;       /* _is_skipped(name): memoized SKIP_FUNCTIONS match */
 static PyObject *g_locals_enable;    /* _locals_enable(code, node) */
 static PyObject *g_round;            /* builtins.round */
 static PyObject *g_nine;             /* 9 == _TIME_DECIMALS */
@@ -379,8 +380,17 @@ nw_vectorcall(PyObject *op, PyObject *const *args, size_t nargsf, PyObject *kwna
         return nw_passthrough(self, args, nargsf, kwnames);
     }
 
-    /* Rare paths: let the Python wrapper handle them exactly as before. */
+    /* Rare paths: let the Python wrapper handle them exactly as before. Only
+     * a call that IS skipped (its name matches SKIP_FUNCTIONS, or it runs
+     * under a skipped call) leaves the fast path -- not every call as soon
+     * as SKIP_FUNCTIONS is non-empty. */
     int skip = cfg_true(s_SKIP_FUNCTIONS);
+    if (skip > 0) {
+        PyObject *verdict = PyObject_CallOneArg(g_is_skipped, self->name);
+        if (verdict == NULL) goto fail_parent;
+        skip = PyObject_IsTrue(verdict);
+        Py_DECREF(verdict);
+    }
     int depth = skip ? 0 : ctx_true(g_skip_depth);
     if (skip < 0 || depth < 0) goto fail_parent;
     if (skip || depth || PyList_GET_SIZE(g_timeout_pending) > 0) {
@@ -829,7 +839,8 @@ sp_init(PyObject *module, PyObject *globals)
         || !(g_sync_failure = take(globals, "_sync_failure"))
         || !(g_reraise = take(globals, "_RERAISE"))
         || !(g_locals_wanted = take(globals, "_locals_wanted"))
-        || !(g_locals_enable = take(globals, "_locals_enable"))) {
+        || !(g_locals_enable = take(globals, "_locals_enable"))
+        || !(g_is_skipped = take(globals, "_is_skipped"))) {
         return NULL;
     }
     if (!PyList_Check(g_timeout_pending)) {

@@ -111,7 +111,9 @@ rather than stop at the first familiar thing:
 ## MUST NOT DO
 
 - Never treat a missing or cut-off value (`<TypeName>`, `capture_skipped`, a repr at
-  depth) as empty or as evidence.
+  depth) as empty or as evidence. Since perf 0.12.0 `capture_skipped` is common (first
+  20 calls per function captured by default): when you need such a call's values, re-run
+  with `MAX_CAPTURES_PER_FUNCTION=None`.
 - Never claim a speed-up from a single trace, or from a trace dominated by recording
   overhead.
 - Never conclude "duplicate processing" from a shared id without comparing the inputs

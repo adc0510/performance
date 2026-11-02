@@ -82,9 +82,23 @@ other's values.
 ```python
 @perf.trace(CAPTURE_IO=False, TRACE_LOCALS=[], OUTPUT_DIR="perf_traces")
 ```
-Keeps the tree and the times and drops all values. To keep some values cheaply, use
-`MAX_CAPTURES_PER_FUNCTION=50`: later calls of each function are timed and marked
-`capture_skipped`.
+Keeps the tree and the times and drops all values.
+
+**How many calls keep their values:** since perf 0.12.0, only the first 20 calls of each
+function in a trace record args/result (`MAX_CAPTURES_PER_FUNCTION=20` by default). Later
+calls are timed and marked `capture_skipped`. Before 0.12.0, every call was captured unless
+you set a cap. When the call you need is past the cap (its node says `capture_skipped`),
+re-run that input with the cap lifted, scoped to the one entry point:
+```python
+@perf.trace(MAX_CAPTURES_PER_FUNCTION=None)   # every call; or a larger N
+```
+Expect that run to be slower: on real libraries, capturing every call costs 4-40x more
+than the default cap.
+
+**Tree-shaped objects with parent links** (docutils nodes, ASTs, DOMs, ORM sessions): one
+captured node can reach the whole tree through `parent`, so a single capture can take
+about a second and tens of MB. If `summary` shows recording dominating and the values are
+huge, set `MAX_DEPTH=4` (or `MAX_SIZE_CAPTURE`).
 
 What capture costs depends on the perf version (`perf.__version__`). Since 0.11.0, data
 unchanged since its last capture is reused rather than converted and hashed again: long
@@ -136,6 +150,10 @@ ones via SIGALRM (Unix main thread only). Calls cut off show in `unfinished`.
 services. `OUTPUT_FILE` names a fixed file, overwritten on every call. With
 `ENDPOINT_URL`, each trace is POSTed to a collector as the same JSON plus `status`
 (`ok`/`error`) and `tags`: save a body to a `.json` file and every command reads it.
+Since 0.12.0 no API key is built in: set `perf.API_KEY` or the `PERF_API_KEY` environment
+variable if the collector needs one. `SEND_TIMEOUT` (default 5 s) bounds each POST.
+`PRINT_REPORT=False` stops the printed tree and hot-spots table (files and POSTs are
+unchanged), which suits services that trace every request.
 
 ## What gets traced across threads and processes
 
@@ -158,7 +176,10 @@ services. `OUTPUT_FILE` names a fixed file, overwritten on every call. With
   wall times include their children's.
 - `SUPPRESS_ERRORS=True`: perf swallows exceptions at the innermost traced call and returns
   a default value derived from its return annotation (or `DEFAULT_RETURN`), so a failure
-  looks like an empty result. Such a node has both `exception` and `result`; `errors` and
+  looks like an empty result. Since 0.12.0 only `Exception` subclasses are swallowed:
+  `SystemExit`, `KeyboardInterrupt`, `asyncio.CancelledError` and `TraceTimeout` always
+  propagate. Before 0.12.0 these were swallowed too: an older trace can show a `sys.exit()`,
+  a Ctrl-C or a task cancellation "suppressed by perf". Such a node has both `exception` and `result`; `errors` and
   `summary` report it as "suppressed by perf". Without a captured result (`CAPTURE_IO=False`,
   `capture_skipped`) it can't be told apart from a caught exception.
 - `LOG_FUNCTIONS`: pruned calls fold into their ancestors' self time (see above).
