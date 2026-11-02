@@ -43,10 +43,10 @@ self time of the nodes that remain.
 | `params` | positional parameter names, present when TRACE_LOCALS needs them; otherwise args are anonymous (the first arg of a `Class.method` is `self`) |
 | `result` | return value, captured at return |
 | `capture_time` | seconds perf spent converting this call's values (perf overhead, excluded from self time) |
-| `capture_skipped` | true: call past `MAX_CAPTURES_PER_FUNCTION` -- timed, but no args/result |
+| `capture_skipped` | true: call past `MAX_CAPTURES_PER_FUNCTION` (default 20 since 0.12.0; unlimited before) -- timed, but no args/result |
 | `exception` | repr of the exception the call raised (also on every ancestor it propagated through). With `result` on the same node: SUPPRESS_ERRORS swallowed it there and the call returned that default |
 | `exception_origin` | `{file, line, function, text}` of the innermost frame -- where it was raised |
-| `exception_debug` | `{frames: [...], formatted: "<full traceback>", caused_by: {...}}` -- full chain, untruncated |
+| `exception_debug` | `{frames: [...], formatted: "<full traceback>", caused_by: {...}}` -- untruncated. Since 0.12.0, nodes an exception propagates through share the innermost node's copy, and the root has the complete traceback; before, each node had its own (longer) one |
 | `yields` / `yielded` / `active_time` / `closed` | generators: number of yields, first values yielded (`MAX_YIELDS_CAPTURE`), time actually running (excl. the consumer between yields), closed early by the consumer |
 | `cache` | `"hit"` / `"miss"` for `functools.lru_cache` / `cache` functions |
 | `locals`, `locals_capture_time`, `locals_dropped`, `source` | TRACE_LOCALS, see below |
@@ -117,6 +117,7 @@ line that changed something, positional with `0` for an empty part (trailing par
 `MAX_CAPTURES_PER_FUNCTION`, `MAX_YIELDS_CAPTURE`, `SKIP_FUNCTIONS` (whole calls hidden,
 including everything under them), `SKIP_VARIABLES`, `REDACT_PATTERNS`, `TRACE_LOCALS`,
 `MAX_LOCALS_EVENTS`, `LOG_FUNCTIONS` (file pruned to these names + ancestors), `MIN_PCT` /
-`HOT_SPOTS` (printed report only), `SCAN_VENV` (also trace library code), `TIMEOUT`.
+`HOT_SPOTS` / `PRINT_REPORT` (printed report only), `SCAN_VENV` (also trace library code),
+`TIMEOUT`.
 Set as module attributes (`perf.TRACE_LOCALS = [...]`) or per decorator
 (`@perf.trace(TRACE_LOCALS=["pkg.mod.func"])`).

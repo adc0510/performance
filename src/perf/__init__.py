@@ -66,7 +66,7 @@ def _is_function(obj: Any) -> bool:
     in for a wrapped Python function)."""
     return inspect.isfunction(obj) or (_NodeWrapper is not None and type(obj) is _NodeWrapper)
 
-__version__ = "0.11.2"
+__version__ = "0.12.0"
 __all__ = [
     "TraceTimeout",
     "API_KEY",
@@ -80,7 +80,9 @@ __all__ = [
     "MIN_PCT",
     "OUTPUT_DIR",
     "OUTPUT_FILE",
+    "PRINT_REPORT",
     "SCAN_VENV",
+    "SEND_TIMEOUT",
     "SKIP_FUNCTIONS",
     "SKIP_VARIABLES",
     "SPILL_DIR",
@@ -157,7 +159,7 @@ class _TraceState:
     """
 
     __slots__ = ("lock", "open", "graft_tokens", "sources", "_source_ids", "_source_prefix", "captures", "line_sources",
-                 "reuse", "reuse_by_out")
+                 "reuse", "reuse_by_out", "last_exception")
 
     def __init__(self, source_prefix: str = "") -> None:
         # Re-entrant: an asynchronous exception perf can't defer (Ctrl-C)
@@ -183,6 +185,12 @@ class _TraceState:
         # _reused_conversion): id(container) -> entry, id(converted) -> entry.
         self.reuse: dict = {}
         self.reuse_by_out: dict = {}
+        # (exception, origin, interned debug) of the exception recorded last:
+        # one unwinding through N traced calls is described once, at the
+        # innermost node, and reused by the nodes it passes through next (see
+        # _record_exception_fields). Only the latest is kept, so a loop that
+        # raises and catches doesn't keep every traceback (and its frames) alive.
+        self.last_exception: "tuple | None" = None
 
     def capture_allowed(self, name: str, limit: int) -> bool:
         """Whether a call of `name` still gets its IO captured, counting it if so."""
@@ -195,6 +203,7 @@ class _TraceState:
     def close(self) -> None:
         with self.lock:
             self.open = False
+        self.last_exception = None  # its traceback holds frames (and their locals)
         for token in self.graft_tokens:
             _pool_grafts.pop(token, None)
 
@@ -243,7 +252,7 @@ _hook_state = threading.local()
 # A TIMEOUT that fired while perf's own code was running (where raising is
 # unsafe: perf's defensive handlers would swallow it, a lock could be left
 # held, a sys.monitoring callback could be interrupted mid-way). Holds the
-# message until a safe point raises it: a node wrapper about to call into the
+# (thread, message) until a safe point on that thread raises it: a node wrapper about to call into the
 # program (_raise_pending_timeout), or a retry alarm landing in program code.
 _timeout_pending: list = []
 
@@ -254,9 +263,20 @@ class TraceTimeout(TimeoutError):
     swallows it (that would let a timed-out program keep running)."""
 
 
+def _suppressible(exc: BaseException) -> bool:
+    """Whether SUPPRESS_ERRORS may swallow `exc`: ordinary failures only.
+    SystemExit, KeyboardInterrupt, GeneratorExit and asyncio.CancelledError
+    (all BaseException, not Exception) are control flow, not errors -- and a
+    TraceTimeout must stop the program."""
+    return isinstance(exc, Exception) and not isinstance(exc, TraceTimeout)
+
+
 def _raise_pending_timeout() -> None:
-    if _timeout_pending:
-        message = _timeout_pending[0]
+    # Entries are (thread ident, message): SIGALRM is handled on the main
+    # thread, and only that thread may receive the TraceTimeout -- a worker
+    # thread running traced code at the same moment must not.
+    if _timeout_pending and _timeout_pending[0][0] == threading.get_ident():
+        message = _timeout_pending[0][1]
         _timeout_pending.clear()
         raise TraceTimeout(message)
 
@@ -331,7 +351,10 @@ class _Config:
         if overrides is not None and name in overrides:
             value = overrides[name]
         else:
-            value = _G[name]
+            try:
+                value = _G[name]
+            except KeyError:
+                raise AttributeError(name) from None
         if type(value) is str and name in _LIST_KEYS:
             return (value,)
         return value
@@ -361,9 +384,23 @@ def _is_skipped(name: str) -> bool:
     return verdict
 
 
+_skip_var_cache: dict = {}
+
+
 def _is_skipped_variable(name: str) -> bool:
-    """Whether ``name`` matches an entry in SKIP_VARIABLES (glob-aware via fnmatch)."""
-    return bool(_cfg.SKIP_VARIABLES) and any(fnmatch(name, pattern) for pattern in _cfg.SKIP_VARIABLES)
+    """Whether ``name`` matches an entry in SKIP_VARIABLES (glob-aware via
+    fnmatch). Memoized like _is_skipped: it runs for every dict key and slot
+    converted while SKIP_VARIABLES is set."""
+    patterns = _cfg.SKIP_VARIABLES
+    if not patterns:
+        return False
+    key = (name, tuple(patterns))
+    verdict = _skip_var_cache.get(key)
+    if verdict is None:
+        if len(_skip_var_cache) >= _SKIP_CACHE_MAX:
+            _skip_var_cache.clear()
+        verdict = _skip_var_cache[key] = any(fnmatch(name, pattern) for pattern in patterns)
+    return verdict
 
 
 def _now_iso() -> str:
@@ -436,6 +473,11 @@ def _restart(node: dict) -> None:
 MIN_PCT = 0.0
 # Number of functions to list in the flat "hot spots" summary. 0 disables it.
 HOT_SPOTS = 15
+# Print the call tree + hot-spots table to stdout when a traced call ends.
+# Set False for services that trace every request and only read the written
+# (OUTPUT_DIR/OUTPUT_FILE) or sent (ENDPOINT_URL) traces: the report is then
+# not even built.
+PRINT_REPORT = True
 # When set, each traced call's raw tree is written as JSON into this directory,
 # one file per call — so repeated/concurrent traces don't clobber each other.
 # The filename is OUTPUT_FILE if set (user-chosen, ".json" appended if missing),
@@ -535,8 +577,13 @@ ENDPOINT_URL: str | None = None
 # Tags attached to every posted trace (e.g. ["prod", "search"]).
 TAGS: list = ["dev"]
 # Pre-shared key for collectors that require API-key auth on their ingestion
-# route (sent as the X-API-Key header on every POST to ENDPOINT_URL).
-API_KEY: str | None = "F-OZcYtZT0H_5FXT5qwm1-Ftaop5AKiVSFIbr_HGvs4"
+# route (sent as the X-API-Key header on every POST to ENDPOINT_URL). Never
+# built in: set it here or through the PERF_API_KEY environment variable.
+API_KEY: str | None = os.environ.get("PERF_API_KEY") or None
+# Seconds a POST to ENDPOINT_URL may take. An error trace is sent before the
+# failing call returns (see _send_trace), so this bounds how long a slow or
+# unreachable collector can hold up a failing call.
+SEND_TIMEOUT: float = 5.0
 # Auto-terminate a traced call that runs longer than this many seconds. The
 # async path cancels the coroutine (asyncio.wait_for); the sync path interrupts
 # via SIGALRM (Unix main thread only — a background thread is left to run and a
@@ -673,9 +720,10 @@ MAX_YIELDS_CAPTURE = 10
 # only the first N calls of each function (by node name) in a trace. Every
 # call still gets its node and timing, and exceptions are always recorded; a
 # call past the limit carries "capture_skipped": true instead. Capture is most
-# of a traced call's cost, so this bounds it for code called in a loop. None
-# captures every call.
-MAX_CAPTURES_PER_FUNCTION: int | None = None
+# of a traced call's cost -- on real libraries (jinja2, sqlparse, pygments)
+# capturing every call made traces 5-40x slower than this default -- so it is
+# bounded by default. None captures every call.
+MAX_CAPTURES_PER_FUNCTION: int | None = 20
 
 
 # Exact types _jsonable returns unchanged (when not budget-limited) -- lets the
@@ -1814,7 +1862,7 @@ def _exception_debug(exc: BaseException, _seen: frozenset = frozenset()) -> dict
     return debug
 
 
-def _record_exception(node: dict, exc: BaseException) -> None:
+def _record_exception(node: dict, exc: BaseException, full: bool = False) -> None:
     """Record, under ``node["exception"]``, the repr of an exception a call raised.
 
     No-op unless :data:`CAPTURE_IO` is on. Uses :func:`_safe_repr` so an
@@ -1837,20 +1885,36 @@ def _record_exception(node: dict, exc: BaseException) -> None:
     if _cfg.CAPTURE_IO:
         token = _capturing.set(_capturing.get() + 1)  # repr() of a user exception runs user code
         try:
-            _record_exception_fields(node, exc)
+            _record_exception_fields(node, exc, full)
         finally:
             _capturing.reset(token)
 
 
-def _record_exception_fields(node: dict, exc: BaseException) -> None:
+def _record_exception_fields(node: dict, exc: BaseException, full: bool = False) -> None:
+    """Describing an exception walks and formats its whole traceback, which
+    grows by a frame at every level it unwinds through: doing that at each
+    traced call on the way up costs O(depth^2) in time and output. So the
+    first node to record a given exception object gets the full description,
+    and every later one in the same trace reuses it (its origin is the same
+    frame, and its frames are where the exception actually came from). With
+    `full` (the trace root) it is described again from the top, so the root
+    still holds the complete outer-to-inner traceback."""
     start = perf_counter()
     node["exception"] = _safe_repr(exc)
-    origin = _exception_origin(exc)
+    state = _current_trace.get()
+    seen = state.last_exception if state is not None else None
+    if seen is not None and seen[0] is exc and not full:
+        _, origin, debug = seen
+    else:
+        origin = _exception_origin(exc)
+        # Interned: nodes sharing identical parts (frames, cause chain)
+        # store them once.
+        debug = _intern(_exception_debug(exc))
+        if state is not None:
+            state.last_exception = (exc, origin, debug)
     if origin is not None:
         node["exception_origin"] = origin
-    # Interned: ancestors the exception propagates through share every
-    # identical part (frames, cause chain) instead of repeating it.
-    node["exception_debug"] = _intern(_exception_debug(exc))
+    node["exception_debug"] = debug
     _add_capture_time(node, start)
 
 
@@ -1877,7 +1941,7 @@ def _is_project_module(module: Any) -> bool:
         True if functions/classes defined in this module should be wrapped.
     """
     name = getattr(module, "__name__", "")
-    if any(name.startswith(prefix) for prefix in _SKIP_MODULE_PREFIXES):
+    if name.startswith(_SKIP_MODULE_PREFIXES):
         return False
     filepath = getattr(module, "__file__", None)
     if filepath is None:
@@ -1885,13 +1949,26 @@ def _is_project_module(module: Any) -> bool:
     # C extensions can't be patched
     if filepath.endswith((".so", ".pyd", ".dylib")):
         return False
-    resolved = Path(filepath).resolve()
-    if not any(resolved.is_relative_to(venv) for venv in _VENV_PATHS):
+    if not _in_library_paths(filepath):
         return True  # your own code: always (SCAN_VENV only ADDS library code)
     if not _cfg.SCAN_VENV:
         return False
     prefixes = _cfg._SCAN_INCLUDE_PREFIXES
     return not prefixes or any(name == p or name.startswith(p + ".") for p in prefixes)
+
+
+_library_path_cache: dict = {}  # module __file__ -> whether it resolves under stdlib/site-packages
+
+
+def _in_library_paths(filepath: str) -> bool:
+    """Whether `filepath` lies under stdlib/site-packages (:data:`_VENV_PATHS`).
+    Resolved once per file: ``Path.resolve`` costs an lstat per path
+    component, and every trace start asks this for every loaded module."""
+    verdict = _library_path_cache.get(filepath)
+    if verdict is None:
+        resolved = Path(filepath).resolve()
+        verdict = _library_path_cache[filepath] = any(resolved.is_relative_to(venv) for venv in _VENV_PATHS)
+    return verdict
 
 
 def _is_project_class(cls: type) -> bool:
@@ -1991,6 +2068,7 @@ def _patch_module_functions(module: Any) -> None:
                 wrapped = _cache_wrap(attr, f"{_module_label(module.__name__)}.{name}")
                 _set_patched(module, name, wrapped, module.__name__)
                 _wrapped_originals[id(attr)] = (attr, wrapped)
+                _bump_wrap_generation()
             except (TypeError, AttributeError):
                 pass
             continue
@@ -2006,6 +2084,7 @@ def _patch_module_functions(module: Any) -> None:
             wrapped._perf_wrapped = True  # type: ignore
             _set_patched(module, name, wrapped, module.__name__)
             _wrapped_originals[id(attr)] = (attr, wrapped)
+            _bump_wrap_generation()
         except (TypeError, AttributeError):
             continue
 
@@ -2296,7 +2375,7 @@ def _gen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
                 done = rec.finish()
                 _record_exception(done, exc)
                 rec.state.complete(rec.node, done)
-                if suppress and _cfg.SUPPRESS_ERRORS and not isinstance(exc, TraceTimeout):
+                if suppress and _cfg.SUPPRESS_ERRORS and _suppressible(exc):
                     return None  # a failed generator just ends
                 raise
             finally:
@@ -2354,7 +2433,7 @@ def _agen_wrap(func: Any, name: str, suppress: bool = True) -> Any:
                 done = rec.finish()
                 _record_exception(done, exc)
                 rec.state.complete(rec.node, done)
-                if suppress and _cfg.SUPPRESS_ERRORS and not isinstance(exc, TraceTimeout):
+                if suppress and _cfg.SUPPRESS_ERRORS and _suppressible(exc):
                     return
                 raise
             finally:
@@ -2456,12 +2535,44 @@ def _patch_all_project_classes() -> None:
         _patch_all_project_classes_locked()
 
 
+# Every trace start walks the loaded project modules, but between traces
+# their namespaces rarely change. A module whose namespace still holds the
+# very same names bound to the very same objects as right after its last scan
+# (checked by identity, at C speed) has nothing new to patch, so it is
+# skipped. _wrap_generation counts additions to _wrapped_originals: while it
+# is unchanged, no module can have gained a re-exported binding to fix up.
+_module_scans: dict = {}  # module name -> (module, keys, values) after its last scan
+_wrap_generation = 0
+_scanned_generation = -1
+
+
+def _bump_wrap_generation() -> None:
+    global _wrap_generation
+    _wrap_generation += 1
+
+
+def _module_unchanged(module: Any) -> bool:
+    snap = _module_scans.get(module.__name__)
+    if snap is None or snap[0] is not module:
+        return False
+    try:
+        return bool(_same_items(vars(module), snap[1], snap[2]))
+    except RuntimeError:  # pure-Python check: the namespace changed while being compared
+        return False
+
+
+def _remember_scan(module: Any) -> None:
+    items = tuple(vars(module).items())  # one step: consistent even if another thread writes
+    _module_scans[module.__name__] = (module, tuple(k for k, _ in items), tuple(v for _, v in items))
+
+
 def _patch_all_project_classes_locked() -> None:
-    global _skip_classes_config
+    global _skip_classes_config, _scanned_generation
     config = (_cfg.SCAN_VENV, tuple(_cfg._SCAN_INCLUDE_PREFIXES))
     if config != _skip_classes_config:
         _skip_classes.clear()
         _expandable_cache.clear()
+        _module_scans.clear()
         if _skip_classes_config is not None:
             _unpatch_non_project()
             _events_config_changed()
@@ -2469,8 +2580,9 @@ def _patch_all_project_classes_locked() -> None:
     # list() snapshots sys.modules atomically: another thread may import
     # (and so grow sys.modules) while we're walking it.
     project_modules = [m for m in list(sys.modules.values()) if m is not None and _is_project_module(m)]
-    for module in project_modules:
-        _patch_module_functions(module)  # ← NEW
+    changed = [m for m in project_modules if not _module_unchanged(m)]
+    for module in changed:
+        _patch_module_functions(module)
         for attr_name in list(vars(module)):
             try:
                 attr = vars(module)[attr_name]
@@ -2480,17 +2592,24 @@ def _patch_all_project_classes_locked() -> None:
                 _patch_class(attr)
     # Second pass: fix up `from other import func` bindings now that every
     # defining module's own functions have been wrapped (see
-    # _patch_reexported_names).
-    for module in project_modules:
+    # _patch_reexported_names). Every module needs it when anything new was
+    # wrapped anywhere; otherwise only the ones that changed.
+    rescan = project_modules if _wrap_generation != _scanned_generation else changed
+    for module in rescan:
         _patch_reexported_names(module)
+    for module in rescan:
+        _remember_scan(module)
+    if len(_module_scans) > len(project_modules):  # unloaded modules: don't keep them alive
+        live = {m.__name__ for m in project_modules}
+        for name in [n for n in _module_scans if n not in live]:
+            del _module_scans[name]
+    _scanned_generation = _wrap_generation
 
 
 # ── sync / async node wrappers ────────────────────────────────────────────────
 
 
 def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -> Any:
-    _cover(func, name)
-    inner_code = _inner_code(func)
     """Wrap a synchronous callable so each call becomes a timed tree node.
 
     The returned wrapper: creates a node named ``name``, links it under the
@@ -2516,6 +2635,8 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
     Returns:
         A ``functools.wraps``-preserving wrapper with the same signature.
     """
+    _cover(func, name)
+    inner_code = _inner_code(func)
     default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
     param_names = _resolve_param_names(func)
 
@@ -2561,7 +2682,7 @@ def _sync_wrap(func: Any, name: str, extra: Any = None, suppress: bool = True) -
         except BaseException as exc:
             done = _completion(node)
             _record_exception(done, exc)
-            if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
+            if not (suppress and _cfg.SUPPRESS_ERRORS and _suppressible(exc)):
                 raise
             result = _default_return_unrecorded(default_factory)
             _record_output(done, result)
@@ -2593,7 +2714,7 @@ def _sync_failure(done: dict, exc: BaseException, suppress: bool, default_factor
     wrapper: record `exc` on `done`, then return :data:`_RERAISE` or (under
     SUPPRESS_ERRORS) the call's default return value."""
     _record_exception(done, exc)
-    if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
+    if not (suppress and _cfg.SUPPRESS_ERRORS and _suppressible(exc)):
         return _RERAISE
     result = _default_return_unrecorded(default_factory)
     _record_output(done, result)
@@ -2601,8 +2722,6 @@ def _sync_failure(done: dict, exc: BaseException, suppress: bool, default_factor
 
 
 def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
-    _cover(func, name)
-    inner_code = _inner_code(func)
     """Wrap a coroutine function so each awaited call becomes a timed tree node.
 
     Async analogue of :func:`_sync_wrap`: same node creation, input/output
@@ -2624,6 +2743,8 @@ def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
     Returns:
         A ``functools.wraps``-preserving async wrapper with the same signature.
     """
+    _cover(func, name)
+    inner_code = _inner_code(func)
     default_factory = _default_factory_for_annotation(_resolve_return_annotation(func))
     param_names = _resolve_param_names(func)
 
@@ -2666,7 +2787,7 @@ def _async_wrap(func: Any, name: str, suppress: bool = True) -> Any:
         except BaseException as exc:
             done = _completion(node)
             _record_exception(done, exc)
-            if not (suppress and _cfg.SUPPRESS_ERRORS) or isinstance(exc, TraceTimeout):
+            if not (suppress and _cfg.SUPPRESS_ERRORS and _suppressible(exc)):
                 state.complete(node, done)
                 raise
             result = _default_return_unrecorded(default_factory)
@@ -2886,7 +3007,7 @@ def _sync_timeout(seconds: float | None, name: str) -> Any:
             # __repr__, is raised into after ~3 s, so it can't hang forever.)
             deferrals += 1
             if not _timeout_pending:
-                _timeout_pending.append(message)
+                _timeout_pending.append((threading.get_ident(), message))
             signal.setitimer(signal.ITIMER_REAL, 0.01)
             return
         _timeout_pending.clear()
@@ -2925,12 +3046,14 @@ _CONFIG_KEYS = frozenset(
     {
         "MIN_PCT",
         "HOT_SPOTS",
+        "PRINT_REPORT",
         "OUTPUT_DIR",
         "OUTPUT_FILE",
         "LOG_FUNCTIONS",
         "ENDPOINT_URL",
         "TAGS",
         "API_KEY",
+        "SEND_TIMEOUT",
         "TIMEOUT",
         "SCAN_VENV",
         "CAPTURE_IO",
@@ -3054,8 +3177,8 @@ def trace(func: Any = None, **overrides: Any) -> Any:
     def _failed(root: dict, exc: BaseException) -> Any:
         if root["time"] is None:
             _finish_node(root)
-        _record_exception(root, exc)
-        if not _cfg.SUPPRESS_ERRORS or isinstance(exc, TraceTimeout):
+        _record_exception(root, exc, full=True)
+        if not (_cfg.SUPPRESS_ERRORS and _suppressible(exc)):
             raise  # called from an `except` block: re-raises `exc` unchanged
         result = _default_return_unrecorded(_default_factory)
         _record_output(root, result)
@@ -3081,7 +3204,17 @@ def trace(func: Any = None, **overrides: Any) -> Any:
                                 raise
                             raise TraceTimeout(f"{func.__qualname__} exceeded TIMEOUT of {_cfg.TIMEOUT:g}s") from exc
                     elif _cfg.TIMEOUT is not None:
-                        result = await asyncio.wait_for(func(*args, **kwargs), _cfg.TIMEOUT)
+                        # Python 3.10: no asyncio.timeout. wait_for's own expiry is
+                        # an asyncio.TimeoutError raised from the CancelledError it
+                        # cancelled the call with (on 3.10 not even a builtin
+                        # TimeoutError); a TimeoutError the program raised itself
+                        # has no such cause and propagates unchanged.
+                        try:
+                            result = await asyncio.wait_for(func(*args, **kwargs), _cfg.TIMEOUT)
+                        except asyncio.TimeoutError as exc:
+                            if not isinstance(exc.__cause__, asyncio.CancelledError):
+                                raise
+                            raise TraceTimeout(f"{func.__qualname__} exceeded TIMEOUT of {_cfg.TIMEOUT:g}s") from exc
                     else:
                         result = await func(*args, **kwargs)
                     _finish_node(root)
@@ -5032,6 +5165,10 @@ def print_tree(root: dict) -> None:
     Args:
         root: The root call-tree node, with ``time`` already filled in.
     """
+    if not _cfg.PRINT_REPORT:
+        _write_output(root)
+        _send_trace(root)
+        return
     lines: list[tuple[str, str, str, str, str]] = []
     total = root["time"] or 1
     threshold = total * _cfg.MIN_PCT
@@ -5127,6 +5264,7 @@ def print_tree(root: dict) -> None:
 
 
 _pending_sends: set = set()
+_EXIT_FLUSH_SECONDS = 10.0  # total wait at exit for in-flight background sends
 _pending_sends_lock = threading.Lock()
 
 
@@ -5145,8 +5283,13 @@ def _flush_pending_sends() -> None:
     """
     with _pending_sends_lock:
         threads = list(_pending_sends)
+    # One overall deadline, not one per thread: N stuck sends must not
+    # delay exit by N times the timeout.
+    from time import monotonic
+
+    deadline = monotonic() + _EXIT_FLUSH_SECONDS
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=max(deadline - monotonic(), 0.0))
 
 
 def _send_trace(root: dict) -> None:
@@ -5188,7 +5331,7 @@ def _send_trace(root: dict) -> None:
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
     # Resolved NOW, in the trace's context: the send may run on a background
     # thread after the trace (and its per-trace overrides) has ended.
-    url, api_key = _cfg.ENDPOINT_URL, _cfg.API_KEY
+    url, api_key, send_timeout = _cfg.ENDPOINT_URL, _cfg.API_KEY, _cfg.SEND_TIMEOUT
 
     def _post() -> None:
         headers = {"Content-Type": "application/json"}
@@ -5201,7 +5344,7 @@ def _send_trace(root: dict) -> None:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=send_timeout) as resp:
                 resp.read()
         except Exception as e:  # never let telemetry break the traced call
             print(f"[perf] failed to POST trace to {url}: {e}", file=sys.stderr)
@@ -5221,11 +5364,6 @@ def _send_trace(root: dict) -> None:
     with _pending_sends_lock:
         _pending_sends.add(t)
     t.start()
-
-
-# @trace
-# def a() -> None:
-#     print(1)
 
 
 _register_wrapper_codes()

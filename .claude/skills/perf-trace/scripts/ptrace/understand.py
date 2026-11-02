@@ -380,15 +380,17 @@ def cmd_advise(a):
         tips.append("for TIMING: re-run with CAPTURE_IO=False and TRACE_LOCALS=[] -- the numbers in this trace are inflated.")
         tips.append("capture-heaviest functions: " + ", ".join(f"{k} {fmt_t(v)} over {calls[k]} calls" for k, v in heavy if v))
         many = [(k, c) for k, c in calls.most_common(3) if c >= 200]
-        if many:
-            tips.append(f"or keep values but cap repeats: MAX_CAPTURES_PER_FUNCTION = 50  (top call counts: "
+        if many and not skipped:  # nothing was skipped: this trace captured every call
+            tips.append(f"or keep values but cap repeats: MAX_CAPTURES_PER_FUNCTION = 20 (the default since perf 0.12.0;"
+                        " this trace captured every call)  (top call counts: "
                         + ", ".join(f"{k} ×{c}" for k, c in many) + ")")
     if l_tot:
         lheavy = sorted(loc.items(), key=lambda kv: -kv[1])[:5]
         tips.append("TRACE_LOCALS cost by function: " + ", ".join(f"{k} {fmt_t(v)}" for k, v in lheavy if v)
                     + " -- narrow the pattern to the one function you are debugging.")
     if skipped:
-        tips.append(f"{skipped} calls were past MAX_CAPTURES_PER_FUNCTION (timed only): raise it if you need their values.")
+        tips.append(f"{skipped} calls were past MAX_CAPTURES_PER_FUNCTION (timed only; default 20 since perf 0.12.0):"
+                    " re-run with @perf.trace(MAX_CAPTURES_PER_FUNCTION=None) if you need their values.")
     for nid, name, k in dropped[:3]:
         tips.append(f"#{nid} {name} lost {k} locals entries past MAX_LOCALS_EVENTS: raise it, or trace a smaller input.")
     for kind, k in markers.items():

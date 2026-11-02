@@ -56,10 +56,18 @@ function where levels 1 and 2 stop explaining things.
   An argument the function mutates shows its state on entry.
 - `"<TypeName>"`, a repr cut at `MAX_DEPTH`, `capture_skipped` and `__spilled__` all mean
   the value wasn't captured in full. Say what's missing. Don't guess.
+- `capture_skipped` is normal since perf 0.12.0: only each function's first 20 calls keep
+  their values by default. If the failing or suspicious call is one of them, ask for (or
+  make) a re-run of the same input with `@perf.trace(MAX_CAPTURES_PER_FUNCTION=None)`
+  (see `capture.md`). Don't reason from a neighbouring call's values instead.
 - Project objects appear as `{"__type__": "Class", ...fields}`. Library objects appear as
   their repr (`<Session at 0x...>`): their state is not in the trace.
 - Exceptions on every ancestor that re-raised them share the same text. `errors` groups
   them by origin, so count origins, not nodes.
+- Since 0.12.0, the nodes an exception passes through on its way up share the innermost
+  node's `exception_debug` (its frames start where that node's traceback starts). The
+  trace root holds the complete outer-to-inner traceback. For the full path, read the
+  root's traceback, or the tree itself.
 - A trace is one execution. A bug that depends on timing (threads, tasks) may look
   different in the next trace: compare several with `vdiff`, `sdiff` or `group`.
 

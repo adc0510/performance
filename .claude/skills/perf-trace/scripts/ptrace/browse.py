@@ -203,6 +203,13 @@ def cmd_node(a):
                 print(f"    {f.get('file')}:{f.get('line')} {f.get('function')}: {f.get('text')}")
         elif frames:
             print(f"  {len(frames)} frames recorded (add --frames to list them)")
+        # perf >= 0.12.0: nodes an exception passes through on its way up share the
+        # innermost node's exception_debug (its frames start there, not here).
+        raw = n.get("exception_debug")
+        if raw is not None and n is not tr.root and any(
+                c.get("exception_debug") == raw for c in n.get("children") or []):
+            full = " -- the root #0 has the complete traceback" if tr.root.get("exception") == n["exception"] else ""
+            print(f"  (traceback shared with the call it came from: it starts at the innermost node that raised{full})")
         cause = dbg.get("caused_by")
         while cause:
             print(f"  caused by {short(cause.get('exception'), w)}")
