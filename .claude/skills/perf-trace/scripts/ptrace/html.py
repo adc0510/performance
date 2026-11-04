@@ -121,7 +121,9 @@ def cmd_html(a):
     size = out.stat().st_size
     print(f"wrote {out}  ({size / 1e6:.1f} MB, {len(tr.nodes)} calls, {len(data['fns'])} functions,"
           f" {fmt_t(data['meta']['total'])})")
-    print(f"open it in a browser: file://{out.resolve()}")
+    url = f"file://{out.resolve()}"
+    print(f"open it in a browser: {url}")
+    print(f"  views: {url}#graph (call graph) · #timeline · #flame · #fns (functions) · #n<ID> (one call)")
     if not a.no_values:
         print("note: the page holds every captured argument, result and local value of the trace;"
               " run `secrets` on the trace before sharing it, or rebuild with --no-values")

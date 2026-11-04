@@ -50,7 +50,8 @@ What each tab answers:
   a time axis, for where the time went.
 
 Handing it over: give the path, plus a link to each call you cite, as
-`<page>.html#n<ID>` (the same node ids as every other command). Large traces are fine:
+`<page>.html#n<ID>` (the same node ids as every other command). `#graph`, `#timeline`,
+`#flame` and `#fns` open the page on that view. Large traces are fine:
 47k calls make a 19 MB page that opens in about a second. The graph and timeline can be
 downloaded as SVG, with their legend, for docs and slides.
 

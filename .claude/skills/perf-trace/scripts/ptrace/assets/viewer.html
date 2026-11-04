@@ -2031,9 +2031,14 @@ addEventListener("keydown", e => {
   e.preventDefault();
 });
 
-// deep link: page.html#n123 opens call #123
+// deep links: page.html#n123 opens call #123; #graph, #timeline, #fns, #flame, #tree open that view
 const m = /^#n(\d+)$/.exec(location.hash);
 if (m && +m[1] < N) { reveal(+m[1]); select(+m[1], { noHash: true }); } else select(0, { noHash: true });
+const view = location.hash.slice(1);
+if (view === "graph" || view === "timeline") {
+  showTab("graph");
+  if (view === "timeline") document.querySelector('[data-gview="timeline"]').click();
+} else if (["fns", "flame", "tree"].includes(view)) showTab(view);
 </script>
 </body>
 </html>
