@@ -68,6 +68,7 @@ def _is_function(obj: Any) -> bool:
 
 __version__ = "0.12.0"
 __all__ = [
+    "Attachment",
     "TraceTimeout",
     "API_KEY",
     "CAPTURE_IO",
@@ -89,6 +90,9 @@ __all__ = [
     "SUPPRESS_ERRORS",
     "TAGS",
     "TIMEOUT",
+    "attach",
+    "attachments",
+    "enable_attach",
     "expand_locals",
     "fmt",
     "print_tree",
@@ -937,6 +941,12 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     return _jsonable_uncached(value, depth, _seen, _budget, _memo)
 
 
+def _marker(value: Any) -> str:
+    """Stand-in for a value with nothing to show but its type (default repr),
+    kept in its container's place: ``"<TypeName>"``, as for a whole argument."""
+    return f"<{type(value).__name__}>"
+
+
 def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list | None, _memo: dict) -> Any:
     """Containers and objects (see _jsonable)."""
     try:
@@ -956,8 +966,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
             fields = {"__type__": type(value).__name__}
             for field_name, field_value in zip(type(value)._fields, value):
                 jv = _jsonable(field_value, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    fields[field_name] = jv
+                fields[field_name] = _marker(field_value) if jv is _SKIP else jv
             return fields
         if isinstance(value, (dict, types.MappingProxyType)):
             seen = _seen | {id(value)}
@@ -985,8 +994,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    out[key] = jv
+                out[key] = _marker(v) if jv is _SKIP else jv
             return out
         if isinstance(value, (list, tuple, set, frozenset)):
             seen = _seen | {id(value)}
@@ -1005,8 +1013,9 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    out.append(jv)
+                # Keep a marker in the element's place: dropping it would
+                # shift every later index and change len() of the capture.
+                out.append(_marker(v) if jv is _SKIP else jv)
             return out
         # pydantic models, dataclasses, and other rich objects. exclude_none
         # drops fields that are unset (Optional[...] = None) rather than
@@ -1059,8 +1068,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 except AttributeError:
                     continue  # slot never assigned
                 jv = _jsonable(slot_value, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    fields[slot] = jv
+                fields[slot] = _marker(slot_value) if jv is _SKIP else jv
             if len(fields) > 1:
                 return fields
         if hasattr(value, "__dict__") and vars(value):
@@ -5364,6 +5372,513 @@ def _send_trace(root: dict) -> None:
     with _pending_sends_lock:
         _pending_sends.add(t)
     t.start()
+
+
+# ── live attach: trace calls in a process that is already running ────────────
+# `perf.attach("pkg.mod:Class.method")` starts tracing the next calls of a
+# function without restarting the program or editing its source. Rebinding
+# the name (like `mod.fn = perf.trace(mod.fn)`) would miss every caller that
+# took a reference before the attach: `from mod import fn`, registries,
+# callbacks, decorators' closures. Instead the function OBJECT stays where it
+# is and only its ``__code__`` is swapped for a small trampoline that hands
+# the call to perf; every reference to the function goes through it. The
+# trampoline calls a copy of the function that keeps the original code
+# (closure, defaults, globals), so the traced call runs exactly the original
+# code. Detaching swaps the original code back; calls already running are
+# unaffected either way (a running frame keeps the code it started with).
+#
+# Getting the attach call itself into a running process is the job of
+# `python -m perf attach <pid> <target>` (see perf/__main__.py): Python 3.14's
+# sys.remote_exec (PEP 768) needs nothing prepared in the target, and
+# `perf.enable_attach()` (a signal handler reading a request file) works on any
+# Python and needs no ptrace rights. Both hand the target a request that ends
+# up in _handle_attach_request.
+
+_attachments: dict = {}  # id(function) -> Attachment currently swapped into it
+_attachments_lock = threading.Lock()
+_ATTACH_HOOK = "__perf_attach_hook__"  # placeholder consts in the trampoline,
+_ATTACH_COPY = "__perf_attach_copy__"  # replaced by the real objects
+_ATTACH_INSIDE = "__perf_attach_inside__"
+_ATTACH_FILENAME = "<perf attach>"
+
+
+class Attachment:
+    """A live attach made by :func:`attach`: traces the next calls of one
+    function until its budget (``calls`` / ``seconds``) is used up or
+    :meth:`detach` is called.
+
+    Attributes:
+        target: the function object being traced.
+        name: its ``__qualname__`` (the root name of each trace).
+        traced: how many traced calls have started.
+        active: whether new calls are still being traced.
+        reason: why it stopped (``"calls"``, ``"seconds"``, ``"detached"``,
+            ``"error"``) once it has.
+    """
+
+    def __init__(self, fn: Any, calls: int | None, seconds: float | None, status_path: Any = None, request_id: str | None = None) -> None:
+        self.target = fn
+        self.name = fn.__qualname__
+        self.calls = calls
+        self.seconds = seconds
+        self.traced = 0
+        self.active = False
+        self.reason: str | None = None
+        self.request_id = request_id
+        self._status_path = status_path
+        self._running = 0
+        self._lock = threading.Lock()
+        self._finished = threading.Event()
+        self._timer: Any = None
+        self._original_code = fn.__code__
+        self._original_defaults = (fn.__defaults__, fn.__kwdefaults__)
+        self._original_signature = fn.__dict__.get("__signature__", _UNSET)
+        self._trampoline_code: Any = None
+        self._inside = ContextVar(f"perf_attach_inside_{id(self)}", default=False)
+
+    def __repr__(self) -> str:
+        state = "active" if self.active else f"stopped ({self.reason})"
+        return f"<perf.Attachment {self.name} traced={self.traced} {state}>"
+
+    def _take(self) -> bool:
+        """Claim a traced call: False when stopped, out of budget, or this is
+        a nested call (recursion) inside one of this attach's own traces --
+        that call is already part of the running trace."""
+        if self._inside.get():
+            return False
+        with self._lock:
+            if not self.active:
+                return False
+            self.traced += 1
+            self._running += 1
+            last = self.calls is not None and self.traced >= self.calls
+        if last:
+            self._stop("calls")
+        return True
+
+    def _release(self) -> None:
+        with self._lock:
+            self._running -= 1
+            done = not self.active and self._running == 0
+        if done:
+            self._finish()
+
+    def _stop(self, reason: str) -> None:
+        """Stop tracing new calls and put the original code back."""
+        with self._lock:
+            if not self.active:
+                return
+            self.active = False
+            self.reason = reason
+            done = self._running == 0
+        if self._timer is not None:
+            self._timer.cancel()
+        with _attachments_lock:
+            if _attachments.get(id(self.target)) is self:
+                del _attachments[id(self.target)]
+            if self.target.__code__ is self._trampoline_code:
+                self.target.__code__ = self._original_code
+                self.target.__defaults__, self.target.__kwdefaults__ = self._original_defaults
+                if self._original_signature is _UNSET:
+                    self.target.__dict__.pop("__signature__", None)
+                else:
+                    self.target.__signature__ = self._original_signature
+        if done:
+            self._finish()
+
+    def _finish(self) -> None:
+        if not self._finished.is_set():
+            self._finished.set()
+            self._write_status("done")
+
+    def _write_status(self, state: str, error: str | None = None) -> None:
+        if self._status_path is not None:
+            _write_attach_status(self._status_path, self.request_id, state, target=self.name, traced=self.traced, reason=self.reason, error=error)
+
+    def detach(self) -> None:
+        """Stop tracing new calls now; traced calls still running finish and
+        are written as usual."""
+        self._stop("detached")
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until stopped and every traced call has been written. Returns
+        False on timeout."""
+        return self._finished.wait(timeout)
+
+
+def _attach_resolve(target: Any) -> Any:
+    """The plain Python function a target names: a function object, or
+    ``"pkg.mod:Qual.name"`` / ``"pkg.mod.Qual.name"`` naming one in a module
+    this process has ALREADY imported (importing it fresh would create a
+    second copy the program never calls)."""
+    if isinstance(target, str):
+        if ":" in target:
+            module_name, _, qualname = target.partition(":")
+            module = sys.modules.get(module_name)
+            if module is None:
+                raise LookupError(f"perf.attach: module {module_name!r} is not imported in this process")
+        else:
+            parts = target.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                module = sys.modules.get(".".join(parts[:i]))
+                if module is not None:
+                    module_name, qualname = ".".join(parts[:i]), ".".join(parts[i:])
+                    break
+            else:
+                raise LookupError(f"perf.attach: no imported module in {target!r} (use 'module:Qual.name')")
+        obj: Any = module
+        for part in qualname.split("."):
+            try:
+                # Static on modules/classes (keeps staticmethod/classmethod
+                # objects); plain on anything else (e.g. a property's fget).
+                static = isinstance(obj, (type, types.ModuleType))
+                obj = inspect.getattr_static(obj, part) if static else getattr(obj, part)
+            except AttributeError:
+                raise LookupError(f"perf.attach: {module_name}:{qualname} not found ({part!r} missing)") from None
+        target = obj
+    if isinstance(target, (staticmethod, classmethod)) or inspect.ismethod(target):
+        target = target.__func__
+    if isinstance(target, property):
+        raise TypeError("perf.attach: a property; attach to its getter, e.g. 'mod:Class.prop.fget'")
+    # Through C / non-function decorators (lru_cache, partial objects) and
+    # perf's own node wrappers, down to the first plain Python function.
+    seen = 0
+    while not inspect.isfunction(target) or getattr(target, "_perf_node", False):
+        inner = getattr(target, "__wrapped__", None) or getattr(target, "func", None)
+        if inner is None or seen > 16:
+            raise TypeError(f"perf.attach: {target!r} is not a Python function")
+        target, seen = inner, seen + 1
+    if getattr(target, "_perf_wrapped", False):
+        raise ValueError(f"perf.attach: {target.__qualname__} is already traced with perf.trace")
+    if inspect.isgeneratorfunction(target) or inspect.isasyncgenfunction(target):
+        raise TypeError(f"perf.attach: {target.__qualname__} is a generator function; attach to the function that iterates it")
+    return target
+
+
+def _attach_copy(fn: Any) -> Any:
+    """A twin of `fn` running its original code, closure, defaults and globals."""
+    code = fn.__code__
+    copy = types.FunctionType(code, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+    copy.__kwdefaults__ = fn.__kwdefaults__
+    copy.__qualname__ = fn.__qualname__
+    copy.__module__ = fn.__module__
+    copy.__doc__ = fn.__doc__
+    copy.__dict__.update(fn.__dict__)
+    for attr in ("__annotations__", "__type_params__"):
+        try:
+            setattr(copy, attr, getattr(fn, attr))
+        except Exception:  # 3.14 lazy annotations that fail to evaluate, etc.
+            pass
+    return copy
+
+
+def _attach_trampoline(fn: Any, hook: Any, copy: Any, inside: Any) -> Any:
+    """Code for `fn` that calls ``hook(*args, **kwargs)`` -- or, for a nested
+    call inside one of the attach's own traces (``inside`` set: recursion),
+    ``copy`` directly, so each recursion level costs one extra frame, not
+    three. Same number of free variables as `fn`'s code (CPython requires it
+    to match the closure), async when `fn` is; the objects are baked into its
+    constants."""
+    code = fn.__code__
+    free = code.co_freevars
+    is_async = bool(code.co_flags & 0x80)  # CO_COROUTINE
+    mention = f"        if False: ({', '.join(free)},)\n" if free else ""
+    aw = "await " if is_async else ""
+    source = (
+        f"def __perf_outer__({', '.join(free)}):\n"
+        f"    {'async ' if is_async else ''}def {code.co_name}(*args, **kwargs):\n"
+        f"{mention}"
+        f"        if {_ATTACH_INSIDE!r}.get():\n"
+        f"            return {aw}{_ATTACH_COPY!r}(*args, **kwargs)\n"
+        f"        return {aw}{_ATTACH_HOOK!r}(*args, **kwargs)\n"
+        f"    return {code.co_name}\n"
+    )
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "'str' object is not callable"
+        module_code = compile(source, _ATTACH_FILENAME, "exec")
+    outer = next(c for c in module_code.co_consts if isinstance(c, types.CodeType))
+    inner = next(c for c in outer.co_consts if isinstance(c, types.CodeType))
+    objects = {_ATTACH_HOOK: hook, _ATTACH_COPY: copy, _ATTACH_INSIDE: inside}
+    consts = tuple(objects.get(c, c) if type(c) is str else c for c in inner.co_consts)
+    if any(type(c) is str and c in objects for c in consts) or not all(any(c is o for c in consts) for o in objects.values()):
+        raise RuntimeError("perf.attach: trampoline constants not substituted")
+    replace: dict = {"co_consts": consts}
+    if hasattr(inner, "co_qualname"):
+        replace["co_qualname"] = getattr(code, "co_qualname", code.co_name)
+    trampoline = inner.replace(**replace)
+    if trampoline.co_freevars != free:  # can't happen; checked so a swap never breaks the function
+        raise RuntimeError("perf.attach: trampoline free variables don't match")
+    return trampoline
+
+
+def attach(target: Any, *, calls: int | None = 1, seconds: float | None = None, **overrides: Any) -> "Attachment":
+    """Trace the next calls of a function in this (already running) process.
+
+    Unlike ``perf.trace(fn)``, nothing has to call a new wrapper: every caller
+    of the function -- including ones holding a reference taken long before
+    (``from mod import fn``, registries, callbacks) -- gets traced, because
+    the function object itself is switched over. Each traced call is written
+    as its own trace, as if the function had been decorated with
+    ``@perf.trace(**overrides)``.
+
+    Args:
+        target: the function, or ``"pkg.mod:Qual.name"`` (``"pkg.mod.func"``
+            also works) naming one in an already-imported module. Methods,
+            static/class methods and decorated functions (through
+            ``__wrapped__``) are accepted; generator functions are not.
+        calls: stop after this many traced calls (None: no limit).
+        seconds: stop after this long (None: no limit).
+        **overrides: per-trace config, like ``@perf.trace(...)``, checked
+            up front (a bad value raises here, not in the program's call).
+            ``TRACE_LOCALS=True`` is short for the attached function's own
+            locals.
+
+    Returns:
+        An :class:`Attachment`; ``.detach()`` stops early, ``.wait()`` blocks
+        until it has stopped and every trace has been written.
+    """
+    return _attach(target, calls=calls, seconds=seconds, overrides=overrides)
+
+
+def _check_attach_config(overrides: dict) -> None:
+    """Reject config values of the wrong shape NOW: with a decorator a bad
+    value fails at the first call, in the developer's face; in a live attach
+    that first call is the running program's, which must not pay for it."""
+    _check_overrides(overrides)
+    for key, value in overrides.items():
+        default = _G.get(key)
+        if key in _LIST_KEYS:
+            ok = isinstance(value, str) or (isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value))
+            want = "a string or a list of strings"
+        elif isinstance(default, bool):
+            ok, want = isinstance(value, bool), "True or False"
+        elif isinstance(default, (int, float)) and key != "DEFAULT_RETURN":
+            ok, want = isinstance(value, (int, float)) and not isinstance(value, bool), "a number"
+        elif key in ("OUTPUT_DIR", "OUTPUT_FILE", "ENDPOINT_URL", "API_KEY", "SPILL_DIR"):
+            ok, want = value is None or isinstance(value, str), "a string or None"
+        else:
+            ok, want = True, ""
+        if not ok:
+            raise TypeError(f"perf.attach: {key} must be {want}, got {value!r}")
+    with _apply_overrides(overrides):
+        try:
+            _redactor()
+        except re.error as e:
+            raise ValueError(f"perf.attach: invalid REDACT_PATTERNS entry: {e}") from None
+
+
+def _attach(target: Any, *, calls: Any, seconds: Any, overrides: dict, status_path: Any = None, request_id: Any = None) -> "Attachment":
+    if calls is not None and (isinstance(calls, bool) or not isinstance(calls, int) or calls < 1):
+        raise ValueError("perf.attach: calls must be an integer >= 1 (or None for no limit)")
+    if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0):
+        raise ValueError("perf.attach: seconds must be a positive number (or None for no limit)")
+    fn = _attach_resolve(target)
+    if overrides.get("TRACE_LOCALS") is True:  # shorthand: the attached function's own locals
+        overrides = {**overrides, "TRACE_LOCALS": [fn.__qualname__]}
+    # An attach observes a program that was running fine without perf: it
+    # must not start swallowing its exceptions or killing slow calls because
+    # of perf's global config. Opt in explicitly to get either.
+    overrides = {"SUPPRESS_ERRORS": False, "TIMEOUT": None, **overrides}
+    _check_attach_config(overrides)
+    copy = _attach_copy(fn)
+    wrapper = trace(copy, **overrides)
+    att = Attachment(fn, calls, seconds, status_path=status_path, request_id=request_id)
+
+    if fn.__code__.co_flags & 0x80:  # coroutine function
+
+        async def hook(*args: Any, **kwargs: Any) -> Any:
+            if not att._take():
+                return await copy(*args, **kwargs)
+            token = att._inside.set(True)
+            try:
+                return await wrapper(*args, **kwargs)
+            finally:
+                att._inside.reset(token)
+                att._release()
+
+    else:
+
+        def hook(*args: Any, **kwargs: Any) -> Any:
+            if not att._take():
+                return copy(*args, **kwargs)
+            token = att._inside.set(True)
+            try:
+                return wrapper(*args, **kwargs)
+            finally:
+                att._inside.reset(token)
+                att._release()
+
+    trampoline = _attach_trampoline(fn, hook, copy, att._inside)
+    try:
+        signature = fn.__dict__.get("__signature__") or inspect.signature(copy)
+    except Exception:
+        signature = None
+    att._trampoline_code = trampoline
+    _event_names[trampoline] = None  # no node of its own (it's perf's, not the program's)
+    with _attachments_lock:
+        current = _attachments.get(id(fn))
+        if current is not None and current.target is fn:
+            raise ValueError(f"perf.attach: {fn.__qualname__} is already attached (detach it first)")
+        _attachments[id(fn)] = att
+        att.active = True
+        # The function object's own defaults would apply to the trampoline's
+        # (*args, **kwargs) signature; the copy keeps them for the real code.
+        if signature is not None:  # what inspect.signature() shows while swapped
+            fn.__signature__ = signature
+        fn.__defaults__ = fn.__kwdefaults__ = None
+        fn.__code__ = trampoline
+    if seconds is not None:
+        att._timer = threading.Timer(seconds, att._stop, args=("seconds",))
+        att._timer.daemon = True
+        att._timer.start()
+    return att
+
+
+def attachments() -> list:
+    """The live :class:`Attachment` objects in this process."""
+    with _attachments_lock:
+        return list(_attachments.values())
+
+
+# ── attach requests: how `python -m perf attach` talks to a target ──────────
+# The CLI writes the request (target + budget + config) and the target answers
+# in a status file next to it, inside a per-user 0700 directory. The CLI
+# delivers the request by sys.remote_exec (3.14+) or, when the target called
+# enable_attach(), by a signal. Requests are JSON, never code.
+
+
+def _attach_dir(uid: int | None = None) -> Path:
+    import tempfile
+
+    if uid is None:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"perf-attach-{uid}"
+
+
+def _attach_dir_trusted(directory: Path) -> bool:
+    """Only this user (or root) can have written into it."""
+    if not hasattr(os, "getuid"):
+        return directory.is_dir()
+    try:
+        st = directory.stat()
+    except OSError:
+        return False
+    return st.st_uid in (os.getuid(), 0) and not st.st_mode & 0o022
+
+
+def _write_attach_status(path: Any, request_id: Any, state: str, **fields: Any) -> None:
+    try:
+        path = Path(path)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(_json.dumps({"id": request_id, "state": state, "pid": os.getpid(), **fields}))
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[perf] attach: failed to write status {path}: {e!r}", file=sys.stderr)
+
+
+def _handle_attach_request(path: Any) -> None:
+    """Act on one request file (attach / detach); never raises."""
+    path = Path(path)
+    status = path.with_name(f"{os.getpid()}.status.json")
+    request_id = None
+    if not path.exists():
+        return  # withdrawn by the CLI (it gave up waiting), or already handled
+    try:
+        if not _attach_dir_trusted(path.parent):
+            raise PermissionError(f"{path.parent} is not private to this user")
+        request = _json.loads(path.read_text())
+        request_id = request.get("id")
+        if isinstance(request_id, str) and request_id.isalnum():
+            status = path.with_name(f"{os.getpid()}.{request_id}.status.json")
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        action = request.get("action", "attach")
+        if action == "detach":
+            names = request.get("target")
+            stopped = []
+            for att in attachments():
+                if names is None or att.name == names or att.target is _safe_resolve(names):
+                    att.detach()
+                    stopped.append(att.name)
+            _write_attach_status(status, request_id, "detached", stopped=stopped)
+            return
+        att = _attach(
+            request["target"],
+            calls=request.get("calls"),
+            seconds=request.get("seconds"),
+            overrides=request.get("config") or {},
+            status_path=status,
+            request_id=request_id,
+        )
+        _write_attach_status(status, request_id, "attached", target=att.name, calls=att.calls, seconds=att.seconds)
+        print(f"[perf] attached to {att.name} (pid {os.getpid()})", file=sys.stderr)
+    except BaseException as e:  # a bad request must never take the program down
+        _write_attach_status(status, request_id, "error", error=f"{type(e).__name__}: {e}")
+
+
+def _safe_resolve(target: Any) -> Any:
+    try:
+        return _attach_resolve(target)
+    except Exception:
+        return None
+
+
+_attach_signal: Any = None
+
+
+def _process_start(pid: int) -> Any:
+    """Kernel start time of `pid` (Linux; None elsewhere)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def enable_attach(sig: Any = None) -> None:
+    """Let ``python -m perf attach <pid> ...`` attach to this process later.
+
+    Call it once at startup. It installs a handler for ``sig`` (default
+    ``SIGUSR1``) that reads the attach request the CLI left in a private
+    per-user directory; until then it costs nothing. Needed on Python < 3.14,
+    or when ptrace is restricted (``sys.remote_exec`` needs ptrace rights);
+    on 3.14+ the CLI can attach without it. Must be called from the main
+    thread (a Python signal-handler rule). POSIX only.
+    """
+    global _attach_signal
+    if sig is None:
+        sig = getattr(signal, "SIGUSR1", None)
+        if sig is None:
+            raise OSError("perf.enable_attach: no SIGUSR1 on this platform")
+    directory = _attach_dir()
+    directory.mkdir(mode=0o700, exist_ok=True)
+    pid = os.getpid()
+    marker = directory / f"{pid}.listening"
+
+    def _on_signal(signum: int, frame: Any) -> None:
+        # One file per request (<pid>.<id>.request.json): two CLIs asking at
+        # once must not overwrite each other; a signal may stand for both.
+        for request in sorted(directory.glob(f"{pid}.*.request.json")):
+            _handle_attach_request(request)
+
+    signal.signal(sig, _on_signal)
+    # The start time lets the CLI tell this process from a later one that
+    # reuses the pid after we die without running atexit (SIGKILL/SIGTERM):
+    # sending SIGUSR1 to a process that doesn't handle it would kill it.
+    marker.write_text(_json.dumps({"signal": int(sig), "start": _process_start(os.getpid())}))
+    _attach_signal = sig
+
+    def _cleanup() -> None:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    atexit.register(_cleanup)
 
 
 _register_wrapper_codes()

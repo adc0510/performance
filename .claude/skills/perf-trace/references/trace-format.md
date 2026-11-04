@@ -63,7 +63,9 @@ Calls made by perf itself while capturing (a `__repr__`, a property read) are ne
   `"<Whitespace ' ' at 0x7F...>"`, or `"<TypeName>"` when the repr is the default
   `<x.Y object at 0x...>`. Their internals are deliberately not walked.
 - `"<TypeName>"` as a whole arg/result: value dropped -- default repr only, or larger than
-  `MAX_SIZE_CAPTURE`. Absence of detail is NOT evidence the value was empty.
+  `MAX_SIZE_CAPTURE`. Absence of detail is NOT evidence the value was empty. Inside a list,
+  tuple, dict or object field the marker keeps the element's place, so lengths and indices
+  are the real ones (traces from perf before this fix dropped such elements silently).
 - `{"__spilled__": path, "size": N}` -- oversize value written to its own file in SPILL_DIR.
 - `{"__class__": "pkg.Cls"}` -- a class object. `{"__type__": "function", "qualname", "module"}` -- a function.
 - `{"__functions__": [names]}` -- a dict holding only functions (a registry).

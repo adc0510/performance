@@ -68,6 +68,29 @@ grep -qx 'perf_driver.py' .git/info/exclude || echo 'perf_driver.py' >> .git/inf
 Check with `git status --short`: neither may appear. Traces hold real data, so run
 `secrets` before sharing one.
 
+## The app is already running: attach instead of restarting
+
+When the problem shows up in a long-running process (a server, a worker that has
+been up for hours) and restarting would lose the state, attach to that process
+instead of writing a driver:
+
+```bash
+python -m perf attach <pid> app.pipeline:Pipeline.handle --out perf_traces   # next call
+python -m perf attach <pid> app.pipeline:process --calls 5 --set TRACE_LOCALS=True
+```
+
+- `perf` must be importable by the target: installed in its venv (step 1 above), or
+  run the CLI from that venv. On Python 3.14 the CLI imports it into the target itself.
+- Python 3.14 target: works as is via `sys.remote_exec`, but needs ptrace rights
+  (`sudo` with the usual `ptrace_scope=1`). Run the CLI with the same Python version.
+  Otherwise, or below 3.14, the app must have called `perf.enable_attach()` at startup.
+  Ask the user before adding that line.
+- It traces only calls that **start** after the attach, from every caller. It stops
+  after `--calls` (default 1) or `--seconds`, or on Ctrl-C. Then the function is back
+  to its original code.
+- Traces land in `--out`, written by the target process. Read them like any other
+  trace.
+
 ## Settings
 
 Settings are module attributes set before the call (`perf.TRACE_LOCALS = [...]`) or

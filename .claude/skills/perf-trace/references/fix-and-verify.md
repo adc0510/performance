@@ -47,6 +47,51 @@ behaviour, so it passes as long as that behaviour still holds. Edit the expected
 to what it **should** be, so the test fails for the bug → fix → the test passes. Keep the
 test.
 
+## Replay one call on its own
+
+```bash
+python3 <skill-dir>/scripts/perf_trace.py replay TRACE ID --root SRC                    # rerun it, compare
+python3 <skill-dir>/scripts/perf_trace.py replay TRACE ID --root SRC --mock children    # it alone, every callee faked
+python3 <skill-dir>/scripts/perf_trace.py replay TRACE ID --root SRC --locals           # + a new trace with its locals
+python3 <skill-dir>/scripts/perf_trace.py replay TRACE ID --root SRC --pdb              # debugger on its first line
+python3 <skill-dir>/scripts/perf_trace.py replay TRACE ID --root SRC -o replay_x.py --no-run   # keep the script, edit args
+```
+
+`replay` runs ONE captured call again, right now, without the rest of the program: no
+server, no request, no test framework. The arguments are rebuilt the same way as for
+`to-test`, it runs with the project's Python (`--python`, default `SRC/.venv/bin/python`)
+from `SRC`, and it compares the outcome with the recording:
+
+- `SAME as recorded` (exit 0) / `DIFFERENT from recorded` (exit 1, with the first
+  difference: `result['total']: recorded 43.63, now 65.45`) / nothing recorded to compare
+  (exit 2). An exception counts as the same when its class matches and the recorded
+  message is part of the new one.
+- **Fakes.** `--mock leaves` (default) fakes the call's direct callees that call nothing
+  traced themselves (DB, HTTP, LLM wrappers, usually); `children` fakes every direct
+  callee, so only the function's own lines run; `none` runs everything for real.
+  `--keep NAME` exempts a callee. Each fake answers the recorded calls in order, and is
+  patched everywhere the function is referenced (`from x import fn` copies too).
+- **`DIVERGED: fetch_price call 1: args[0]: recorded 'A', now 'a'`**: a fake was called
+  with different arguments than in the recording, or more/fewer times (`called 2x <-
+  recorded 1`). That is the first point where the replay took another path, often more
+  telling than the result itself.
+- **Not rebuilt.** An argument perf kept only as a repr (`<Connection>`) is passed as a
+  placeholder that fails loudly the moment the function uses it, naming the value; a
+  `warning:` lists them up front. Edit the script (`-o`) to pass a real one. Callees that
+  are generators, context managers, properties, nested functions or defined in a script
+  run for real (`not faked:` says which).
+- **Refused:** calls that never finished (cut off by `TIMEOUT` or still running), calls
+  with no captured arguments, generator / context-manager functions (use `to-test`), and
+  functions defined in a script that runs code when imported (replaying would run the
+  program).
+- Everything `to-test` can't reproduce applies here too (state outside the arguments,
+  `SKIP_VARIABLES`, tuples captured as lists).
+
+Use it to: see inside a call that had no `TRACE_LOCALS` (`--locals`, then `lines` on the
+new trace), step through it (`--pdb`: interactive, so the user runs it in their
+terminal), or check a fix on the exact input that failed: after the change, the bad call's
+replay should say `DIFFERENT` in the intended way and the good calls `SAME`.
+
 ## Golden master over many calls
 
 ```bash
