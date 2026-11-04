@@ -1,5 +1,6 @@
 ---
 name: perf-trace
+argument-hint: "[help|summary|slow|debug|errors|draw-diagram|sequence|explain|test|compare|share|setup|advise] [trace] [details]"
 description: Debug, fix and optimize Python code using perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. A trace records every project call with timing, arguments at entry, results, exceptions (including swallowed ones) and, under TRACE_LOCALS, every local variable line by line. Use it to find why a request or job is slow (critical path, N+1 calls, serialized awaits, duplicate work, cache misses, perf's own overhead), where a wrong value or exception really came from, what a function received and held, to generate a regression test from a captured call, to compare runs before/after a fix, to map which code a request actually runs, and to export a trace as an interactive offline HTML page (call tree, call graph with timeline, flame) for a person to explore or share. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain, test or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
 ---
 
@@ -20,6 +21,36 @@ targeted questions:
 python3 <skill-dir>/scripts/perf_trace.py <command> ...   # stdlib only, python3.9+
 python3 <skill-dir>/scripts/perf_trace.py --help          # every command, grouped by task
 ```
+
+## Options (`/perf-trace <option> ...`)
+
+When the user types `/perf-trace` with words after it, they reach you as `ARGUMENTS:` at
+the end of this file. The first word picks the task below; the rest is the trace and
+details. With no arguments, work out the task from the conversation as usual. If the
+first word is not an option, treat all of it as the request in plain words.
+
+**Which trace:** a path or uuid among the arguments wins. Otherwise use the newest file
+from `ls` on `perf_traces/` (or `perf.OUTPUT_DIR`), and say which one you picked. If
+there is none, offer `setup`.
+
+| option | what to do |
+|---|---|
+| `help` | List these options with one line each, and the trace you would use by default. Run nothing else. |
+| `summary [trace]` | Core workflow step 2: `summary`, then report the totals, perf's recording share, exceptions and unfinished calls. |
+| `slow [trace] [function]` | Optimize: follow `references/optimize.md`, scoped to the function if given (`find`, then `critical-path --id`). |
+| `debug [trace] <what's wrong>` | Debug: follow `references/debug.md` with the user's description as the symptom. |
+| `errors [trace]` | `errors` (and `exc-flow`, `retries` when they apply): each exception's origin, fate and cause, swallowed ones included. |
+| `draw-diagram [trace] [graph\|timeline\|flame\|tree\|sequence]` | Write the page with `html` and give the link to the view asked for (default `#graph`), plus `#n<ID>` links to the calls worth looking at first. `sequence` writes the Mermaid diagram with `sequence` instead. State the page's limits (`references/understand.md`). |
+| `sequence [trace] [function]` | Mermaid sequence diagram with `sequence` (`--id` of the function's slowest call if given). |
+| `explain [trace] [function]` | Understand: follow `references/understand.md` (`touched`, `types`, `tree`, `path`) and explain what the run does, in order, citing node ids. |
+| `test [trace] <id or function>` | Regression test: `to-test` for a call id, `snapshot --fn` for a function (`references/fix-and-verify.md`). |
+| `compare <trace A> <trace B>` | Before/after: `diff`, `sdiff` and `vdiff`, and say what changed and by how much. |
+| `share [trace]` | Before sharing: `secrets`; if anything is found, also write `html --no-values` and recommend it over the full page. |
+| `setup` | No traces yet: follow "No traces yet" in `references/capture.md` for the current repo. |
+| `advise [trace]` | `advise`: what capture cost and what was cut, and the settings for the next trace. |
+
+Every option still follows the rules below: cite node ids, account for the whole picture,
+and say what the trace could not show.
 
 ## When to use it
 
