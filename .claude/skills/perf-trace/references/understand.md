@@ -41,7 +41,11 @@ What each tab answers:
   where their chains meet.
 - **Call graph**, *Timeline* view: the same functions as rows on a time axis, with a
   bar wherever each one was running and a red tick where it raised. This shows the
-  phases of the run and what overlapped.
+  phases of the run and what overlapped. To look at something too short to see, zoom
+  in: drag across the time axis or the overview strip (a small copy of every lane) to
+  pick a range, use the + / − buttons or keys, or double-click a function's name to
+  jump to its slowest call (again for the next slowest). Zoom goes to ×10,000,000, and
+  zoomed-in ticks count from the window's left edge.
 - **Functions**: per-function totals with callers and callees. **Flame**: every call on
   a time axis, for where the time went.
 

@@ -222,6 +222,7 @@ pre { background: var(--code); border: 1px solid var(--soft); border-radius: 6px
 .lg .l-aux { stroke: var(--key); stroke-dasharray: 0.5 5; stroke-linecap: round; }
 .lg rect.box { fill: var(--bg); stroke: var(--line); }
 .lg rect.err-tick { fill: var(--err); }
+.lg rect.lg-win { fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: var(--accent); stroke-width: 1.5; }
 .lg rect.callerbox { fill: var(--bg); stroke: var(--key); stroke-width: 2.5; }
 .lg rect.calleebox { fill: var(--bg); stroke: var(--ok); stroke-width: 2.5; }
 .seg { display: inline-flex; }
@@ -230,7 +231,15 @@ pre { background: var(--code); border: 1px solid var(--soft); border-radius: 6px
 .seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
 #tl-stage { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #tl-stage[hidden] { display: none; }
-#tl-head { display: block; flex: none; height: 30px; width: 100%; border-bottom: 1px solid var(--line); }
+#tl-head { display: block; flex: none; height: 30px; width: 100%; border-bottom: 1px solid var(--line); cursor: crosshair; }
+#tl-ov { display: block; flex: none; height: 46px; width: 100%; border-bottom: 1px solid var(--line); cursor: crosshair; }
+#tl-zoom { color: var(--muted); }
+#tl-zoom[hidden] { display: none; }
+.tl-ov-bg { fill: var(--hover); }
+.tl-ov-d { fill: var(--muted); opacity: .5; }
+.tl-ov-label { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.tl-win { fill: color-mix(in srgb, var(--accent) 16%, transparent); stroke: var(--accent); stroke-width: 1.5; cursor: grab; }
+.tl-brush { fill: color-mix(in srgb, var(--accent) 22%, transparent); stroke: var(--accent); stroke-dasharray: 3 2; pointer-events: none; }
 #tl-body { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; cursor: grab; }
 #tl-body.dragging { cursor: grabbing; }
 #tl-svg { display: block; width: 100%; }
@@ -277,7 +286,9 @@ pre { background: var(--code); border: 1px solid var(--soft); border-radius: 6px
         <span class="seg"><button data-gview="graph" class="on">Graph</button><button data-gview="timeline">Timeline</button></span>
         <label>Functions shown <input id="graph-top" type="range" min="2" step="1"> <output id="graph-top-out"></output></label>
         <label id="graph-all-l"><input id="graph-all" type="checkbox"> All callers</label>
+        <span class="seg"><button id="g-zout" title="zoom out (−)">−</button><button id="g-zin" title="zoom in (+)">+</button></span>
         <button id="graph-fit">Fit</button>
+        <span id="tl-zoom" class="mono" hidden></span>
         <button id="graph-svg-dl">Download SVG</button>
         <button id="graph-legend-btn" class="on">Legend</button>
         <button id="link-btn" title="Find how two functions are connected">Find link</button>
@@ -296,6 +307,7 @@ pre { background: var(--code); border: 1px solid var(--soft); border-radius: 6px
       <div id="graph-legend"><div class="lg-head">Legend <span class="link" id="graph-legend-x">hide</span></div><div id="graph-legend-body"></div></div>
       <div id="tl-stage" hidden>
         <svg id="tl-head" xmlns="http://www.w3.org/2000/svg"></svg>
+        <svg id="tl-ov" xmlns="http://www.w3.org/2000/svg"></svg>
         <div id="tl-body"><svg id="tl-svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
       </div>
     </div>
@@ -1358,6 +1370,13 @@ gStage.addEventListener("mousedown", ev => {
   addEventListener("mousemove", move); addEventListener("mouseup", up);
 });
 document.getElementById("graph-fit").onclick = graphFit;
+function graphZoomBy(f) {   // the graph view: zoom around the middle of the stage
+  const r = gStage.getBoundingClientRect(), mx = r.width / 2, my = r.height / 2;
+  const k = Math.min(4, Math.max(0.08, gCam.k / f));
+  gCam.x = mx - (mx - gCam.x) * k / gCam.k; gCam.y = my - (my - gCam.y) * k / gCam.k; gCam.k = k; gApply();
+}
+document.getElementById("g-zin").onclick = () => gViewMode === "timeline" ? tlZoomBy(0.5) : graphZoomBy(0.8);
+document.getElementById("g-zout").onclick = () => gViewMode === "timeline" ? tlZoomBy(2) : graphZoomBy(1.25);
 document.getElementById("graph-all").onchange = ev => gView.classList.toggle("all", ev.target.checked);
 addEventListener("resize", graphResize);
 
@@ -1422,7 +1441,7 @@ const TL = { LW: 330, RH: 22, v0: 0, v1: TOTAL || 1e-9 };
 const tlIndent = depth => 10 + Math.min(depth, 10) * 8;   // capped so deep rows keep room for their names
 const HINTS = {
   graph: "each function sits under the caller that spends the most time in it · hover a box to preview its flow, click it to pin the whole flow through it (everything upstream and downstream) and open its details · click again, empty space or Esc to clear · drag to pan, scroll to zoom",
-  timeline: "hover a bar for the call running then, click it for its details, double-click to zoom to it · drag to pan, Ctrl/⌘ + scroll to zoom time · click a name for the function",
+  timeline: "zoom: drag across the time axis or the overview strip to pick a range, scroll on them, + / − buttons or keys, Ctrl/⌘ + scroll anywhere, double-click a bar to zoom to that call, a name to zoom to its slowest call (again: the next slowest) · pan: drag the lanes or the overview box, Shift + scroll, ← / → · 0 or Fit = whole run · hover a bar for its call, click it for details",
 };
 // legend, drawn as SVG so the same drawing goes into "Download SVG"
 function legendSvg(mode) {
@@ -1478,6 +1497,9 @@ function legendSvg(mode) {
     svgEl("rect", { x: 22, y: y + 1, width: 2, height: 15, class: "err-tick" }, out);
     svgText(out, 60, y + 12, "raised an exception here");
     y += RH;
+    svgEl("rect", { x: 2, y: y + 2, width: 46, height: 13, rx: 3, class: "lg-win" }, out);
+    svgText(out, 60, y + 12, "overview box: the part of the run on screen");
+    y += RH;
     svgText(out, 2, y + 12, "indented", "mono");
     svgText(out, 60, y + 12, "called from the row above it (its main caller)");
     y += RH;
@@ -1493,6 +1515,7 @@ function drawGraphView() {
   document.getElementById("graph-legend-body").replaceChildren(legendSvg(gViewMode));
   document.getElementById("graph-hint").textContent = HINTS[gViewMode];
   document.getElementById("graph-all-l").hidden = gViewMode !== "graph";
+  document.getElementById("tl-zoom").hidden = gViewMode !== "timeline";
   gStage.hidden = gViewMode !== "graph";
   tlStage.hidden = gViewMode !== "timeline";
   if (gViewMode === "graph") drawGraph(); else drawTimeline();
@@ -1524,16 +1547,21 @@ function drawTimeline() {
   tlSvg.setAttribute("height", rows.length * RH + 8);
   tlSvg.setAttribute("viewBox", `0 0 ${W} ${rows.length * RH + 8}`);
   tlHead.setAttribute("viewBox", `0 0 ${W} 30`);
+  drawOverview(W, LW, TW);
+  tlZoomInfo();
 
   // time axis + grid
   const ax = svgEl("g", { class: "tl-axis" }, tlHead);
-  svgText(ax, 10, 19, "function  (" + fmtT(TL.v0) + " → " + fmtT(TL.v1) + ")", "", "start");
+  // zoomed in, ticks count from the window's left edge, so they stay readable at any depth
+  const zoomed = TOTAL / span > 1.05;
+  svgText(ax, 10, 19, zoomed ? "ticks from +" + fmtAbs(TL.v0) : "function  (whole run)", "", "start");
   const step = niceStep(span, Math.max(2, Math.floor(TW / 110)));
   const grid = svgEl("g", {}, tlSvg);
-  for (let t = Math.ceil(TL.v0 / step) * step; t <= TL.v1 + 1e-12; t += step) {
+  const first = zoomed ? TL.v0 : Math.ceil(TL.v0 / step) * step;
+  for (let t = first, k = 0; t <= TL.v1 + span * 1e-9 && k < 400; t = first + ++k * step) {
     const x = X(t);
     svgEl("line", { x1: x, y1: 22, x2: x, y2: 30 }, ax);
-    svgText(ax, x, 17, "+" + fmtT(t), "", "middle");
+    if (!zoomed || k) svgText(ax, x, 17, "+" + fmtT(zoomed ? k * step : t), "", "middle");
     svgEl("line", { x1: x, y1: 0, x2: x, y2: rows.length * RH + 8, class: "tl-grid" }, grid);
   }
   svgEl("line", { x1: LW - 6, y1: 0, x2: LW - 6, y2: rows.length * RH + 8, class: "tl-split" }, tlSvg);
@@ -1545,6 +1573,7 @@ function drawTimeline() {
     svgEl("rect", { class: "bg", x: 0, y, width: W, height: RH }, g);
     const name = svgText(g, tlIndent(depth), y + 15, clipText(fnLabel(fi), LW - 60 - tlIndent(depth), 7.2), "t");
     name.addEventListener("click", ev => { ev.stopPropagation(); renderFnDetail(fi); });
+    name.addEventListener("dblclick", ev => { ev.stopPropagation(); tlZoomToFunction(fi); });
     svgText(g, LW - 12, y + 15, fmtT(s.cumul), "s", "end");
     // bars: the union of this function's calls, merged when closer than a pixel
     const color = groupColor(fnGroup(fi));
@@ -1598,7 +1627,7 @@ tlBody.addEventListener("mousemove", ev => {
   }
   tlGuide = svgEl("line", { class: "tl-guide", x1: h.x, y1: 0, x2: h.x, y2: tlSvg.getAttribute("height") }, tlSvg);
   svgEl("line", { class: "tl-guide", x1: h.x, y1: 0, x2: h.x, y2: 30 }, tlHead);
-  svgText(tlHead, h.x + 4, 28, "+" + fmtT(Math.max(0, h.t)), "tl-guide-t");
+  svgText(tlHead, h.x + 4, 28, "+" + fmtAbs(Math.max(0, h.t)), "tl-guide-t");
   if (h.call < 0) { tip.style.display = "none"; return; }
   const c = h.call;
   graphTip(ev, [["mono", D.fns[D.f[c]] + "  #" + c],
@@ -1615,13 +1644,11 @@ tlBody.addEventListener("dblclick", ev => {
 });
 // zoom time with Ctrl/⌘ + scroll (and trackpad pinch); plain scroll moves through the rows
 tlBody.addEventListener("wheel", ev => {
-  if (!ev.ctrlKey && !ev.metaKey) return;
+  if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); tlZoomBy(Math.exp(ev.deltaY * 0.002), tlHit(ev).t); return; }
+  const side = ev.shiftKey ? ev.deltaY || ev.deltaX : (Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : 0);
+  if (!side) return;   // plain vertical scroll: move through the rows
   ev.preventDefault();
-  const h = tlHit(ev), f = Math.exp(ev.deltaY * 0.002);
-  const span = Math.min(TOTAL, Math.max((TL.v1 - TL.v0) * f, TOTAL * 1e-7, 1e-9));
-  const at = Math.min(Math.max(h.t, TL.v0), TL.v1), ratio = (at - TL.v0) / (TL.v1 - TL.v0);
-  TL.v0 = Math.max(0, at - ratio * span); TL.v1 = Math.min(TOTAL, TL.v0 + span); TL.v0 = Math.max(0, TL.v1 - span);
-  tlRedraw();
+  tlPanBy(side / Math.max(50, tlBody.clientWidth - TL.LW - 12));
 }, { passive: false });
 let tlMoved = false;
 tlBody.addEventListener("mousedown", ev => {
@@ -1816,6 +1843,139 @@ function renderLinkPanel() {
 }
 function labelShort(fi) { return fnLabel(fi); }
 
+
+// ── timeline zoom: one window [v0, v1] on the run, changed by buttons, keys, wheel, brush, overview
+const tlOv = document.getElementById("tl-ov");
+const TL_MIN = () => Math.max(TOTAL * 1e-7, 1e-9);   // narrowest window: ~10 million× zoom
+const TL_OVH = 46;   // overview strip height
+function tlSetWindow(v0, v1) {
+  let span = Math.min(Math.max(v1 - v0, TL_MIN()), TOTAL || 1e-9);
+  let a = Math.min(Math.max(0, v0), Math.max(0, TOTAL - span));
+  TL.v0 = a; TL.v1 = a + span;
+  tlRedraw();
+}
+function tlZoomBy(f, at) {   // f < 1 zooms in, around time `at` (default: the middle)
+  const span = TL.v1 - TL.v0;
+  if (at === undefined || !isFinite(at)) at = (TL.v0 + TL.v1) / 2;
+  at = Math.min(Math.max(at, TL.v0), TL.v1);
+  const ratio = (at - TL.v0) / span, ns = span * f;
+  tlSetWindow(at - ratio * ns, at - ratio * ns + ns);
+}
+function tlPanBy(fraction) { const span = TL.v1 - TL.v0; tlSetWindow(TL.v0 + fraction * span, TL.v1 + fraction * span); }
+// double-click a name: zoom to that function's slowest call; again for the next slowest, and so on
+const tlStep = new Map();   // function -> index into its calls, slowest first
+function tlZoomToFunction(fi) {
+  const order = callsOf[fi].slice().sort((x, y) => tEff(y) - tEff(x));
+  const k = tlStep.has(fi) ? (tlStep.get(fi) + 1) % order.length : 0;
+  tlStep.set(fi, k);
+  const c = order[k], a = D.s[c], b = a + tEff(c), pad = (b - a) * 0.15 || TL_MIN();
+  tlSetWindow(a - pad, b + pad);
+  select(c);   // its details on the right
+  document.getElementById("tl-zoom").title = D.fns[fi] + ": call " + (k + 1) + " of " + order.length + " (slowest first)";
+  tlStepNote = D.fns[fi].split(".").pop() + " call " + (k + 1) + "/" + order.length;
+}
+let tlStepNote = "";
+// a time since the start, with as many digits as the current zoom can tell apart
+function fmtAbs(t) {
+  const res = (TL.v1 - TL.v0) / 1000;
+  if (res >= 0.01 || t < 1) return fmtT(t);
+  return t.toFixed(Math.min(9, Math.max(2, Math.ceil(-Math.log10(res))))) + " s";
+}
+function tlZoomInfo() {
+  const span = TL.v1 - TL.v0, z = TOTAL / span;
+  document.getElementById("tl-zoom").textContent = (z < 1.05 ? "whole run" : "×" + (z < 10 ? z.toFixed(1) : Math.round(z).toLocaleString()))
+    + " · +" + fmtAbs(TL.v0) + " → +" + fmtAbs(TL.v1) + (tlStepNote ? " · " + tlStepNote : "");
+  tlStepNote = "";
+}
+// overview strip: the whole run (all shown functions merged), with a box for the visible window
+let ovCache = { key: "", rects: [] };
+function drawOverview(W, LW, TW) {
+  const { rows } = graphModel();
+  const OH = TL_OVH, LH = (OH - 6) / Math.max(1, rows.length);   // every lane, squeezed into the strip
+  tlOv.setAttribute("viewBox", `0 0 ${W} ${OH}`);
+  tlOv.style.height = OH + "px";
+  tlOv.replaceChildren();
+  svgText(tlOv, 10, OH / 2 + 4, "overview: whole run", "tl-ov-label");
+  svgEl("rect", { class: "tl-ov-bg", x: LW, y: 2, width: TW, height: OH - 4, rx: 3 }, tlOv);
+  const key = graphN + "|" + TW;
+  if (ovCache.key !== key) {   // each lane's calls merged at one-pixel resolution, over the whole run
+    const px = TOTAL / TW, rects = [];
+    rows.forEach(({ fi }, r) => {
+      let cur = null;
+      for (const c of callsByStart(fi)) {
+        const a = D.s[c], b = a + tEff(c);
+        if (cur && a <= cur[1] + px) cur[1] = Math.max(cur[1], b); else { if (cur) rects.push([r, fi, cur[0], cur[1]]); cur = [a, b]; }
+      }
+      if (cur) rects.push([r, fi, cur[0], cur[1]]);
+    });
+    ovCache = { key, rects };
+  }
+  const XO = t => LW + t / (TOTAL || 1e-9) * TW;
+  for (const [r, fi, a, b] of ovCache.rects)
+    svgEl("rect", { x: XO(a), y: 3 + r * LH, width: Math.max(1, XO(b) - XO(a)), height: Math.max(1, LH - 0.3), fill: groupColor(fnGroup(fi)), opacity: .8 }, tlOv);
+  const x0 = XO(TL.v0), x1 = XO(TL.v1), w = Math.max(4, x1 - x0);
+  svgEl("rect", { class: "tl-win", x: Math.min(x0, LW + TW - w), y: 1, width: w, height: OH - 2, rx: 3 }, tlOv);
+}
+const tlTrackX = (svg, ev) => { const r = svg.getBoundingClientRect(); return ev.clientX - r.left; };
+const tlTW = () => Math.max(50, tlBody.clientWidth - TL.LW - 12);
+// drag across the time axis = zoom to that range; scroll on it = zoom around the cursor
+tlHead.addEventListener("mousedown", ev => {
+  const x0 = tlTrackX(tlHead, ev);
+  if (ev.button !== 0 || x0 < TL.LW) return;
+  ev.preventDefault();
+  const tAt = x => TL.v0 + (Math.min(Math.max(x, TL.LW), TL.LW + tlTW()) - TL.LW) / tlTW() * (TL.v1 - TL.v0);
+  const brush = svgEl("rect", { class: "tl-brush", x: x0, y: 1, width: 0, height: 28 }, tlHead);
+  const move = e => { const x = tlTrackX(tlHead, e); brush.setAttribute("x", Math.min(x, x0)); brush.setAttribute("width", Math.abs(x - x0)); };
+  const up = e => {
+    removeEventListener("mousemove", move); removeEventListener("mouseup", up); brush.remove();
+    const x = tlTrackX(tlHead, e);
+    if (Math.abs(x - x0) > 4) { const a = tAt(Math.min(x, x0)), b = tAt(Math.max(x, x0)); tlSetWindow(a, b); }
+  };
+  addEventListener("mousemove", move); addEventListener("mouseup", up);
+});
+// overview: drag the box to pan, drag elsewhere to pick a range, click to centre the window there
+tlOv.addEventListener("mousedown", ev => {
+  const x0 = tlTrackX(tlOv, ev);
+  if (ev.button !== 0 || x0 < TL.LW) return;
+  ev.preventDefault();
+  const TW = tlTW(), tAt = x => (Math.min(Math.max(x, TL.LW), TL.LW + TW) - TL.LW) / TW * TOTAL;
+  const t0 = tAt(x0), v0 = TL.v0, v1 = TL.v1, inside = t0 >= v0 && t0 <= v1;
+  const brush = inside ? null : svgEl("rect", { class: "tl-brush", x: x0, y: 2, width: 0, height: TL_OVH - 4 }, tlOv);
+  let moved = false;
+  const move = e => {
+    const x = tlTrackX(tlOv, e);
+    if (Math.abs(x - x0) > 3) moved = true;
+    if (inside) { const dt = tAt(x) - t0; tlSetWindow(v0 + dt, v1 + dt); }
+    else { brush.setAttribute("x", Math.min(x, x0)); brush.setAttribute("width", Math.abs(x - x0)); }
+  };
+  const up = e => {
+    removeEventListener("mousemove", move); removeEventListener("mouseup", up);
+    if (brush) brush.remove();
+    if (inside) return;
+    const x = tlTrackX(tlOv, e);
+    if (moved && Math.abs(x - x0) > 4) tlSetWindow(tAt(Math.min(x, x0)), tAt(Math.max(x, x0)));
+    else { const span = v1 - v0; tlSetWindow(t0 - span / 2, t0 + span / 2); }
+  };
+  addEventListener("mousemove", move); addEventListener("mouseup", up);
+});
+for (const [svg, full] of [[tlHead, false], [tlOv, true]]) svg.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const x = tlTrackX(svg, ev), frac = (x - TL.LW) / tlTW();
+  const at = full ? frac * TOTAL : TL.v0 + frac * (TL.v1 - TL.v0);
+  tlZoomBy(Math.exp((ev.deltaY || ev.deltaX) * 0.002), at);
+}, { passive: false });
+// keys while the timeline is showing: + / − zoom, ← / → pan, 0 = whole run
+addEventListener("keydown", ev => {
+  if (tab !== "graph" || gViewMode !== "timeline" || /INPUT|SELECT|TEXTAREA/.test(ev.target.tagName) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  const k = ev.key;
+  if (k === "+" || k === "=") tlZoomBy(0.5);
+  else if (k === "-" || k === "_") tlZoomBy(2);
+  else if (k === "ArrowLeft") tlPanBy(-0.2);
+  else if (k === "ArrowRight") tlPanBy(0.2);
+  else if (k === "0") tlSetWindow(0, TOTAL);
+  else return;
+  ev.preventDefault();
+});
 // ── search and error list ───────────────────────────────────────────────────
 const results = document.getElementById("results");
 function showResults(title, ids, extra) {
