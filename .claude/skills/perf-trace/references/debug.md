@@ -40,8 +40,13 @@ function where levels 1 and 2 stop explaining things.
      goes wrong.
    - `at TRACE ID LINE --hit K`: every local right after the K-th execution of a line.
    - `locals TRACE ID`: the raw line-by-line log.
-   If the function has no locals, ask for (or set up) a re-run with `TRACE_LOCALS`
-   narrowed to it (see `capture.md`).
+   If the function has no locals, don't re-run the app: **replay just that call** with
+   `replay TRACE ID --root SRC --locals`. It reruns the function alone from its recorded
+   arguments, fakes its leaf callees from their recorded results, and writes a new trace
+   (`TRACE.replay-ID.json`) that has its locals; run `lines`/`iters`/`at` on node `#0` of
+   that file. Check it printed `SAME as recorded` first: only then does the replay show what
+   the original call did. If replay can't rebuild an argument (a warning names it), fall
+   back to a re-run with `TRACE_LOCALS` narrowed to it (see `capture.md`).
 6. **Side effects.** Run `mutations TRACE [--fn NAME]`. It lists objects changed in place
    by a callee, either certain (the callee's own locals show a parameter edited) or
    inferred (`self` differs between method calls). Because arguments are captured at

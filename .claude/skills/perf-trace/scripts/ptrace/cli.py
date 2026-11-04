@@ -45,6 +45,8 @@ many traces
 fixing and verifying
     to-test TRACE ID --root SRC [--mock-leaves] [-o FILE]   pytest reproducing one captured call
     snapshot TRACE --fn NAME --root SRC [-o FILE]           golden-master tests over every captured call
+    replay TRACE ID --root SRC [--mock leaves|children|none] [--keep NAME] [--pdb] [--locals] [-o FILE]
+                                        run ONE captured call again on its own, compare with the recording
 understanding and hygiene
     types TRACE [--fn NAME]             observed argument/return types per function
     touched TRACE --root SRC [--unreached]   files and functions this run executed
@@ -61,7 +63,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import browse, codegen, exceptions, html, multi, timing, understand, values
+from . import browse, codegen, exceptions, html, multi, replay, timing, understand, values
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -138,6 +140,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--mock-leaves", action="store_true"); p.add_argument("-o", "--output")
     p = cmd("snapshot", codegen.cmd_snapshot, "trace"); p.add_argument("--fn", required=True); p.add_argument("--root", default=".")
     p.add_argument("-n", type=int, default=25); p.add_argument("--keep-todo", action="store_true"); p.add_argument("-o", "--output")
+    p = cmd("replay", replay.cmd_replay, "trace", "id"); p.add_argument("--root", default=".")
+    p.add_argument("--mock", choices=["leaves", "children", "none"], default="leaves",
+                   help="fake the call's direct leaf callees (default), all direct callees, or nothing, from their recorded results")
+    p.add_argument("--keep", action="append", metavar="NAME", help="never fake this callee (repeatable, substring)")
+    p.add_argument("--pdb", action="store_true", help="stop in pdb on the function's first line (interactive terminal)")
+    p.add_argument("--locals", action="store_true", help="record the replay as a new trace with the function's locals")
+    p.add_argument("--trace-out", metavar="FILE", help="where to write the replay trace (default TRACE.replay-ID.json)")
+    p.add_argument("--python", help="the project's interpreter (default ROOT/.venv/bin/python, else this one)")
+    p.add_argument("-o", "--output", help="keep the generated replay script here (edit its arguments, run it again)")
+    p.add_argument("--no-run", action="store_true", help="only write the script (-o)")
 
     # understanding and hygiene
     p = cmd("types", understand.cmd_types, "trace"); p.add_argument("--fn")

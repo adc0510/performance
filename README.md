@@ -213,6 +213,14 @@ These install the latest version (the `main` branch). To pin one, append
 pip install -e .
 ```
 
+Two test suites, both standard library only (run from the repo root; `PYTHONPATH=src`
+makes sure the clone's perf is the one imported):
+
+```bash
+PYTHONPATH=src python cases/run_all.py                         # perf itself: every case, checked against its EXPECT
+PYTHONPATH=src python -m unittest tests.test_skill_replay -v   # the perf-trace skill's `replay` command
+```
+
 ### Optional C extension
 
 On CPython 3.12+ (with the GIL) the install also compiles `perf._speedups`
@@ -256,7 +264,7 @@ link it into that project's `.claude/skills/` instead and keep it out of git wit
 
 Update it with `git -C ~/code/performance pull`. It needs only `python3` (3.9+);
 perf itself does not have to be installed where traces are read. The bundled
-reader also works on its own (`--help` lists its 43 commands):
+reader also works on its own (`--help` lists its 44 commands):
 
 ```bash
 python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py --help
@@ -314,6 +322,74 @@ def b(): ...                         # these three settings apply only to b()
 Passing an unknown key raises `TypeError` at decoration time. Overrides work by
 temporarily setting the module globals, so two traced calls running
 concurrently with *different* overrides can transiently see each other's values.
+
+### Attach to a running process
+
+You don't have to restart a program to trace it. `python -m perf attach` traces
+the **next calls** of one function in a process that is already running, and
+each call is written as its own trace:
+
+```bash
+python -m perf attach <pid> app.handlers:process_message              # next call
+python -m perf attach <pid> app.repo:Repo.save --calls 5 --out traces  # next 5 calls
+python -m perf attach <pid> app.jobs:run --seconds 30 --set TRACE_LOCALS=True
+python -m perf detach <pid>                                            # stop early (or Ctrl-C the attach)
+```
+
+The CLI waits, prints each trace file as the target writes it, and detaches
+once the budget is used up (default: 1 call; `--calls 0` means no limit).
+Every caller is traced, including code that took its reference long before
+the attach (`from x import fn`, handler registries, callbacks). That's because
+perf swaps the code inside the function object itself instead of rebinding a
+name. Detaching swaps the original code back. A call that is already running
+when you attach can't be traced; only calls that start afterwards are.
+
+There are two ways to get into the process (`--via`, picked automatically):
+
+| | needs in the target | needs for the CLI |
+|---|---|---|
+| `remote` | nothing (Python 3.14+, uses `sys.remote_exec`) | the same Python minor version as the target, plus ptrace rights over it. With `kernel.yama.ptrace_scope=1` (most Linux distros) that means `sudo` |
+| `signal` | `perf.enable_attach()` called once at startup. Any Python 3.10+, POSIX. It costs nothing until used | nothing special |
+
+Either way the target receives only a JSON request (function, budget, config)
+through a private per-user directory under the temp dir, never code from the
+CLI. The target writes the traces itself, into `--out` (default
+`./perf_traces`, resolved against the CLI's working directory), so the target
+must be able to write there. `--set KEY=VALUE` takes any
+[Configuration](#configuration) key. Bad keys or values are rejected before
+anything is attached, so they never fail inside the program's own call.
+`TRACE_LOCALS=True` is shorthand for the attached function's own locals.
+
+From inside the process (a debug endpoint or a REPL, say), the same thing is
+`perf.attach`:
+
+```python
+att = perf.attach("app.handlers:process_message", calls=3, OUTPUT_DIR="perf_traces")
+att.wait()            # or att.detach(); perf.attachments() lists the live ones
+```
+
+Targets are `module:Qual.name` (or a function object) in a module the
+process has already imported: methods, static and class methods, and
+decorated functions (through `__wrapped__`). Generator functions are
+refused; attach to the function that iterates them.
+
+While attached, the function behaves as before. Arguments, defaults (including
+a shared mutable default), closure state, exceptions and `inspect.signature()`
+are all unchanged. An attach also ignores perf's global `SUPPRESS_ERRORS` and
+`TIMEOUT`, so it can't start swallowing the program's exceptions or cutting
+off slow calls (pass them explicitly to opt in). What it does change:
+
+- **Recursion depth.** Each recursive level inside a traced call costs one
+  extra frame, so the deepest recursion that still fits is roughly halved
+  while attached.
+- **`--via remote` needs the main thread to run Python code.**
+  `sys.remote_exec` is picked up only by the main thread. A main thread
+  parked in `join()`, `Event().wait()` or a long C call never picks it up. The
+  CLI then gives up after `--connect-timeout` and withdraws the request, so
+  nothing attaches later when the thread wakes. Use `perf.enable_attach()` for
+  such programs: its signal does wake a parked main thread.
+- **A forked child** inherits the attach and also traces its own calls (into
+  the same `--out`) until the budget it inherited runs out.
 
 ## What a trace contains
 

@@ -1,6 +1,6 @@
 ---
 name: perf-trace
-argument-hint: "[help|summary|slow|debug|errors|draw-diagram|sequence|explain|test|compare|share|setup|advise] [trace] [details]"
+argument-hint: "[help|summary|slow|debug|errors|replay|attach|detach|draw-diagram|sequence|explain|test|compare|share|setup|advise] [trace] [details]"
 description: Debug, fix and optimize Python code using perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. A trace records every project call with timing, arguments at entry, results, exceptions (including swallowed ones) and, under TRACE_LOCALS, every local variable line by line. Use it to find why a request or job is slow (critical path, N+1 calls, serialized awaits, duplicate work, cache misses, perf's own overhead), where a wrong value or exception really came from, what a function received and held, to generate a regression test from a captured call, to compare runs before/after a fix, to map which code a request actually runs, and to export a trace as an interactive offline HTML page (call tree, call graph with timeline, flame) for a person to explore or share. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain, test or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
 ---
 
@@ -40,6 +40,9 @@ there is none, offer `setup`.
 | `slow [trace] [function]` | Optimize: follow `references/optimize.md`, scoped to the function if given (`find`, then `critical-path --id`). |
 | `debug [trace] <what's wrong>` | Debug: follow `references/debug.md` with the user's description as the symptom. |
 | `errors [trace]` | `errors` (and `exc-flow`, `retries` when they apply): each exception's origin, fate and cause, swallowed ones included. |
+| `replay [trace] <id or function> [what to check]` | Run that ONE captured call again on its own with `replay` (`references/fix-and-verify.md`): find the id with `find` if a name is given (its first call, or the failing one), replay it, report SAME/DIFFERENT, the first difference and any `DIVERGED` callee. Add `--locals` to see inside it; for `--pdb`, give the user the command to run in their own terminal (it's interactive). |
+| `attach <pid or process> <function> [calls/seconds]` | Trace a process that is already running, without restarting it: "The app is already running" in `references/capture.md`. Confirm the pid (`ps`/`pgrep -af python`) and the function with the user before attaching, then read the traces it writes. |
+| `detach <pid> [function]` | Stop a live attach early: `python -m perf detach <pid> [function]` with the target's Python. |
 | `draw-diagram [trace] [graph\|timeline\|flame\|tree\|sequence]` | Write the page with `html` and give the link to the view asked for (default `#graph`), plus `#n<ID>` links to the calls worth looking at first. `sequence` writes the Mermaid diagram with `sequence` instead. State the page's limits (`references/understand.md`). |
 | `sequence [trace] [function]` | Mermaid sequence diagram with `sequence` (`--id` of the function's slowest call if given). |
 | `explain [trace] [function]` | Understand: follow `references/understand.md` (`touched`, `types`, `tree`, `path`) and explain what the run does, in order, citing node ids. |
@@ -77,7 +80,9 @@ and say what the trace could not show.
    **No traces at all**, or the app doesn't use `@perf.trace`? Don't stop and don't edit
    the app. Follow "No traces yet" in `references/capture.md`: perf installed in `.venv`
    only (`uv pip install`, then `uv sync --inexact`), a `perf_driver.py` that wraps the
-   entry point, and both excluded from git via `.git/info/exclude`.
+   entry point, and both excluded from git via `.git/info/exclude`. If the app is
+   already running and shouldn't be restarted, attach to it instead:
+   `python -m perf attach <pid> mod:func` (see "already running" in `capture.md`).
 2. **Baseline.** Run `summary TRACE` and note the total, perf's own recording share, the
    exceptions and any unfinished calls. If recording is 20% or more of the elapsed time,
    timings are inflated (see `capture.md`). An exception "suppressed by perf" means
@@ -86,8 +91,9 @@ and say what the trace could not show.
    claim points at a node id `#N` and a `file:line`.
 4. **Read the source.** The trace tells you what happened. The code tells you why. Use
    `where`, `lines`, exception origins and `touched` to get there.
-5. **Fix, then prove it.** Write a test with `to-test`/`snapshot`. Re-run the same input,
-   then compare with `diff`, `sdiff` and `vdiff`. A change isn't done until a test or a
+5. **Fix, then prove it.** `replay TRACE ID` the bad call after the fix: it reruns just that
+   call from its recorded arguments and says how the result changed. Write a test with
+   `to-test`/`snapshot`. Re-run the same input, then compare with `diff`, `sdiff` and `vdiff`. A change isn't done until a test or a
    new trace shows the difference.
 
 ## Reference guide
@@ -110,7 +116,7 @@ and say what the trace could not show.
 | exceptions | `errors` (origin, fate, cause chain, translation) · `retries` · `exc-flow` (exceptions used as control flow) · `unfinished` |
 | time | `critical-path` · `timeline` · `serial` (independent work done in sequence) · `nplus1` · `dupes` · `cache` · `scaling` (growth with input size) · `outliers` · `gens` · `payload` |
 | many traces | `stats DIR` (p50/p95, what drives the slow ones) · `sdiff` (calls that appeared or vanished) · `group DIR` |
-| fix | `to-test TRACE ID --root SRC [--mock-leaves]` · `snapshot TRACE --fn NAME --root SRC` |
+| fix | `to-test TRACE ID --root SRC [--mock-leaves]` · `snapshot TRACE --fn NAME --root SRC` · `replay TRACE ID --root SRC [--mock leaves\|children\|none] [--locals] [--pdb]` (run one captured call again, alone, and compare) |
 | understand | `types` · `touched --root SRC` · `sequence` (Mermaid) · `html` (one offline page: call tree, call graph, flame) · `secrets` · `advise` |
 
 Node ids (`#N`) are stable for a file, so an id printed by one command can be passed to

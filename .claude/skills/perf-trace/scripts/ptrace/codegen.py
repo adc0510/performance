@@ -71,10 +71,30 @@ def _plain(value, _seen=()):
 class Emitter:
     """Turns captured JSON values into Python source, collecting the imports they need."""
 
-    def __init__(self, index: Index, near: Defn | None):
+    def __init__(self, index: Index, near: Defn | None, inline: bool = False):
         self.index, self.near = index, near
         self.imports: set[str] = set()
         self.todos: list[str] = []
+        self.inline = inline  # placeholders as `_missing(...)` expressions (replay) instead of comments
+        self._depth = 0  # > 0 while emitting inside a list/dict literal
+
+    def placeholder(self, what: str, fallback: str = "None") -> str:
+        """Source for a value that could not be rebuilt."""
+        if self.inline:
+            return f"_missing({what!r})"
+        if self._depth:  # a `# TODO` comment inside a literal would swallow the rest of the line
+            self.todos.append(f"{what}: passed as {fallback.split('  #')[0] if fallback != 'None' else 'None'} inside a container, supply it")
+            return "None" if fallback == "None" else fallback
+        return f"{fallback}  # TODO {what}"
+
+    def value(self, v, expected: bool = False) -> str:
+        if isinstance(v, (list, dict)) and not (isinstance(v, dict) and ("__spilled__" in v or "__class__" in v or "__enum__" in v)):
+            self._depth += 1
+            try:
+                return self._value(v, expected)
+            finally:
+                self._depth -= 1
+        return self._value(v, expected)
 
     def ref(self, qualname: str, module: str | None = None) -> str | None:
         top = qualname.split(".")[0]
@@ -89,12 +109,12 @@ class Emitter:
         self.imports.add(f"from {d.module} import {top}")
         return qualname
 
-    def value(self, v, expected: bool = False) -> str:
+    def _value(self, v, expected: bool = False) -> str:
         if isinstance(v, str) and v.startswith("<") and v.endswith(">"):
             if expected:
                 return "ANY"
             self.todos.append(f"{v} was not captured (repr only): supply a real value")
-            return f"None  # TODO {v}"
+            return self.placeholder(f"{v}")
         if v is None or isinstance(v, (bool, int, float, str)):
             return repr(v)
         if isinstance(v, list):
@@ -113,19 +133,19 @@ class Emitter:
             if v.get("__type__") in ("function", "method") and "qualname" in v:
                 if "<locals>" in str(v["qualname"]) or v["__type__"] == "method":
                     self.todos.append(f"{v['qualname']} is a nested function or bound method: pass it by hand")
-                    return f"None  # TODO {v['qualname']}"
+                    return self.placeholder(f"{v['qualname']}")
                 name = self.ref(v["qualname"], v.get("module"))
-                return name or f"None  # TODO import {v['qualname']}"
+                return name or self.placeholder(f"import {v['qualname']}")
             if "__class__" in v:
                 mod, _, q = v["__class__"].rpartition(".")
-                return self.ref(q, mod) or f"None  # TODO class {v['__class__']}"
+                return self.ref(q, mod) or self.placeholder(f"class {v['__class__']}")
             if "__enum__" in v:
                 q = v["__enum__"]
                 name = self.ref(q.split(".")[0])
-                return q if name else f"None  # TODO enum {q}"
+                return q if name else self.placeholder(f"enum {q}")
             if "__functions__" in v:
                 self.todos.append("a function registry was captured only by its keys")
-                return f"None  # TODO registry of {v['__functions__']}"
+                return self.placeholder(f"registry of {v['__functions__']}")
             if "__type__" in v:
                 cls = v["__type__"]
                 fields = {k: x for k, x in v.items() if k != "__type__"}
@@ -133,7 +153,7 @@ class Emitter:
                 body = "{" + ", ".join(f"{k!r}: {self.value(x)}" for k, x in fields.items()) + "}"
                 if not name:
                     self.todos.append(f"class {cls} not found under --root: import it and build it by hand")
-                    return f"{body}  # TODO was a {cls}"
+                    return self.placeholder(f"was a {cls}", body)
                 return f"_build({name}, {body})"
             return "{" + ", ".join(f"{k!r}: {self.value(x)}" for k, x in v.items()) + "}"
         return repr(v)
@@ -195,23 +215,27 @@ def _call_src(tr: Trace, n: dict, d: Defn, em: Emitter, indent: str) -> tuple[li
     owner = d.qualname.rsplit(".", 1)[0] if is_method else None
     target = d.top
     em.imports.add(f"from {d.module} import {target}")
-    if is_method and d.binding == "classmethod" and args:
-        args = args[1:]  # the class itself: Class.method(...) binds it
+    if is_method and d.binding == "classmethod" and args and isinstance(args[0][1], dict) and "__class__" in args[0][1]:
+        args = args[1:]  # the class itself, when recorded (a nested call; a root call omits it): Class.method(...) binds it
     for name, v in args:
         var = re.sub(r"\W", "_", name)
         lines.append(f"{indent}{var} = {em.value(v)}")
         (kw if name in kwargs else pos).append((name, var))
     callee = d.qualname
+    self_var = pos[0][1] if is_method and pos and pos[0][0] in ("self", "cls") else None
     if is_method and pos and pos[0][0] in ("self", "cls"):
         callee = f"{pos[0][1]}.{d.qualname.rsplit('.', 1)[1]}"
         pos = pos[1:]
     elif is_method:
         callee = d.qualname  # static/class method or self not captured
     if d.binding == "property" and is_method:
-        obj = pos[0][1] if pos else "None  # TODO: the instance"
+        # `self` was split off into self_var above; the remaining pos are the
+        # setter's value (if any).
+        obj = self_var or (pos[0][1] if pos else em.placeholder("the instance"))
+        rest = pos if self_var else pos[1:]
         attr = d.qualname.rsplit(".", 1)[1]
-        if n["name"].endswith(".setter") and len(pos) > 1:
-            return lines, f"setattr({obj}, {attr!r}, {pos[1][1]})"
+        if n["name"].endswith(".setter") and rest:
+            return lines, f"setattr({obj}, {attr!r}, {rest[0][1]})"
         return lines, f"{obj}.{attr}"
     expr = f"{callee}(" + ", ".join([v for _, v in pos] + [f"{k}={v}" for k, v in kw]) + ")"
     if "yields" in n:  # a generator: _assert_src drives it
