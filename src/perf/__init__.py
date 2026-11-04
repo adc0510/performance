@@ -937,6 +937,12 @@ def _jsonable(value: Any, depth: int = 0, _seen: frozenset = frozenset(), _budge
     return _jsonable_uncached(value, depth, _seen, _budget, _memo)
 
 
+def _marker(value: Any) -> str:
+    """Stand-in for a value with nothing to show but its type (default repr),
+    kept in its container's place: ``"<TypeName>"``, as for a whole argument."""
+    return f"<{type(value).__name__}>"
+
+
 def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list | None, _memo: dict) -> Any:
     """Containers and objects (see _jsonable)."""
     try:
@@ -956,8 +962,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
             fields = {"__type__": type(value).__name__}
             for field_name, field_value in zip(type(value)._fields, value):
                 jv = _jsonable(field_value, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    fields[field_name] = jv
+                fields[field_name] = _marker(field_value) if jv is _SKIP else jv
             return fields
         if isinstance(value, (dict, types.MappingProxyType)):
             seen = _seen | {id(value)}
@@ -985,8 +990,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    out[key] = jv
+                out[key] = _marker(v) if jv is _SKIP else jv
             return out
         if isinstance(value, (list, tuple, set, frozenset)):
             seen = _seen | {id(value)}
@@ -1005,8 +1009,9 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 elif _budget[0] <= 0:
                     break
                 jv = _jsonable(v, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    out.append(jv)
+                # Keep a marker in the element's place: dropping it would
+                # shift every later index and change len() of the capture.
+                out.append(_marker(v) if jv is _SKIP else jv)
             return out
         # pydantic models, dataclasses, and other rich objects. exclude_none
         # drops fields that are unset (Optional[...] = None) rather than
@@ -1059,8 +1064,7 @@ def _jsonable_uncached(value: Any, depth: int, _seen: frozenset, _budget: list |
                 except AttributeError:
                     continue  # slot never assigned
                 jv = _jsonable(slot_value, depth + 1, seen, _budget, _memo)
-                if jv is not _SKIP:
-                    fields[slot] = jv
+                fields[slot] = _marker(slot_value) if jv is _SKIP else jv
             if len(fields) > 1:
                 return fields
         if hasattr(value, "__dict__") and vars(value):
