@@ -49,6 +49,7 @@ understanding and hygiene
     types TRACE [--fn NAME]             observed argument/return types per function
     touched TRACE --root SRC [--unreached]   files and functions this run executed
     sequence TRACE [--id N] [--depth D] Mermaid sequence diagram
+    html TRACE [-o FILE] [--no-values]  one offline HTML page: call tree, call graph, functions, flame
     secrets TRACE [--emails]            credentials that escaped redaction, with config to stop it
     advise TRACE                        capture settings for the next trace
 
@@ -60,7 +61,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import browse, codegen, exceptions, multi, timing, understand, values
+from . import browse, codegen, exceptions, html, multi, timing, understand, values
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -146,6 +147,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--by", choices=["function", "module"], default="function", help="one lifeline per function (default) or per module")
     p = cmd("secrets", understand.cmd_secrets, "trace"); p.add_argument("--emails", action="store_true"); p.add_argument("-n", type=int, default=30)
     cmd("advise", understand.cmd_advise, "trace")
+    p = cmd("html", html.cmd_html, "trace"); p.add_argument("-o", "--output", help="default: the trace path with .html")
+    p.add_argument("--no-values", action="store_true", help="leave out arguments, results and locals: structure and timing only (exception messages stay)")
     return ap
 
 

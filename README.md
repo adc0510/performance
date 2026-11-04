@@ -100,6 +100,20 @@ run the skill's reader directly, which needs only `python3`:
 python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py summary perf_traces/<uuid>.json
 ```
 
+To explore it in a browser instead, write it out as one HTML page: a call tree
+with time bars, each call's arguments, result, exception and locals, a call
+graph of which function calls which (click a function to see everything
+upstream and downstream of it, or find the call chains between two functions),
+with a timeline of when each one ran (both downloadable as SVG), a function table with callers and callees, and a
+flame view. The page is a single file that
+needs no network access, so it can be opened from a server's disk or attached
+to a ticket. It holds every captured value: check it with `secrets` first, or
+add `--no-values` to keep only the structure and timing.
+
+```bash
+python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py html perf_traces/<uuid>.json   # writes perf_traces/<uuid>.html
+```
+
 ## Install
 
 perf is hosted in a **private** GitHub repository: you need a GitHub account with
@@ -242,7 +256,7 @@ link it into that project's `.claude/skills/` instead and keep it out of git wit
 
 Update it with `git -C ~/code/performance pull`. It needs only `python3` (3.9+);
 perf itself does not have to be installed where traces are read. The bundled
-reader also works on its own (`--help` lists its 42 commands):
+reader also works on its own (`--help` lists its 43 commands):
 
 ```bash
 python3 ~/.claude/skills/perf-trace/scripts/perf_trace.py --help

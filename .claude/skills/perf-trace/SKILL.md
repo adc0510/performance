@@ -1,6 +1,6 @@
 ---
 name: perf-trace
-description: Debug, fix and optimize Python code using perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. A trace records every project call with timing, arguments at entry, results, exceptions (including swallowed ones) and, under TRACE_LOCALS, every local variable line by line. Use it to find why a request or job is slow (critical path, N+1 calls, serialized awaits, duplicate work, cache misses, perf's own overhead), where a wrong value or exception really came from, what a function received and held, to generate a regression test from a captured call, to compare runs before/after a fix, and to map which code a request actually runs. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain, test or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
+description: Debug, fix and optimize Python code using perf trace files -- the JSON call trees written by the `perf` tracer (`@perf.trace`, github.com/adc0510/performance), usually `perf_traces/<uuid>.json` or a path set by `perf.OUTPUT_DIR` / `OUTPUT_FILE`. A trace records every project call with timing, arguments at entry, results, exceptions (including swallowed ones) and, under TRACE_LOCALS, every local variable line by line. Use it to find why a request or job is slow (critical path, N+1 calls, serialized awaits, duplicate work, cache misses, perf's own overhead), where a wrong value or exception really came from, what a function received and held, to generate a regression test from a captured call, to compare runs before/after a fix, to map which code a request actually runs, and to export a trace as an interactive offline HTML page (call tree, call graph with timeline, flame) for a person to explore or share. Use this skill whenever the user mentions perf traces, perf_traces, a trace JSON with "variables"/"trace" keys, `@perf.trace`, TRACE_LOCALS, or asks to debug, explain, test or speed up code that is traced with perf -- even if they only say "check the trace" or "why is process_message slow".
 ---
 
 # Debugging, fixing and optimizing with perf traces
@@ -31,6 +31,8 @@ python3 <skill-dir>/scripts/perf_trace.py --help          # every command, group
   trace.
 - **Unfamiliar code.** See which files and functions a request actually runs, what types
   they really get, and what calls what.
+- **Showing the run to people.** `html TRACE` writes one offline page to explore the run
+  in a browser. Link the calls you cite as `<page>.html#n<ID>` so the reader lands on them.
 - **Before sharing a trace or capturing a new one.** Check for leaked secrets and pick
   cheaper or more targeted settings.
 
@@ -64,7 +66,7 @@ python3 <skill-dir>/scripts/perf_trace.py --help          # every command, group
 | Debugging | `references/debug.md` | wrong value, wrong branch, exception, "partial"/degraded result, flaky behaviour |
 | Optimizing | `references/optimize.md` | slow request/job, latency regression, "what should we optimize" |
 | Fixing and verifying | `references/fix-and-verify.md` | writing the fix, regression tests, before/after comparison |
-| Understanding code | `references/understand.md` | unfamiliar code path, types, diagrams, secret scan before sharing |
+| Understanding code | `references/understand.md` | unfamiliar code path, types, diagrams, an HTML page of the run, secret scan before sharing |
 | Capturing the next trace | `references/capture.md` | the trace lacks what you need, or the overhead is too high |
 | Trace file format | `references/trace-format.md` | output shows an unexpected marker (`<TypeName>`, `capture_skipped`, `__spilled__`, a cut-off repr) |
 
@@ -78,7 +80,7 @@ python3 <skill-dir>/scripts/perf_trace.py --help          # every command, group
 | time | `critical-path` · `timeline` · `serial` (independent work done in sequence) · `nplus1` · `dupes` · `cache` · `scaling` (growth with input size) · `outliers` · `gens` · `payload` |
 | many traces | `stats DIR` (p50/p95, what drives the slow ones) · `sdiff` (calls that appeared or vanished) · `group DIR` |
 | fix | `to-test TRACE ID --root SRC [--mock-leaves]` · `snapshot TRACE --fn NAME --root SRC` |
-| understand | `types` · `touched --root SRC` · `sequence` (Mermaid) · `secrets` · `advise` |
+| understand | `types` · `touched --root SRC` · `sequence` (Mermaid) · `html` (one offline page: call tree, call graph, flame) · `secrets` · `advise` |
 
 Node ids (`#N`) are stable for a file, so an id printed by one command can be passed to
 the next. Every command prints its own blind spots (values not captured, matching by equal
@@ -118,6 +120,9 @@ rather than stop at the first familiar thing:
   (`group`).
 - Never try to recover `<redacted>` or skipped values, and never paste secrets that
   `secrets` finds.
+- Never share an `html` page built with values (the default) before running `secrets` on
+  the trace: it carries every captured value, like the trace itself. Otherwise rebuild
+  it with `--no-values`.
 - Never present a pattern-shaped guess ("probably N+1") as a finding without the command
   output that shows it.
 
@@ -135,4 +140,5 @@ Accounted for: <how much of the wall time or of the failure chain this explains;
 Cause: <file>:<line> -- <what the code does there>
 Fix: <the change, or the options with their trade-offs>
 Verified: <test name / before -> after numbers from a new trace> | Not verified: <why, and how to check>
+Page: <path>.html -- open #n<ID> for each call above (only if you wrote one with `html`)
 ```

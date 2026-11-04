@@ -1,0 +1,1879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>perf trace · __PERF_TITLE__</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --soft: #eaeef2;
+  --sel: #dbeafe; --hover: #f3f4f6; --bar: #93c5fd; --err: #cf222e; --warn: #9a6700;
+  --ok: #1a7f37; --code: #f6f8fa; --accent: #0969da; --str: #0a3069; --num: #0550ae;
+  --key: #8250df; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --soft: #21262d;
+    --sel: #1c3557; --hover: #161b22; --bar: #1f6feb; --err: #f85149; --warn: #d29922;
+    --ok: #3fb950; --code: #161b22; --accent: #58a6ff; --str: #a5d6ff; --num: #79c0ff; --key: #d2a8ff;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { display: flex; flex-direction: column; overflow: hidden; }
+button { font: inherit; color: inherit; background: var(--soft); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.on { background: var(--sel); border-color: var(--accent); }
+a, .link { color: var(--accent); cursor: pointer; text-decoration: none; }
+a:hover, .link:hover { text-decoration: underline; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+.err { color: var(--err); }
+.warn { color: var(--warn); }
+
+header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw; }
+header .facts { color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+header .spacer { flex: 1; }
+header input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 8px; width: 260px; }
+.tabs { display: flex; gap: 4px; }
+
+main { flex: 1; display: grid; grid-template-columns: minmax(300px, 1fr) 5px minmax(300px, var(--right, 42%)); min-height: 0; }
+#left { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+#split { cursor: col-resize; background: var(--line); }
+#right { overflow: auto; padding: 12px 16px 40px; min-width: 0; }
+.pane { flex: 1; overflow: auto; min-height: 0; display: none; }
+.pane.show { display: block; }
+
+#results { border-bottom: 1px solid var(--line); max-height: 40%; overflow: auto; display: none; }
+#results.show { display: block; }
+#results .head { position: sticky; top: 0; background: var(--bg); padding: 6px 10px; border-bottom: 1px solid var(--soft); display: flex; gap: 8px; }
+#results .head .spacer { flex: 1; }
+.res { padding: 3px 10px; cursor: pointer; display: flex; gap: 10px; white-space: nowrap; }
+.res:hover { background: var(--hover); }
+.res .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 12px; }
+
+/* call tree */
+.thead, .row { display: flex; align-items: center; gap: 8px; padding: 1px 10px; white-space: nowrap; }
+.thead { position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; padding-top: 4px; padding-bottom: 4px; }
+.row { cursor: default; font-family: var(--mono); font-size: 12px; height: 21px; }
+.row:hover { background: var(--hover); }
+.row.sel { background: var(--sel); }
+.row .nm { flex: 1 0 auto; padding-left: 4px; }
+#tree, #pane-tree .thead { min-width: max-content; }
+.row .tg { display: inline-block; width: 14px; color: var(--muted); cursor: pointer; text-align: center; }
+.row .cnt { color: var(--muted); }
+.row.raised .nm .fn, .row.exc .nm .fn { color: var(--err); }
+.row.unf .nm .fn { color: var(--warn); }
+.badge { font-size: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 0 5px; margin-left: 6px; color: var(--muted); font-family: var(--mono); }
+.badge.err { color: var(--err); border-color: var(--err); }
+.c-bar { width: 90px; height: 8px; background: var(--soft); border-radius: 2px; overflow: hidden; flex: none; }
+.c-bar i { display: block; height: 100%; background: var(--bar); }
+.c-t, .c-s { width: 74px; text-align: right; flex: none; }
+.c-p { width: 46px; text-align: right; flex: none; color: var(--muted); }
+.more { padding: 2px 10px; font-size: 12px; }
+
+/* function table */
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--soft); white-space: nowrap; }
+th { position: sticky; top: 0; background: var(--bg); color: var(--muted); font-weight: 500; font-size: 12px; cursor: pointer; user-select: none; border-bottom: 1px solid var(--line); }
+td.n, th.n { text-align: right; }
+td.fnc { font-family: var(--mono); font-size: 12px; max-width: 0; min-width: 140px; width: 100%; overflow: hidden; text-overflow: ellipsis; }
+#fn-table { width: auto; min-width: 100%; }
+#fn-table td.fname { font-family: var(--mono); font-size: 12px; width: 100%; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--hover); }
+tbody tr.sel { background: var(--sel); }
+
+/* flame */
+#flame-wrap { position: relative; }
+#flame-bar { padding: 6px 10px; display: flex; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 1; }
+#flame-crumbs { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+#flame { display: block; }
+#pane-flame { overflow-x: hidden; }
+#tip { position: fixed; pointer-events: none; background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.18); display: none; z-index: 10; max-width: 480px; }
+
+/* detail panel */
+#right h2 { font-family: var(--mono); font-size: 14px; margin: 0 0 6px; word-break: break-all; }
+#right h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 6px; font-weight: 600; }
+.crumbs { font-family: var(--mono); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.crumbs .sep { color: var(--muted); margin: 0 4px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+.kv .k { color: var(--muted); }
+.arg { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 10px; font-family: var(--mono); font-size: 12px; }
+.kv { grid-template-columns: max-content minmax(0, 1fr); }
+.v, .kv > span { overflow-wrap: anywhere; }
+.arg .k { color: var(--key); }
+pre { background: var(--code); border: 1px solid var(--soft); border-radius: 6px; padding: 8px; overflow: auto; font-size: 12px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+.empty { color: var(--muted); padding: 30px 10px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+/* value viewer */
+.v { font-family: var(--mono); font-size: 12px; }
+.v details { display: inline; }
+.v details[open] { display: block; }
+.v summary { cursor: pointer; display: inline; list-style: none; }
+.v summary::-webkit-details-marker { display: none; }
+.v summary::before { content: "▸ "; color: var(--muted); }
+.v details[open] > summary::before { content: "▾ "; }
+.v .body { margin-left: 16px; border-left: 1px solid var(--soft); padding-left: 8px; }
+.v .s { color: var(--str); white-space: pre-wrap; word-break: break-word; }
+.v .num { color: var(--num); }
+.v .lit { color: var(--key); }
+.v .mk { color: var(--muted); font-style: italic; }
+.v .ty { color: var(--warn); }
+.v .k { color: var(--key); }
+
+/* locals */
+.loc { table-layout: fixed; }
+.loc td { vertical-align: top; font-family: var(--mono); font-size: 12px; white-space: normal; overflow-wrap: anywhere; }
+.loc td.ln { color: var(--muted); text-align: right; width: 48px; white-space: nowrap; }
+.loc td.src { white-space: pre; color: var(--fg); width: 38%; overflow: hidden; text-overflow: ellipsis; }
+.loc tr { cursor: default; }
+.loc tr.raise td { background: color-mix(in srgb, var(--err) 12%, transparent); }
+.chip { display: inline-block; margin: 0 10px 2px 0; }
+.chip .k { color: var(--key); }
+
+/* call graph */
+#pane-graph.show { display: flex; flex-direction: column; overflow: hidden; }
+#graph-bar { padding: 6px 10px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid var(--line); flex-wrap: wrap; font-size: 12px; }
+#graph-bar label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+#graph-bar label[hidden] { display: none; }
+#graph-bar output { font-family: var(--mono); color: var(--fg); min-width: 54px; }
+#graph-stage { flex: 1; position: relative; overflow: hidden; cursor: grab; min-height: 0; }
+#graph-stage.dragging { cursor: grabbing; }
+#graph-svg { width: 100%; height: 100%; display: block; }
+.g-n rect.box { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.g-n.err rect.box { stroke: var(--err); stroke-width: 1.6; }
+.g-n.root rect.box { stroke: var(--accent); stroke-width: 2; }
+.g-n.sel rect.box { stroke: var(--accent); stroke-width: 2.5; }
+.g-n.match rect.box { fill: var(--sel); }
+.g-n.focus rect.box { stroke: var(--accent); stroke-width: 3; }
+.g-n.caller rect.box { stroke: var(--key); stroke-width: 2.5; }
+.g-n.callee rect.box { stroke: var(--ok); stroke-width: 2.5; }
+.tl-row.dim { opacity: .3; }
+#link-btn.on { border-color: var(--warn); color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+#link-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 10px; font-size: 12px;
+  border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+#link-bar[hidden] { display: none; }
+#link-bar label { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+#link-bar input { font: 12px var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; width: 230px; }
+.g-n.lk rect.box { stroke: var(--warn); stroke-width: 2.5; }
+.g-n.lk-end rect.box { stroke: var(--warn); stroke-width: 4; fill: color-mix(in srgb, var(--warn) 14%, var(--bg)); }
+.g-n.lk-dim, .g-e.lk-dim { opacity: .15; }
+.g-e.lkpath path { stroke: var(--warn); stroke-dasharray: none; opacity: 1; }
+.g-e.lkpath text { fill: var(--warn); }
+#graph-svg marker.lk path { fill: var(--warn); }
+.tl-row.lk-dim { opacity: .3; }
+.lk-chain { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; cursor: pointer; }
+.lk-chain:hover { border-color: var(--warn); }
+.lk-chain.on { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.lk-chain-head { display: flex; gap: 6px; align-items: baseline; margin-bottom: 4px; }
+.lk-chain-head .spacer { flex: 1; }
+.lk-steps { font: 12px var(--mono); line-height: 1.7; overflow-wrap: anywhere; }
+.lk-steps .sep { color: var(--muted); margin: 0 5px; }
+.lk-endname { color: var(--warn); font-weight: 600; }
+.lk-leg { font-size: 11px; margin-top: 4px; }
+.lg rect.lkbox { fill: var(--bg); stroke: var(--warn); stroke-width: 2.5; }
+.lg .l-lk { stroke: var(--warn); }
+.g-n text.t { fill: var(--fg); font: 600 12px var(--mono); }
+.g-n text.s { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.g-n text.x { fill: var(--err); font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.g-n { cursor: pointer; }
+.g-n.dim, .g-e.dim { opacity: .15; }
+.g-e path { fill: none; stroke: var(--muted); }
+.g-e.hot path { stroke: var(--accent); }
+.g-e.skip path { stroke-dasharray: 9 5; }
+.g-e.aux { display: none; }
+.g-e.aux path { stroke: var(--key); stroke-dasharray: 0.5 5; stroke-linecap: round; }
+.g-e.aux text { fill: var(--key); }
+.g-e.aux.show, #graph-view.all .g-e.aux { display: inline; }
+#graph-view.all .g-e.aux:not(.show) { opacity: .45; }
+.g-n text.m { fill: var(--muted); font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.g-e text { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.g-e text.err { fill: var(--err); }
+.g-lbl { fill: var(--bg); }
+#graph-svg marker path { fill: var(--muted); }
+#graph-svg marker.aux path { fill: var(--key); }
+#pane-graph { position: relative; }
+#graph-legend { position: absolute; right: 16px; bottom: 12px; z-index: 3; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 10px 8px; box-shadow: 0 4px 14px rgba(0,0,0,.15); }
+#graph-legend[hidden] { display: none; }
+#graph-legend .lg-head { display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; font-weight: 600; margin-bottom: 2px; }
+#graph-legend .lg-head span.link { text-transform: none; letter-spacing: 0; font-weight: 400; }
+#graph-legend svg { display: block; }
+.lg text { fill: var(--fg); font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.lg text.m { fill: var(--muted); }
+.lg text.mono { font: 600 11px var(--mono); }
+.lg text.err { fill: var(--err); }
+.lg text.key { fill: var(--key); }
+.lg line { fill: none; }
+.lg .f-hot { fill: var(--accent); stroke: none; }
+.lg .f-aux { fill: var(--key); stroke: none; }
+.lg .f-dir { fill: var(--muted); stroke: none; }
+.lg .l-hot { stroke: var(--accent); }
+.lg .l-dir { stroke: var(--muted); }
+.lg .l-skip { stroke: var(--muted); stroke-dasharray: 9 5; }
+.lg .l-aux { stroke: var(--key); stroke-dasharray: 0.5 5; stroke-linecap: round; }
+.lg rect.box { fill: var(--bg); stroke: var(--line); }
+.lg rect.err-tick { fill: var(--err); }
+.lg rect.callerbox { fill: var(--bg); stroke: var(--key); stroke-width: 2.5; }
+.lg rect.calleebox { fill: var(--bg); stroke: var(--ok); stroke-width: 2.5; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+#tl-stage { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#tl-stage[hidden] { display: none; }
+#tl-head { display: block; flex: none; height: 30px; width: 100%; border-bottom: 1px solid var(--line); }
+#tl-body { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; cursor: grab; }
+#tl-body.dragging { cursor: grabbing; }
+#tl-svg { display: block; width: 100%; }
+.tl-row.alt rect.bg { fill: var(--hover); }
+.tl-row rect.bg { fill: transparent; }
+.tl-row.sel rect.bg { fill: var(--sel); }
+.tl-row.match rect.bg { fill: color-mix(in srgb, var(--accent) 22%, transparent); }
+.tl-row text.t { fill: var(--fg); font: 12px var(--mono); cursor: pointer; }
+.tl-row text.t:hover { fill: var(--accent); }
+.tl-row text.s { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.tl-err { fill: var(--err); }
+.tl-axis line { stroke: var(--line); }
+.tl-axis text { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.tl-grid { stroke: var(--line); stroke-dasharray: 2 4; opacity: .6; }
+.tl-guide { stroke: var(--accent); stroke-width: 1; pointer-events: none; }
+.tl-guide-t { fill: var(--accent); font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+.tl-split { stroke: var(--line); }
+#graph-svg marker.hot path { fill: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="facts" id="facts"></div>
+  <div class="spacer"></div>
+  <div class="tabs">
+    <button data-tab="tree" class="on">Call tree</button>
+    <button data-tab="graph">Call graph</button>
+    <button data-tab="fns">Functions</button>
+    <button data-tab="flame">Flame</button>
+  </div>
+  <button id="btn-errors">Errors</button>
+  <input id="q" type="search" placeholder="Find calls by name, or #id" autocomplete="off">
+</header>
+<main>
+  <div id="left">
+    <div id="results"></div>
+    <div class="pane show" id="pane-tree">
+      <div class="thead"><span class="c-t">wall</span><span class="c-s">self</span><span class="c-p">%tot</span><span class="c-bar"></span><span style="flex:1;padding-left:4px">call</span></div>
+      <div id="tree"></div>
+    </div>
+    <div class="pane" id="pane-graph">
+      <div id="graph-bar">
+        <span class="seg"><button data-gview="graph" class="on">Graph</button><button data-gview="timeline">Timeline</button></span>
+        <label>Functions shown <input id="graph-top" type="range" min="2" step="1"> <output id="graph-top-out"></output></label>
+        <label id="graph-all-l"><input id="graph-all" type="checkbox"> All callers</label>
+        <button id="graph-fit">Fit</button>
+        <button id="graph-svg-dl">Download SVG</button>
+        <button id="graph-legend-btn" class="on">Legend</button>
+        <button id="link-btn" title="Find how two functions are connected">Find link</button>
+        <span class="muted" id="graph-hint"></span>
+      </div>
+      <div id="link-bar" hidden>
+        <span class="muted">Click two boxes, or type:</span>
+        <label>From <input id="link-from" list="fn-names" placeholder="function" autocomplete="off"></label>
+        <button id="link-swap" title="swap From and To">⇄</button>
+        <label>To <input id="link-to" list="fn-names" placeholder="function" autocomplete="off"></label>
+        <button id="link-clear">Clear</button>
+        <span class="muted">Find link is on: clicks pick the ends. Turn it off to get the normal click highlight back.</span>
+        <datalist id="fn-names"></datalist>
+      </div>
+      <div id="graph-stage"><svg id="graph-svg" xmlns="http://www.w3.org/2000/svg"><defs id="graph-defs"></defs><g id="graph-view"></g></svg></div>
+      <div id="graph-legend"><div class="lg-head">Legend <span class="link" id="graph-legend-x">hide</span></div><div id="graph-legend-body"></div></div>
+      <div id="tl-stage" hidden>
+        <svg id="tl-head" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div id="tl-body"><svg id="tl-svg" xmlns="http://www.w3.org/2000/svg"></svg></div>
+      </div>
+    </div>
+    <div class="pane" id="pane-fns"><table id="fn-table"><thead></thead><tbody></tbody></table></div>
+    <div class="pane" id="pane-flame">
+      <div id="flame-bar"><button id="flame-reset">Reset zoom</button><div id="flame-crumbs"></div><span class="muted">click: zoom + details</span></div>
+      <div id="flame-wrap"><canvas id="flame"></canvas></div>
+    </div>
+  </div>
+  <div id="split"></div>
+  <div id="right"><div class="empty">Select a call in the tree, a function in the call graph or table, or a bar in the flame view.</div></div>
+</main>
+<div id="tip"></div>
+<script id="data" type="application/json">/*__PERF_DATA__*/</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const N = D.f.length;
+const F = { EXC: 1, RAISED: 2, UNFINISHED: 4, LOCALS: 8, CACHE_HIT: 16, CACHE_MISS: 32, GENERATOR: 64, SUPPRESSED: 128 };
+const PAGE = 200;
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+function fmtT(x) {
+  if (x === null || x === undefined) return "unfinished";
+  if (x >= 1) return x.toFixed(2) + " s";
+  if (x >= 1e-3) return (x * 1e3).toFixed(1) + " ms";
+  return (x * 1e6).toFixed(0) + " µs";
+}
+function pct(x, of) { return of > 0 ? (100 * x / of) : 0; }
+function fmtPct(x) { return x >= 10 ? x.toFixed(0) + "%" : x.toFixed(1) + "%"; }
+const name = id => D.fns[D.f[id]];
+const det = id => D.detail[id] || {};
+const has = (id, flag) => (D.fl[id] & flag) !== 0;
+const TOTAL = D.meta.total || 0;
+const tEff = id => D.t[id] !== null ? D.t[id] : Math.max(TOTAL - D.s[id], 0);
+
+// children lists and subtree ends (ids are preorder)
+const kids = new Array(N);
+for (let i = 1; i < N; i++) { const p = D.p[i]; (kids[p] || (kids[p] = [])).push(i); }
+const subEnd = new Int32Array(N);
+for (let i = N - 1; i >= 0; i--) { const k = kids[i]; subEnd[i] = k ? subEnd[k[k.length - 1]] : i; }
+const depthOf = new Int32Array(N);
+for (let i = 1; i < N; i++) depthOf[i] = depthOf[D.p[i]] + 1;
+function ancestors(id) { const out = []; for (let x = D.p[id]; x !== -1; x = D.p[x]) out.push(x); return out.reverse(); }
+
+// calls of each function, in preorder
+const callsOf = D.fns.map(() => []);
+for (let i = 0; i < N; i++) callsOf[D.f[i]].push(i);
+// positional parameter names per function, from any call that recorded them
+const paramsOf = {};
+for (let i = 0; i < N; i++) { const d = D.detail[i]; if (d && d.params && !(D.f[i] in paramsOf)) paramsOf[D.f[i]] = d.params; }
+
+// ── value resolution (same rules as the reader's Trace.resolve) ─────────────
+function isRef(v) { return v !== null && typeof v === "object" && !Array.isArray(v) && "__ref__" in v; }
+function step(v) {
+  // one level of {"__ref__"} resolution; {"__type__": T, "__ref__": r} merges T with the pooled fields
+  let guard = 0;
+  while (isRef(v) && guard++ < 50) {
+    const target = D.vars[v.__ref__];
+    if (target === undefined) return v;
+    const extra = Object.keys(v).filter(k => k !== "__ref__");
+    if (extra.length && target && typeof target === "object" && !Array.isArray(target)) {
+      const m = {}; for (const k of extra) m[k] = v[k]; Object.assign(m, target); v = m;
+    } else v = target;
+  }
+  return v;
+}
+const deepMemo = new Map();
+function deep(v, depth = 0) {
+  if (depth > 100 || v === null || typeof v !== "object") return v;
+  if (isRef(v) && Object.keys(v).length === 1) {
+    const r = v.__ref__;
+    if (deepMemo.has(r)) return deepMemo.get(r);
+    if (!(r in D.vars)) return v;
+    deepMemo.set(r, null); // cycle guard
+    const out = deep(D.vars[r], depth + 1);
+    deepMemo.set(r, out);
+    return out;
+  }
+  v = step(v);
+  if (Array.isArray(v)) return v.map(x => deep(x, depth + 1));
+  if (v === null || typeof v !== "object") return v;
+  const o = {}; for (const k in v) o[k] = deep(v[k], depth + 1); return o;
+}
+// perf's placeholder for a value it kept only as a repr, e.g. <LawRepository>; markup such as "<html>…</html>" is a real string
+function isMarker(v) { return typeof v === "string" && v.length > 1 && v[0] === "<" && v[v.length - 1] === ">" && v.indexOf("<", 1) === -1 && v.indexOf("\n") === -1; }
+
+// one-line preview within a character budget, resolving refs as it goes
+function preview(v, budget = 80) {
+  let out = "";
+  function put(s) { out += s; return out.length < budget; }
+  function walk(x, d) {
+    if (out.length >= budget) return;
+    x = step(x);
+    if (x === null || x === undefined) return put("None");
+    if (typeof x === "boolean") return put(x ? "True" : "False");
+    if (typeof x === "number") return put(String(x));
+    if (typeof x === "string") return put(isMarker(x) ? x : JSON.stringify(x));
+    if (d > 3) return put(Array.isArray(x) ? "[…]" : "{…}");
+    if (Array.isArray(x)) {
+      put("[");
+      for (let i = 0; i < x.length; i++) { if (i) put(", "); walk(x[i], d + 1); if (out.length >= budget) return; }
+      return put("]");
+    }
+    if ("__spilled__" in x) return put("<spilled " + x.__spilled__ + ">");
+    const ty = x.__type__;
+    put(ty ? ty + "(" : "{");
+    let first = true;
+    for (const k in x) {
+      if (k === "__type__") continue;
+      if (!first) put(", "); first = false;
+      put(ty ? k + "=" : JSON.stringify(k) + ": "); walk(x[k], d + 1);
+      if (out.length >= budget) return;
+    }
+    return put(ty ? ")" : "}");
+  }
+  walk(v, 0);
+  return out.length > budget ? out.slice(0, budget - 1) + "…" : out;
+}
+
+// expandable value view, rendered one level at a time
+function valueView(v, wrap = true) {
+  const root = wrap ? el("div", "v") : document.createDocumentFragment();
+  root.appendChild(valueNode(v));
+  return root;
+}
+function valueNode(v) {
+  v = step(v);
+  if (v === null || v === undefined) return el("span", "lit", "None");
+  if (typeof v === "boolean") return el("span", "lit", v ? "True" : "False");
+  if (typeof v === "number") return el("span", "num", String(v));
+  if (typeof v === "string") {
+    if (isMarker(v)) return el("span", "mk", v);
+    if (v.length <= 300) return el("span", "s", JSON.stringify(v));
+    const d = el("details"); const sm = el("summary", "s", JSON.stringify(v.slice(0, 120)) + "… (" + v.length + " chars)");
+    d.appendChild(sm);
+    d.addEventListener("toggle", () => { if (d.open && d.children.length === 1) d.appendChild(el("div", "body s", v)); }, { once: false });
+    return d;
+  }
+  if (!Array.isArray(v) && "__spilled__" in v) return el("span", "mk", "<spilled to " + v.__spilled__ + ">");
+  const isArr = Array.isArray(v);
+  const keys = isArr ? null : Object.keys(v).filter(k => k !== "__type__");
+  const size = isArr ? v.length : keys.length;
+  if (size === 0) return el("span", "lit", isArr ? "[]" : (v.__type__ ? v.__type__ + "()" : "{}"));
+  const d = el("details");
+  const sm = el("summary");
+  if (!isArr && v.__type__) sm.appendChild(el("span", "ty", v.__type__ + " "));
+  sm.appendChild(el("span", "muted", (isArr ? "list[" + size + "] " : "{" + size + "} ")));
+  sm.appendChild(el("span", "", preview(v, 90)));
+  d.appendChild(sm);
+  d.addEventListener("toggle", () => {
+    if (!d.open || d.dataset.done) return;
+    d.dataset.done = "1";
+    const body = el("div", "body");
+    const items = isArr ? v.map((x, i) => [i, x]) : keys.map(k => [k, v[k]]);
+    let shown = 0;
+    const more = () => {
+      const stop = Math.min(items.length, shown + PAGE);
+      for (; shown < stop; shown++) {
+        const line = el("div");
+        line.appendChild(el("span", "k", isArr ? items[shown][0] + ": " : items[shown][0] + ": "));
+        line.appendChild(valueNode(items[shown][1]));
+        body.appendChild(line);
+      }
+      if (shown < items.length) {
+        const m = el("div", "link", "… " + (items.length - shown) + " more");
+        m.onclick = () => { m.remove(); more(); };
+        body.appendChild(m);
+      }
+    };
+    more();
+    d.appendChild(body);
+  });
+  return d;
+}
+
+// named arguments (the reader's named_args)
+function namedArgs(id) {
+  const d = det(id), nm = name(id);
+  const params = d.params || paramsOf[D.f[id]] || [];
+  const raw = d.args || [];
+  const parts = nm.split(".");
+  const owner = parts.length >= 2 ? parts[parts.length - 2] : "";
+  const out = raw.map((a, i) => {
+    let k;
+    if (i < params.length) k = params[i];
+    else if (i === 0 && /^[A-Z]/.test(owner)) {
+      const s = step(a);
+      k = (a === "<" + owner + ">" || (s && typeof s === "object" && s.__type__ === owner)) ? "self" : "arg0";
+    } else k = "arg" + i;
+    return [k, a];
+  });
+  for (const k in (d.kwargs || {})) out.push([k, d.kwargs[k]]);
+  return out;
+}
+
+// TRACE_LOCALS replay (same semantics as perf.expand_locals)
+const LKEYS = ["line", "set", "changed", "deleted", "globals", "deleted_globals"];
+function clone(v) { return Array.isArray(v) ? v.slice() : (v && typeof v === "object" ? Object.assign({}, v) : v); }
+function concat(a, b) { return Array.isArray(a) ? a.concat(b) : a + b; }
+function expandLocals(id) {
+  const d = det(id);
+  const params = d.params || [], args = d.args || [], kwargs = d.kwargs || {};
+  const cur = new Map();
+  const base = n => {
+    if (cur.has(n)) return cur.get(n);
+    const i = params.indexOf(n), j = i >= 0 ? i : args.length;
+    return deep(j < args.length ? args[j] : kwargs[n]);
+  };
+  const apply = (value, op) => {
+    const kind = op[0], path = op[1];
+    if (!path.length) return kind === "+" ? concat(value, deep(op[2])) : value;
+    const root = clone(value); let parent = root;
+    for (const key of path.slice(0, -1)) { parent[key] = clone(parent[key]); parent = parent[key]; }
+    const last = path[path.length - 1];
+    if (kind === "+") parent[last] = concat(parent[last], deep(op[2]));
+    else if (kind === "=") parent[last] = deep(op[2]);
+    else if (kind === "-") { if (Array.isArray(parent)) parent.splice(last, 1); else delete parent[last]; }
+    return root;
+  };
+  return (d.locals || []).map(raw => {
+    const e = {};
+    if (Array.isArray(raw)) raw.forEach((x, i) => { e[LKEYS[i]] = x; }); else Object.assign(e, raw);
+    const row = { line: e.line, set: {}, edited: [] };
+    for (const n in (e.set || {})) { const v = deep(e.set[n]); row.set[n] = v; cur.set(n, v); }
+    for (const n in (e.changed || {})) {
+      let v = base(n);
+      try { for (const op of e.changed[n]) v = apply(v, op); }
+      catch (err) { v = "<could not replay edits: " + err + ">"; }
+      row.set[n] = v; cur.set(n, v); row.edited.push(n);
+    }
+    for (const n of (e.deleted || [])) cur.delete(n);
+    if (e.deleted && e.deleted.length) row.deleted = e.deleted;
+    if (e.globals && Object.keys(e.globals).length) row.globals = deep(e.globals);
+    return row;
+  });
+}
+
+// ── header ──────────────────────────────────────────────────────────────────
+const raisedIds = [];
+for (let i = 0; i < N; i++) if (has(i, F.RAISED)) raisedIds.push(i);
+document.getElementById("title").textContent = D.meta.root;
+document.getElementById("title").title = D.meta.file;
+const facts = document.getElementById("facts");
+[[fmtT(TOTAL), "wall time of the traced call"], [N.toLocaleString() + " calls", ""], [D.fns.length + " functions", ""],
+ [D.meta.start_timestamp ? D.meta.start_timestamp.replace("T", " ").slice(0, 19) : "", "start"],
+ [D.meta.values ? "" : "values omitted (--no-values)", ""]]
+  .forEach(([t, tip]) => { if (t) { const s = el("span", "", t); if (tip) s.title = tip; facts.appendChild(s); } });
+const btnErr = document.getElementById("btn-errors");
+btnErr.textContent = "Errors (" + raisedIds.length + ")";
+if (raisedIds.length) btnErr.classList.add("err");
+
+// ── tabs and splitter ───────────────────────────────────────────────────────
+let tab = "tree";
+function showTab(t) {
+  tab = t;
+  document.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("on", b.dataset.tab === t));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("show", p.id === "pane-" + t));
+  if (t === "fns") renderFnTable();
+  if (t === "flame") drawFlame();
+  if (t === "graph") drawGraphView();
+}
+document.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+(() => {
+  const split = document.getElementById("split"), main = document.querySelector("main");
+  split.addEventListener("mousedown", e => {
+    e.preventDefault();
+    const move = ev => { const w = Math.max(300, main.getBoundingClientRect().right - ev.clientX); main.style.setProperty("--right", w + "px"); };
+    const up = () => { removeEventListener("mousemove", move); removeEventListener("mouseup", up); if (tab === "flame") drawFlame(); if (tab === "graph") graphResize(); };
+    addEventListener("mousemove", move); addEventListener("mouseup", up);
+  });
+})();
+
+// ── call tree ───────────────────────────────────────────────────────────────
+const treeEl = document.getElementById("tree");
+const nodeState = new Map();   // id -> {wrap,row,depth,open,kidsEl,groups,list}
+const groupState = new Map();  // "parent:index" -> {...}
+let selected = -1;
+
+function groupsOf(id) {
+  const out = [];
+  for (const c of (kids[id] || [])) {
+    const last = out[out.length - 1];
+    if (last && D.f[last[0]] === D.f[c]) last.push(c); else out.push([c]);
+  }
+  return out;
+}
+function makeList(container, items, render) {
+  const st = { items, shown: 0, container, render, more: null };
+  showMore(st, PAGE);
+  return st;
+}
+function showMore(st, upto) {
+  if (st.more) { st.more.remove(); st.more = null; }
+  upto = Math.min(upto, st.items.length);
+  const frag = document.createDocumentFragment();
+  for (; st.shown < upto; st.shown++) frag.appendChild(st.render(st.items[st.shown], st.shown));
+  if (st.shown < st.items.length) {
+    const m = el("div", "more");
+    const a = el("span", "link", "… " + (st.items.length - st.shown) + " more: show " + Math.min(PAGE, st.items.length - st.shown));
+    a.onclick = () => showMore(st, st.shown + PAGE);
+    m.appendChild(a); frag.appendChild(m); st.more = m;
+  }
+  st.container.appendChild(frag);
+}
+function metricCells(row, wall, self) {
+  // timing columns first, so deep names extend to the right (and scroll) instead of being squeezed
+  const bar = el("span", "c-bar"); const i = el("i"); i.style.width = Math.min(100, pct(wall, TOTAL)) + "%"; bar.appendChild(i);
+  row.prepend(el("span", "c-t", fmtT(wall)), el("span", "c-s", self === null ? "" : fmtT(self)), el("span", "c-p", fmtPct(pct(wall, TOTAL))), bar);
+}
+function rowClasses(row, id) {
+  if (has(id, F.RAISED)) row.classList.add("raised");
+  else if (has(id, F.EXC) && !has(id, F.SUPPRESSED)) row.classList.add("exc");
+  if (has(id, F.UNFINISHED)) row.classList.add("unf");
+}
+function badges(nm, id) {
+  if (has(id, F.RAISED)) nm.appendChild(el("span", "badge err", has(id, F.SUPPRESSED) ? "raised, suppressed" : "raised"));
+  else if (has(id, F.SUPPRESSED)) nm.appendChild(el("span", "badge err", "suppressed"));
+  if (has(id, F.CACHE_HIT)) nm.appendChild(el("span", "badge", "cache hit"));
+  if (has(id, F.CACHE_MISS)) nm.appendChild(el("span", "badge", "cache miss"));
+  if (has(id, F.GENERATOR)) nm.appendChild(el("span", "badge", "gen"));
+  if (has(id, F.LOCALS)) nm.appendChild(el("span", "badge", "locals"));
+  if (has(id, F.UNFINISHED)) nm.appendChild(el("span", "badge", "unfinished"));
+}
+function nodeEl(id, depth) {
+  const wrap = el("div");
+  const row = el("div", "row"); row.dataset.id = id;
+  const nm = el("span", "nm"); nm.style.paddingLeft = (depth * 14) + "px";
+  const tg = el("span", "tg", kids[id] ? "▸" : "");
+  nm.appendChild(tg);
+  nm.appendChild(el("span", "fn", name(id)));
+  badges(nm, id);
+  row.appendChild(nm);
+  rowClasses(row, id);
+  metricCells(row, tEff(id), D.st[id]);
+  row.title = "#" + id + "  " + name(id);
+  wrap.appendChild(row);
+  const s = { wrap, row, tg, depth, open: false, kidsEl: null, groups: null, list: null };
+  nodeState.set(id, s);
+  tg.onclick = e => { e.stopPropagation(); toggleNode(id); };
+  row.onclick = () => select(id);
+  row.ondblclick = () => toggleNode(id);
+  if (id === selected) row.classList.add("sel");
+  return wrap;
+}
+function toggleNode(id, open) {
+  const s = nodeState.get(id);
+  if (!s || !kids[id]) return;
+  if (open === undefined) open = !s.open;
+  if (open && !s.kidsEl) {
+    s.kidsEl = el("div"); s.wrap.appendChild(s.kidsEl);
+    s.groups = groupsOf(id);
+    s.list = makeList(s.kidsEl, s.groups, (g, i) => g.length === 1 ? nodeEl(g[0], s.depth + 1) : groupEl(g, s.depth + 1, id, i));
+  }
+  if (s.kidsEl) s.kidsEl.style.display = open ? "" : "none";
+  s.open = open; s.tg.textContent = open ? "▾" : "▸";
+}
+function groupEl(members, depth, parent, index) {
+  const wrap = el("div");
+  const row = el("div", "row");
+  const nm = el("span", "nm"); nm.style.paddingLeft = (depth * 14) + "px";
+  const tg = el("span", "tg", "▸"); nm.appendChild(tg);
+  nm.appendChild(el("span", "fn", name(members[0])));
+  nm.appendChild(el("span", "cnt", " ×" + members.length));
+  let wall = 0, self = 0, errs = 0;
+  for (const m of members) { wall += tEff(m); self += D.st[m]; if (has(m, F.RAISED)) errs++; }
+  if (errs) nm.appendChild(el("span", "badge err", errs + " raised"));
+  row.appendChild(nm);
+  metricCells(row, wall, self);
+  row.title = members.length + " consecutive calls of " + name(members[0]) + " (times summed)";
+  wrap.appendChild(row);
+  const gs = { wrap, row, tg, open: false, kidsEl: null, list: null, members, depth };
+  groupState.set(parent + ":" + index, gs);
+  tg.onclick = e => { e.stopPropagation(); toggleGroup(gs); };
+  row.onclick = () => { toggleGroup(gs); };
+  return wrap;
+}
+function toggleGroup(gs, open) {
+  if (open === undefined) open = !gs.open;
+  if (open && !gs.kidsEl) {
+    gs.kidsEl = el("div"); gs.wrap.appendChild(gs.kidsEl);
+    gs.list = makeList(gs.kidsEl, gs.members, m => nodeEl(m, gs.depth + 1));
+  }
+  if (gs.kidsEl) gs.kidsEl.style.display = open ? "" : "none";
+  gs.open = open; gs.tg.textContent = open ? "▾" : "▸";
+}
+function reveal(id) {
+  const path = ancestors(id).concat([id]);
+  for (let k = 0; k < path.length - 1; k++) {
+    const par = path[k], c = path[k + 1];
+    toggleNode(par, true);
+    const s = nodeState.get(par);
+    const gi = s.groups.findIndex(g => g[0] <= c && c <= g[g.length - 1]);
+    if (s.list.shown <= gi) showMore(s.list, gi + 1);
+    const g = s.groups[gi];
+    if (g.length > 1) {
+      const gs = groupState.get(par + ":" + gi);
+      toggleGroup(gs, true);
+      const mi = g.indexOf(c);
+      if (gs.list.shown <= mi) showMore(gs.list, mi + 1);
+    }
+  }
+  const s = nodeState.get(id);
+  if (s) s.row.scrollIntoView({ block: "center" });
+}
+function expandHot(id, depth) {
+  toggleNode(id, true);
+  if (depth >= 12) return;
+  for (const c of (kids[id] || [])) {
+    if (tEff(c) >= 0.1 * TOTAL && nodeState.has(c)) expandHot(c, depth + 1);
+  }
+}
+treeEl.appendChild(nodeEl(0, 0));
+expandHot(0, 0);
+
+// ── selection and the detail panel ──────────────────────────────────────────
+const right = document.getElementById("right");
+function select(id, opts = {}) {
+  if (selected >= 0 && nodeState.has(selected)) nodeState.get(selected).row.classList.remove("sel");
+  selected = id;
+  if (nodeState.has(id)) nodeState.get(id).row.classList.add("sel");
+  if (!opts.noHash) history.replaceState(null, "", "#n" + id);
+  renderDetail(id);
+  if (tab === "flame") drawFlame();
+}
+function goto(id) {
+  if (tab !== "tree" && tab !== "flame") showTab("tree");
+  if (tab === "tree") reveal(id);
+  else if (id < flameFocus || id > subEnd[flameFocus] || tEff(id) < 0.01 * tEff(flameFocus)) flameFocus = D.p[id] >= 0 ? D.p[id] : id;  // zoom so it is visible
+  select(id);
+}
+function nodeLink(id, label) {
+  const a = el("span", "link", label || name(id));
+  a.title = "#" + id;
+  a.onclick = () => goto(id);
+  return a;
+}
+function kvGrid(pairs) {
+  const g = el("div", "kv");
+  for (const [k, v] of pairs) {
+    if (v === undefined || v === null || v === "") continue;
+    g.appendChild(el("span", "k", k));
+    const c = el("span"); if (v instanceof Node) c.appendChild(v); else c.textContent = v; g.appendChild(c);
+  }
+  return g;
+}
+function sourceFile(id) { const d = det(id); return ((D.sources[d.source] || {}).file) || null; }
+
+function renderDetail(id) {
+  const d = det(id);
+  right.replaceChildren();
+  right.appendChild(el("h2", "", name(id)));
+
+  // path from the root
+  const crumbs = el("div", "crumbs");
+  for (const a of ancestors(id)) { crumbs.appendChild(nodeLink(a)); crumbs.appendChild(el("span", "sep", "›")); }
+  crumbs.appendChild(el("b", "", name(id) + "  #" + id));
+  right.appendChild(crumbs);
+
+  // timing
+  const par = D.p[id];
+  const fnCalls = callsOf[D.f[id]];
+  const k = fnCalls.indexOf(id);
+  const nav = el("span");
+  nav.appendChild(document.createTextNode("call " + (k + 1) + " of " + fnCalls.length + "  "));
+  if (k > 0) nav.appendChild(nodeLink(fnCalls[k - 1], "‹ prev"));
+  if (k > 0 && k < fnCalls.length - 1) nav.appendChild(document.createTextNode("  "));
+  if (k < fnCalls.length - 1) nav.appendChild(nodeLink(fnCalls[k + 1], "next ›"));
+  nav.appendChild(document.createTextNode("  "));
+  const fl = el("span", "link", "function stats"); fl.onclick = () => { showTab("fns"); renderFnDetail(D.f[id]); }; nav.appendChild(fl);
+  right.appendChild(el("h3", "", "Call"));
+  right.appendChild(kvGrid([
+    ["wall", D.t[id] === null ? "unfinished (still running when the trace closed)" : fmtT(D.t[id]) + "   (" + fmtPct(pct(D.t[id], TOTAL)) + " of the trace" + (par >= 0 ? ", " + fmtPct(pct(D.t[id], tEff(par))) + " of its caller" : "") + ")"],
+    ["self", fmtT(D.st[id])],
+    ["started", "+" + fmtT(D.s[id])],
+    ["perf capture", D.ct[id] ? fmtT(D.ct[id]) : null],
+    ["active time", d.active_time !== undefined ? fmtT(d.active_time) + "  (generator: excludes the consumer between yields)" : null],
+    ["yields", d.yields !== undefined ? String(d.yields) + (d.closed ? "  (closed early by the consumer)" : "") : null],
+    ["cache", d.cache || null],
+    ["source", sourceFile(id)],
+    ["same function", nav],
+  ]));
+
+  // arguments and result
+  if (!D.meta.values) right.appendChild(el("div", "note", "Values were omitted from this page (--no-values)."));
+  else if (d.capture_skipped) right.appendChild(el("div", "note", "Arguments and result not captured: past MAX_CAPTURES_PER_FUNCTION."));
+  const args = namedArgs(id);
+  if (args.length) {
+    right.appendChild(el("h3", "", "Arguments (at entry)"));
+    const g = el("div", "arg");
+    for (const [k, v] of args) { g.appendChild(el("span", "k", k)); g.appendChild(valueView(v)); }
+    right.appendChild(g);
+  }
+  if ("result" in d) {
+    right.appendChild(el("h3", "", has(id, F.SUPPRESSED) ? "Result (default returned after a suppressed error)" : "Result"));
+    right.appendChild(valueView(d.result));
+  }
+  if (d.yielded) { right.appendChild(el("h3", "", "First values yielded")); right.appendChild(valueView(d.yielded)); }
+
+  // exception
+  if (d.exception !== undefined) {
+    right.appendChild(el("h3", "err", "Exception"));
+    right.appendChild(el("pre", "err", d.exception));
+    const src = has(id, F.RAISED) ? null : (kids[id] || []).find(c => det(c).exception === d.exception);
+    const o = d.exception_origin;
+    const info = [];
+    if (o) info.push(["raised at", (o.file || "") + ":" + (o.line || "") + (o.function ? "  in " + o.function : "")]);
+    if (o && o.text) info.push(["line", o.text]);
+    if (src !== undefined && src !== null) info.push(["came from", nodeLink(src)]);
+    else if (has(id, F.RAISED)) info.push(["", "raised inside this call (not by a traced child)"]);
+    if (has(id, F.SUPPRESSED)) info.push(["fate", "suppressed here (SUPPRESS_ERRORS): the call returned the result above"]);
+    else {
+      // follow it up the callers: the first one that does not carry it caught it
+      let x = D.p[id], last = id;
+      while (x !== -1 && det(x).exception === d.exception && !has(x, F.SUPPRESSED)) { last = x; x = D.p[x]; }
+      const fate = el("span");
+      if (x === -1) fate.textContent = "escaped the traced call";
+      else if (det(x).exception === d.exception) { fate.append("suppressed in "); fate.appendChild(nodeLink(x)); }
+      else { fate.append("caught in "); fate.appendChild(nodeLink(x)); }
+      if (last !== id) fate.append("  (propagated up " + (depthOf[id] - depthOf[last]) + " level" + (depthOf[id] - depthOf[last] > 1 ? "s" : "") + ")");
+      info.push(["fate", fate]);
+    }
+    right.appendChild(kvGrid(info));
+    const dbg = d.exception_debug;
+    if (dbg && dbg.formatted) {
+      const det2 = el("details"); det2.appendChild(el("summary", "link", "full traceback"));
+      det2.appendChild(el("pre", "", dbg.formatted)); right.appendChild(det2);
+    }
+  }
+
+  // locals
+  if (d.locals && d.locals.length) renderLocals(id, d);
+  else if (d.locals_dropped) right.appendChild(el("div", "note", "Locals dropped: " + d.locals_dropped));
+
+  // children
+  const ks = kids[id];
+  if (ks) {
+    right.appendChild(el("h3", "", "Calls made (" + ks.length + ")"));
+    const tb = el("table"); const body = el("tbody");
+    const gs = groupsOf(id);
+    for (const g of gs.slice(0, 300)) {
+      let w = 0, errs = 0; for (const m of g) { w += tEff(m); if (has(m, F.RAISED)) errs++; }
+      const tr = el("tr");
+      const c1 = el("td", "fnc"); c1.appendChild(el("span", has(g[0], F.RAISED) ? "err" : "", name(g[0]) + (g.length > 1 ? "  ×" + g.length : "")));
+      if (errs) c1.appendChild(el("span", "badge err", errs + " raised"));
+      tr.appendChild(c1);
+      tr.appendChild(el("td", "n", fmtT(w)));
+      tr.appendChild(el("td", "n muted", fmtPct(pct(w, tEff(id)))));
+      tr.onclick = () => goto(g[0]);
+      body.appendChild(tr);
+    }
+    tb.appendChild(body); right.appendChild(tb);
+    if (gs.length > 300) right.appendChild(el("div", "note", (gs.length - 300) + " more groups: expand the call in the tree"));
+  }
+  right.scrollTop = 0;
+}
+
+function renderLocals(id, d) {
+  const src = D.sources[d.source] || { lines: {} };
+  const rows = expandLocals(id);
+  const excLine = d.exception !== undefined && has(id, F.RAISED) && d.exception_origin ? d.exception_origin.line : null;
+  right.appendChild(el("h3", "", "Locals, line by line (" + rows.length + " changes)"));
+  right.appendChild(el("div", "note", "Each row is a line that ran and changed variables; ✎ marks an in-place edit. Click a value to expand it."));
+  const tb = el("table", "loc"); const body = el("tbody"); tb.appendChild(body);
+  let shown = 0;
+  const more = () => {
+    const stop = Math.min(rows.length, shown + PAGE);
+    for (; shown < stop; shown++) {
+      const r = rows[shown];
+      const tr = el("tr"); if (r.line === excLine) tr.classList.add("raise");
+      tr.appendChild(el("td", "ln", r.line));
+      const s = el("td", "src", (src.lines[String(r.line)] || "").trim()); s.title = src.lines[String(r.line)] || ""; tr.appendChild(s);
+      const vals = el("td");
+      for (const n in r.set) {
+        const chip = el("span", "chip v");
+        chip.appendChild(el("span", "k", n + (r.edited.includes(n) ? " ✎" : "") + " = "));
+        chip.appendChild(valueNode(r.set[n]));
+        vals.appendChild(chip);
+      }
+      if (r.deleted) vals.appendChild(el("span", "muted", "del " + r.deleted.join(", ")));
+      if (r.globals) { const c = el("span", "chip v"); c.appendChild(el("span", "k", "globals = ")); c.appendChild(valueNode(r.globals)); vals.appendChild(c); }
+      tr.appendChild(vals);
+      body.appendChild(tr);
+    }
+    if (shown < rows.length) {
+      const tr = el("tr"); const td = el("td"); td.colSpan = 3;
+      const a = el("span", "link", "… " + (rows.length - shown) + " more rows"); a.onclick = () => { tr.remove(); more(); };
+      td.appendChild(a); tr.appendChild(td); body.appendChild(tr);
+    }
+  };
+  more();
+  right.appendChild(tb);
+}
+
+// ── functions ───────────────────────────────────────────────────────────────
+let fnStats = null, fnSort = { key: "self", desc: true }, fnSelected = -1;
+function computeFnStats() {
+  const M = D.fns.length;
+  const st = D.fns.map((n, i) => ({ i, name: n, calls: 0, self: 0, cumul: 0, raised: 0, max: 0, callers: new Map(), callees: new Map() }));
+  // cumul counts only outermost calls of a function, so recursion is not counted twice
+  const active = new Int32Array(M);
+  const stack = [];
+  for (let i = 0; i < N; i++) {
+    while (stack.length && subEnd[stack[stack.length - 1]] < i) active[D.f[stack.pop()]]--;
+    const s = st[D.f[i]], w = tEff(i);
+    s.calls++; s.self += D.st[i]; s.max = Math.max(s.max, w);
+    if (active[D.f[i]] === 0) s.cumul += w;
+    if (has(i, F.RAISED)) s.raised++;
+    if (i > 0) {
+      const pf = D.f[D.p[i]];
+      const a = st[pf].callees.get(D.f[i]) || { n: 0, t: 0 }; a.n++; a.t += w; st[pf].callees.set(D.f[i], a);
+      const b = s.callers.get(pf) || { n: 0, t: 0 }; b.n++; b.t += w; s.callers.set(pf, b);
+    }
+    active[D.f[i]]++; stack.push(i);
+  }
+  return st;
+}
+// numbers first and the name last, so long names are never cut off (the table scrolls instead)
+const FN_COLS = [["calls", "calls", 1], ["self", "self total", 1], ["cumul", "cumul", 1], ["avg", "avg", 1], ["raised", "raised", 1], ["name", "function"]];
+function renderFnTable() {
+  if (!fnStats) fnStats = computeFnStats();
+  const table = document.getElementById("fn-table");
+  const head = el("tr");
+  for (const [k, label, num] of FN_COLS) {
+    const th = el("th", num ? "n" : "", label + (fnSort.key === k ? (fnSort.desc ? " ↓" : " ↑") : ""));
+    th.onclick = () => { fnSort = { key: k, desc: fnSort.key === k ? !fnSort.desc : k !== "name" }; renderFnTable(); };
+    head.appendChild(th);
+  }
+  table.tHead.replaceChildren(head);
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  const val = (s, k) => k === "avg" ? s.cumul / s.calls : s[k];
+  const rows = fnStats.filter(s => !q || q[0] === "#" || s.name.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const x = val(a, fnSort.key), y = val(b, fnSort.key);
+      const c = typeof x === "string" ? x.localeCompare(y) : x - y;
+      return fnSort.desc ? -c : c;
+    });
+  const body = el("tbody");
+  for (const s of rows) {
+    const tr = el("tr"); if (s.i === fnSelected) tr.classList.add("sel");
+    tr.appendChild(el("td", "n", s.calls.toLocaleString()));
+    tr.appendChild(el("td", "n", fmtT(s.self)));
+    tr.appendChild(el("td", "n", fmtT(s.cumul)));
+    tr.appendChild(el("td", "n", fmtT(s.cumul / s.calls)));
+    tr.appendChild(el("td", "n" + (s.raised ? " err" : " muted"), s.raised || ""));
+    const c = el("td", "fname", s.name); if (s.raised) c.classList.add("err"); tr.appendChild(c);
+    tr.onclick = () => { renderFnDetail(s.i); renderFnTable(); };
+    body.appendChild(tr);
+  }
+  table.tBodies[0].replaceWith(body);
+}
+function fnLink(i) { const a = el("span", "link", D.fns[i]); a.onclick = () => { renderFnDetail(i); if (tab === "fns") renderFnTable(); }; return a; }
+function edgeTable(title, map, ofTime) {
+  right.appendChild(el("h3", "", title + " (" + map.size + ")"));
+  if (!map.size) { right.appendChild(el("div", "note", "none")); return; }
+  const tb = el("table"), body = el("tbody"); tb.appendChild(body);
+  const head = el("tr"); ["function", "calls", "time", ""].forEach((h, j) => head.appendChild(el("th", j ? "n" : "", h)));
+  const th = el("thead"); th.appendChild(head); tb.insertBefore(th, body);
+  for (const [fi, e] of [...map.entries()].sort((a, b) => b[1].t - a[1].t)) {
+    const tr = el("tr"); const c = el("td", "fnc"); c.appendChild(fnLink(fi)); tr.appendChild(c);
+    tr.appendChild(el("td", "n", e.n.toLocaleString())); tr.appendChild(el("td", "n", fmtT(e.t)));
+    tr.appendChild(el("td", "n muted", ofTime ? fmtPct(pct(e.t, ofTime)) : ""));
+    body.appendChild(tr);
+  }
+  right.appendChild(tb);
+}
+function renderFnDetail(i) {
+  if (!fnStats) fnStats = computeFnStats();
+  fnSelected = i;
+  graphMarkSelected();
+  const s = fnStats[i];
+  right.replaceChildren();
+  right.appendChild(el("h2", "", s.name));
+  right.appendChild(kvGrid([
+    ["calls", s.calls.toLocaleString()],
+    ["self total", fmtT(s.self) + "   (" + fmtPct(pct(s.self, TOTAL)) + " of the trace)"],
+    ["cumulative", fmtT(s.cumul) + "   (outermost calls only)"],
+    ["average", fmtT(s.cumul / s.calls)], ["slowest", fmtT(s.max)],
+    ["raised", s.raised ? s.raised + " exceptions raised here" : null],
+  ]));
+  edgeTable("Called by", s.callers);
+  edgeTable("Calls", s.callees, s.cumul);
+  const calls = callsOf[i].slice().sort((a, b) => tEff(b) - tEff(a));
+  right.appendChild(el("h3", "", "Slowest calls"));
+  const tb = el("table"), body = el("tbody"); tb.appendChild(body);
+  for (const c of calls.slice(0, 50)) {
+    const tr = el("tr");
+    const td = el("td", "fnc"); td.appendChild(el("span", has(c, F.RAISED) ? "err" : "", "#" + c + "  " + (D.meta.values ? preview(namedArgs(c).map(([k, v]) => k === "self" ? null : [k, v]).filter(Boolean).reduce((o, [k, v]) => (o[k] = v, o), {}), 90) : "")));
+    tr.appendChild(td); tr.appendChild(el("td", "n", fmtT(tEff(c))));
+    tr.onclick = () => { showTab("tree"); goto(c); };
+    body.appendChild(tr);
+  }
+  right.appendChild(tb);
+  if (calls.length > 50) right.appendChild(el("div", "note", (calls.length - 50) + " more calls"));
+  right.scrollTop = 0;
+}
+
+// ── flame (time runs left to right, callers above callees) ──────────────────
+const canvas = document.getElementById("flame"), tip = document.getElementById("tip");
+const ROW = 18;
+let flameFocus = 0, flameRects = [];
+function hue(str) { let h = 0; for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0; return Math.abs(h); }
+function flameColor(id) {
+  if (has(id, F.RAISED)) return "hsl(0, 70%, 62%)";
+  const h = hue(name(id).split(".")[0]);
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  return "hsl(" + (20 + h % 40) + ", " + (55 + h % 25) + "%, " + (dark ? 38 + h % 12 : 62 + h % 14) + "%)";
+}
+function drawFlame() {
+  if (tab !== "flame") return;
+  const wrap = document.getElementById("pane-flame");
+  const W = wrap.clientWidth;
+  const anc = ancestors(flameFocus);
+  let maxDepth = 0;
+  for (let i = flameFocus; i <= subEnd[flameFocus]; i++) maxDepth = Math.max(maxDepth, depthOf[i]);
+  const rows = anc.length + (maxDepth - depthOf[flameFocus]) + 1;
+  const H = rows * ROW + 4;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr; canvas.height = H * dpr; canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.font = "11px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.textBaseline = "middle";
+  const css = getComputedStyle(document.documentElement);
+  const fg = "#111", sel = css.getPropertyValue("--accent");
+  flameRects = Array.from({ length: rows }, () => []);
+  const t0 = D.s[flameFocus], dur = tEff(flameFocus) || 1e-12;
+  const box = (id, x, w, r, dim) => {
+    const y = r * ROW;
+    ctx.globalAlpha = dim ? 0.55 : 1;
+    ctx.fillStyle = flameColor(id);
+    ctx.fillRect(x, y, Math.max(w - 1, 0.5), ROW - 1);
+    if (id === selected) { ctx.strokeStyle = sel; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, Math.max(w - 3, 1), ROW - 3); }
+    if (w > 36) {
+      ctx.save(); ctx.beginPath(); ctx.rect(x, y, w - 2, ROW); ctx.clip();
+      ctx.fillStyle = fg; ctx.fillText(name(id) + "  " + fmtT(tEff(id)), x + 4, y + ROW / 2);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+    flameRects[r].push([x, w, id]);
+  };
+  anc.forEach((a, r) => box(a, 0, W, r, true));
+  const base = anc.length - depthOf[flameFocus];
+  for (let i = flameFocus; i <= subEnd[flameFocus];) {
+    const x = (D.s[i] - t0) / dur * W, w = tEff(i) / dur * W;
+    if (w < 0.4) { i = subEnd[i] + 1; continue; }   // too narrow: skip it and everything under it
+    box(i, x, w, base + depthOf[i], false);
+    i++;
+  }
+  const crumbs = document.getElementById("flame-crumbs");
+  crumbs.textContent = anc.map(a => name(a)).concat([name(flameFocus) + "  " + fmtT(tEff(flameFocus))]).join(" › ");
+}
+function flameHit(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = ev.clientX - r.left, row = Math.floor((ev.clientY - r.top) / ROW);
+  const list = flameRects[row] || [];
+  for (let k = list.length - 1; k >= 0; k--) { const [rx, rw, id] = list[k]; if (x >= rx && x <= rx + rw) return id; }
+  return -1;
+}
+canvas.addEventListener("mousemove", ev => {
+  const id = flameHit(ev);
+  if (id < 0) { tip.style.display = "none"; return; }
+  tip.replaceChildren(el("div", "mono", name(id) + "  #" + id),
+    el("div", "muted", "wall " + fmtT(tEff(id)) + " · self " + fmtT(D.st[id]) + " · " + fmtPct(pct(tEff(id), TOTAL)) + " of trace"));
+  if (has(id, F.EXC)) tip.appendChild(el("div", "err", det(id).exception || ""));
+  tip.style.display = "block";
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - 360) + "px"; tip.style.top = (ev.clientY + 14) + "px";
+});
+canvas.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+canvas.addEventListener("click", ev => {
+  const id = flameHit(ev);
+  if (id < 0) return;
+  if (kids[id]) flameFocus = id;
+  select(id);
+  drawFlame();
+});
+document.getElementById("flame-reset").onclick = () => { flameFocus = 0; drawFlame(); };
+addEventListener("resize", () => drawFlame());
+
+// ── call graph: one box per function, columns by call depth, arrows caller → callee ─
+const SVGNS = "http://www.w3.org/2000/svg";
+const gView = document.getElementById("graph-view"), gStage = document.getElementById("graph-stage");
+const gTop = document.getElementById("graph-top"), gTopOut = document.getElementById("graph-top-out");
+let graphN = Math.min(30, D.fns.length), graphDrawn = false, gCam = { x: 0, y: 0, k: 1 };
+gTop.max = Math.max(2, D.fns.length); gTop.value = graphN;
+gTopOut.textContent = graphN + " of " + D.fns.length;
+gTop.oninput = () => { gTopOut.textContent = gTop.value + " of " + D.fns.length; };
+gTop.onchange = () => { graphN = +gTop.value; gTopOut.textContent = graphN + " of " + D.fns.length; graphDrawn = false; drawGraphView(); };
+
+function svgEl(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function svgText(parent, x, y, text, cls, anchor) {
+  const e = svgEl("text", { x, y, class: cls || "", "text-anchor": anchor || "start" }, parent);
+  e.textContent = text; return e;
+}
+const cleanName = n => n.replace(/\.<locals>/g, "");
+function fnGroup(fi) { const n = cleanName(D.fns[fi]); const k = n.lastIndexOf("."); return k > 0 ? n.slice(0, k) : ""; }
+function fnLabel(fi) {   // "Class.method", or the bare function name for module functions
+  const parts = cleanName(D.fns[fi]).split(".");
+  return parts.length >= 2 && /^[A-Z]/.test(parts[parts.length - 2]) ? parts.slice(-2).join(".") : parts[parts.length - 1];
+}
+function fnModule(fi) { const g = fnGroup(fi); return !g || /^[A-Z]/.test(g.split(".").pop()) ? "" : g; }
+function groupColor(g) {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  return "hsl(" + (hue(g) % 360) + " 60% " + (dark ? 62 : 50) + "%)";
+}
+function clipText(text, px, charPx = 7.2) { const n = Math.floor(px / charPx); return text.length > n ? text.slice(0, Math.max(n - 1, 1)) + "…" : text; }
+function graphTip(ev, lines) {
+  tip.replaceChildren(...lines.map(([cls, text]) => el("div", cls, text)));
+  tip.style.display = "block";
+  tip.style.left = Math.min(ev.clientX + 14, innerWidth - 380) + "px";
+  tip.style.top = Math.min(ev.clientY + 14, innerHeight - 120) + "px";
+}
+
+// The functions shown and how they hang together, shared by the graph and the timeline.
+let gModel = null;
+function graphModel() {
+  if (gModel && gModel.n === graphN) return gModel;
+  if (!fnStats) fnStats = computeFnStats();
+  // the N functions with the most total time, plus the entry point
+  const shown = new Set(fnStats.slice().sort((a, b) => b.cumul - a.cumul).slice(0, graphN).map(s => s.i));
+  shown.add(D.f[0]);
+  // each shown call links to its nearest shown caller: hidden functions in between make the arrow dashed
+  const edges = new Map(), layer = new Map([[D.f[0], 0]]), depth = new Map(), stack = [];
+  const sAnc = new Int32Array(N).fill(-1);   // shown call -> its nearest shown caller call (the arrows' real calls)
+  for (let i = 0; i < N; i++) {
+    while (stack.length && subEnd[stack[stack.length - 1]] < i) stack.pop();
+    if (!shown.has(D.f[i])) continue;
+    const anc = stack.length ? stack[stack.length - 1] : -1;
+    const d = anc < 0 ? 0 : depth.get(anc) + 1;
+    depth.set(i, d);
+    layer.set(D.f[i], layer.has(D.f[i]) ? Math.min(layer.get(D.f[i]), d) : d);
+    if (anc >= 0) {
+      const key = D.f[anc] + ">" + D.f[i];
+      const e = edges.get(key) || { a: D.f[anc], b: D.f[i], n: 0, t: 0, skip: false, err: 0 };
+      e.n++; e.t += tEff(i); e.skip = e.skip || D.p[i] !== anc; if (has(i, F.RAISED)) e.err++;
+      edges.set(key, e);
+    }
+    sAnc[i] = anc;
+    stack.push(i);
+  }
+  // Layout as a tree: each function sits under its main caller (the one that spends the most
+  // time in it), so the arrows drawn by default can never cross. Shared helpers' other callers
+  // are "extra" arrows: hidden until you hover the box (or tick "All callers"), and counted
+  // in a +N badge. Functions are taken in first-call order, so a main caller is always placed
+  // before its callees and siblings read top to bottom in the order they first ran.
+  const incoming = new Map();
+  for (const e of edges.values()) if (e.a !== e.b) (incoming.get(e.b) || incoming.set(e.b, []).get(e.b)).push(e);
+  const order = [...layer.keys()].sort((a, b) => callsOf[a][0] - callsOf[b][0]);
+  const main = new Map(), placed = new Set([D.f[0]]), children = new Map();
+  for (const fi of order) {
+    if (fi === D.f[0]) continue;
+    let best = null;
+    for (const e of (incoming.get(fi) || [])) if (placed.has(e.a) && (!best || e.t > best.t)) best = e;
+    main.set(fi, best); placed.add(fi);
+    (children.get(best.a) || children.set(best.a, []).get(best.a)).push(fi);
+  }
+  // rows for the timeline: the same tree, depth first, siblings in first-call order
+  const rows = [];
+  (function walk(fi, depth) { rows.push({ fi, depth }); (children.get(fi) || []).forEach(k => walk(k, depth + 1)); })(D.f[0], 0);
+  return (gModel = { n: graphN, edges, main, children, rows, shown, sAnc });
+}
+function drawGraph() {
+  if (tab !== "graph" || graphDrawn) return;
+  graphDrawn = true;
+  if (!fnStats) fnStats = computeFnStats();
+  const defs = document.getElementById("graph-defs"); defs.replaceChildren();
+  for (const [id, cls] of [["g-arrow", ""], ["g-arrow-hot", "hot"], ["g-arrow-aux", "aux"], ["g-arrow-lk", "lk"]]) {
+    const m = svgEl("marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 9, markerHeight: 9, markerUnits: "userSpaceOnUse", orient: "auto-start-reverse", class: cls }, defs);
+    svgEl("path", { d: "M0,0 L10,5 L0,10 z" }, m);
+  }
+  gView.replaceChildren();
+
+  const { edges, main, children } = graphModel();
+  const W = 210, H = 46, GX = 90, GY = 16;
+  const xy = new Map();
+  let leaf = 0;
+  (function place(fi, depth) {
+    const ks = children.get(fi) || [];
+    if (!ks.length) { xy.set(fi, [depth * (W + GX), leaf++ * (H + GY)]); return; }
+    ks.forEach(k => place(k, depth + 1));
+    xy.set(fi, [depth * (W + GX), (xy.get(ks[0])[1] + xy.get(ks[ks.length - 1])[1]) / 2]);
+  })(D.f[0], 0);
+
+  const auxG = svgEl("g", {}, gView), eg = svgEl("g", {}, gView), ng = svgEl("g", {}, gView);
+  const tmax = Math.max(...[...edges.values()].map(e => e.t), 1e-12);
+  const touching = gTouching = new Map();   // function -> [edge element, edge]
+  gEdgeEl = new Map();                        // "caller>callee" -> arrow element
+  const extra = new Map();      // function -> number of other callers not drawn by default
+  for (const e of edges.values()) {
+    if (e.a === e.b) continue;   // recursion: shown as a ↻ mark on the box
+    const aux = main.get(e.b) !== e;
+    if (aux) extra.set(e.b, (extra.get(e.b) || 0) + 1);
+    const [x1, y1] = xy.get(e.a), [x2, y2] = xy.get(e.b);
+    const hot = !aux && e.t / tmax > 0.25;
+    const g = svgEl("g", { class: "g-e" + (hot ? " hot" : "") + (e.skip ? " skip" : "") + (aux ? " aux" : "") }, aux ? auxG : eg);
+    let d, lx, ly;
+    if (x2 > x1) {
+      const sx = x1 + W, sy = y1 + H / 2, tx = x2, ty = y2 + H / 2, dx = Math.max(30, Math.min(GX, (tx - sx) / 2));
+      d = `M${sx},${sy} C${sx + dx},${sy} ${tx - dx},${ty} ${tx},${ty}`;
+      const u = 0.78, v = 1 - u;   // label near the callee, where fanned-out arrows have separated
+      lx = v * v * v * sx + 3 * v * v * u * (sx + dx) + 3 * v * u * u * (tx - dx) + u * u * u * tx;
+      ly = v * v * v * sy + 3 * v * v * u * sy + 3 * v * u * u * ty + u * u * u * ty;
+    } else {                     // an extra caller to the right of (or level with) its callee: loop round
+      const sx = x1 + W, sy = y1 + H / 2, tx = x2, ty = y2 + H / 2;
+      d = `M${sx},${sy} C${sx + 70},${sy} ${tx - 70},${ty} ${tx},${ty}`;
+      lx = (sx + tx) / 2; ly = (sy + ty) / 2;
+    }
+    svgEl("path", { d, "stroke-width": (1.2 + 3.5 * Math.sqrt(e.t / tmax)).toFixed(2), "marker-end": hot ? "url(#g-arrow-hot)" : aux ? "url(#g-arrow-aux)" : "url(#g-arrow)" }, g);
+    const label = "×" + e.n + (e.err ? "  ⚠" + e.err : ""), lw = label.length * 6.2 + 8;
+    svgEl("rect", { x: lx - lw / 2, y: ly - 9, width: lw, height: 15, rx: 4, class: "g-lbl" }, g);
+    svgText(g, lx, ly + 2, label, e.err ? "err" : "", "middle");
+    g.addEventListener("mousemove", ev => graphTip(ev, [["mono", D.fns[e.a] + " → " + D.fns[e.b]],
+      ["muted", e.n + " call" + (e.n > 1 ? "s" : "") + " · " + fmtT(e.t) + (e.skip ? " · through functions not shown" : "") + (aux ? " · not its main caller" : "")]]
+      .concat(e.err ? [["err", e.err + " raised"]] : [])));
+    g.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    for (const f of [e.a, e.b]) (touching.get(f) || touching.set(f, []).get(f)).push([g, e]);
+    gEdgeEl.set(e.a + ">" + e.b, g);
+  }
+  const recursive = new Set([...edges.values()].filter(e => e.a === e.b).map(e => e.a));
+  for (const [fi, [x, y]] of xy) {
+    const s = fnStats[fi];
+    const g = svgEl("g", { class: "g-n" + (s.raised ? " err" : "") + (fi === D.f[0] ? " root" : ""), transform: `translate(${x},${y})` }, ng);
+    g.dataset.fn = fi;
+    const color = groupColor(fnGroup(fi));
+    svgEl("rect", { class: "box", width: W, height: H, rx: 8 }, g);
+    svgEl("rect", { width: 5, height: H, rx: 2, fill: color }, g);
+    // top-right marks: ⚠ raised, +N other callers, ↻ recursive
+    const marks = [];
+    if (s.raised) marks.push(["x", "⚠" + s.raised]);
+    if (extra.get(fi)) marks.push(["m", "+" + extra.get(fi)]);
+    if (recursive.has(fi)) marks.push(["m", "↻"]);
+    let mx = W - 10;
+    for (const [cls, text] of marks) { svgText(g, mx, 18, text, cls, "end"); mx -= text.length * 7 + 8; }
+    svgText(g, 14, 18, clipText(fnLabel(fi), mx - 14), "t");
+    svgText(g, 14, 35, clipText("×" + s.calls.toLocaleString() + " · " + fmtT(s.cumul) + (fnModule(fi) ? " · " + fnModule(fi) : ""), W - 22, 6.3), "s");
+    if (TOTAL && s.self) svgEl("rect", { x: 14, y: H - 5, width: Math.max(2, (W - 28) * Math.min(1, 3 * s.self / TOTAL)), height: 2.5, rx: 1, fill: color }, g);
+    g.addEventListener("mousemove", ev => graphTip(ev, [["mono", s.name],
+      ["muted", s.calls.toLocaleString() + " call" + (s.calls > 1 ? "s" : "") + " · " + fmtT(s.cumul) + " total (" + fmtPct(pct(s.cumul, TOTAL)) + ") · self " + fmtT(s.self)]]
+      .concat(extra.get(fi) ? [["muted", "also called from " + extra.get(fi) + " other function" + (extra.get(fi) > 1 ? "s" : "") + " shown here (dashed while hovered)"]] : [])
+      .concat(recursive.has(fi) ? [["muted", "calls itself (recursive)"]] : [])
+      .concat(s.raised ? [["err", s.raised + " raised"]] : [])));
+    // hover previews the links; a click pins them until you click the box again, empty space, or press Esc
+    g.addEventListener("mouseenter", () => { if (!gLink.on && gPinned < 0) graphFocus(fi); });
+    g.addEventListener("mouseleave", () => { tip.style.display = "none"; if (!gLink.on && gPinned < 0) graphFocus(-1); });
+    g.addEventListener("click", ev => {
+      ev.stopPropagation();
+      if (gMoved) return;
+      if (gLink.on) { linkPick(fi); return; }   // Find link mode: the click picks an end
+      gPinned = gPinned === fi ? -1 : fi;
+      graphFocus(gPinned);
+      renderFnDetail(fi);
+    });
+  }
+  graphMarkSelected();
+  graphHighlight(document.getElementById("q").value);
+  if (gPinned >= 0 && !gView.querySelector(`.g-n[data-fn="${gPinned}"]`)) gPinned = -1;
+  graphFocus(gPinned);
+  if (gLink.on) linkApply();
+  graphFit();
+}
+// Highlight a function and the functions linked to it: callers outlined purple, callees green,
+// their arrows (extra callers included) drawn, everything else faded. -1 clears it.
+let gPinned = -1, gTouching = new Map(), gEdgeEl = new Map(), gMoved = false;
+// The flow through a function, from the calls that actually happened: upstream = every chain of
+// calls that led to one of its calls (up to the entry point), downstream = everything those calls
+// ran, nested to any depth. Returns the functions on each side and the arrows on those paths.
+function graphFlow(fi) {
+  const { sAnc, shown } = graphModel();
+  const up = new Set(), down = new Set(), arrows = new Set(), seen = new Uint8Array(N);
+  const calls = callsOf[fi];
+  for (const c of calls) {                       // upstream: climb the nearest-shown-caller chain
+    for (let x = c; sAnc[x] >= 0 && !seen[x]; x = sAnc[x]) {
+      seen[x] = 1;
+      const a = sAnc[x];
+      if (D.f[a] !== D.f[x]) arrows.add(D.f[a] + ">" + D.f[x]);
+      if (D.f[a] !== fi) up.add(D.f[a]);
+    }
+  }
+  let coveredTo = -1;
+  for (const c of calls) {                       // downstream: every shown call inside its subtrees
+    if (c <= coveredTo) continue;                // nested (recursive) call already covered
+    coveredTo = subEnd[c];
+    for (let i = c + 1; i <= subEnd[c]; i++) {
+      if (!shown.has(D.f[i]) || sAnc[i] < c) continue;
+      if (D.f[sAnc[i]] !== D.f[i]) arrows.add(D.f[sAnc[i]] + ">" + D.f[i]);
+      if (D.f[i] !== fi) down.add(D.f[i]);
+    }
+  }
+  return { up, down, arrows };
+}
+function graphFocus(fi) {
+  gView.querySelectorAll(".dim, .caller, .callee, .focus, .flow").forEach(n => n.classList.remove("dim", "caller", "callee", "focus", "flow"));
+  gView.querySelectorAll(".g-e.show").forEach(n => n.classList.remove("show"));
+  const flow = fi >= 0 ? graphFlow(fi) : { up: new Set(), down: new Set(), arrows: new Set() };
+  if (fi >= 0) {
+    gView.querySelectorAll(".g-n").forEach(n => {
+      const f = +n.dataset.fn;
+      if (f === fi) n.classList.add("focus");
+      else if (flow.up.has(f)) n.classList.add("caller");      // a function both above and below (recursion) shows as upstream
+      else if (flow.down.has(f)) n.classList.add("callee");
+      else n.classList.add("dim");
+    });
+    gView.querySelectorAll(".g-e").forEach(n => n.classList.add("dim"));
+    for (const key of flow.arrows) { const g = gEdgeEl.get(key); if (g) { g.classList.remove("dim"); g.classList.add("show", "flow"); } }
+  }
+  // the timeline fades the same way
+  const keep = new Set([fi, ...flow.up, ...flow.down]);
+  tlSvg.querySelectorAll(".tl-row").forEach(n => n.classList.toggle("dim", fi >= 0 && !keep.has(+n.dataset.fn)));
+}
+function graphMarkSelected() { gView.querySelectorAll(".g-n").forEach(n => n.classList.toggle("sel", +n.dataset.fn === fnSelected)); timelineMarks(); }
+function graphHighlight(q) {
+  q = (q || "").trim().toLowerCase();
+  gView.querySelectorAll(".g-n").forEach(n => n.classList.toggle("match", !!q && q[0] !== "#" && D.fns[+n.dataset.fn].toLowerCase().includes(q)));
+  timelineMarks();
+}
+
+// pan / zoom
+const gApply = () => gView.setAttribute("transform", `translate(${gCam.x},${gCam.y}) scale(${gCam.k})`);
+function graphResize() { if (gViewMode === "timeline") tlRedraw(); else graphFit(); }
+function graphFit() {
+  if (tab !== "graph") return;
+  if (gViewMode === "timeline") { TL.v0 = 0; TL.v1 = TOTAL || 1e-9; tlRedraw(); return; }
+  const b = gView.getBBox(), r = gStage.getBoundingClientRect(), pad = 30;
+  if (!b.width || !b.height || !r.width) return;
+  const k = Math.min((r.width - 2 * pad) / b.width, (r.height - 2 * pad) / b.height, 1.4);
+  const MIN = 0.7;   // below this the 12px labels stop being readable
+  if (k >= MIN) gCam = { k, x: (r.width - b.width * k) / 2 - b.x * k, y: (r.height - b.height * k) / 2 - b.y * k };
+  else {   // too big to read when fitted: keep text readable, start at the entry point on the left
+    const root = gView.querySelector(".g-n.root"), m = root.transform.baseVal.consolidate().matrix;
+    gCam = { k: MIN, x: pad - b.x * MIN, y: r.height / 2 - (m.f + 23) * MIN };
+  }
+  gApply();
+}
+gStage.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = gStage.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const k = Math.min(4, Math.max(0.08, gCam.k * Math.exp(-ev.deltaY * 0.0015)));
+  gCam.x = mx - (mx - gCam.x) * k / gCam.k; gCam.y = my - (my - gCam.y) * k / gCam.k; gCam.k = k;
+  gApply();
+}, { passive: false });
+gStage.addEventListener("click", () => { if (!gLink.on && !gMoved && gPinned >= 0) { gPinned = -1; graphFocus(-1); } });
+addEventListener("keydown", ev => { if (ev.key === "Escape" && gPinned >= 0) { gPinned = -1; graphFocus(-1); } });
+gStage.addEventListener("mousedown", ev => {
+  gMoved = false;
+  const start = { x: ev.clientX, y: ev.clientY, cx: gCam.x, cy: gCam.y };
+  gStage.classList.add("dragging");
+  const move = e => { if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) > 3) gMoved = true; gCam.x = start.cx + e.clientX - start.x; gCam.y = start.cy + e.clientY - start.y; gApply(); };
+  const up = () => { gStage.classList.remove("dragging"); removeEventListener("mousemove", move); removeEventListener("mouseup", up); };
+  addEventListener("mousemove", move); addEventListener("mouseup", up);
+});
+document.getElementById("graph-fit").onclick = graphFit;
+document.getElementById("graph-all").onchange = ev => gView.classList.toggle("all", ev.target.checked);
+addEventListener("resize", graphResize);
+
+// download the drawing as a standalone SVG, with the current colors written in
+function inlineStyles(src, out) {
+  const props = ["fill", "stroke", "stroke-width", "stroke-dasharray", "opacity", "font-family", "font-size", "font-weight"];
+  const a = src.querySelectorAll("*"), z = out.querySelectorAll("*");
+  a.forEach((node, i) => { const cs = getComputedStyle(node); z[i].setAttribute("style", props.map(p => p + ":" + cs.getPropertyValue(p)).join(";")); });
+}
+// put the legend under an exported drawing and grow the canvas to fit it
+function appendLegend(out, x, y, w, h, vx = 0, vy = 0) {
+  const live = legendSvg(gViewMode);
+  live.style.position = "absolute"; live.style.visibility = "hidden";
+  document.body.appendChild(live);          // attached, so its computed colors can be read
+  const copy = live.cloneNode(true); inlineStyles(live, copy);
+  live.remove();
+  const g = document.createElementNS(SVGNS, "g"); g.setAttribute("transform", `translate(${x},${y})`);
+  [...copy.childNodes].forEach(n => g.appendChild(n));
+  out.appendChild(g);
+  const lh = +copy.getAttribute("height") + 16, H = h + lh, W = Math.max(w, +copy.getAttribute("width") + 20);
+  out.setAttribute("viewBox", [vx, vy, W, H].join(" ")); out.setAttribute("width", W); out.setAttribute("height", H);
+}
+function downloadSvg(out, suffix) {
+  out.style.background = getComputedStyle(document.documentElement).getPropertyValue("--bg");
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(out)], { type: "image/svg+xml" }));
+  link.download = D.meta.root.replace(/\W+/g, "_") + "-" + suffix + ".svg";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+document.getElementById("graph-svg-dl").onclick = () => {
+  if (gViewMode === "timeline") {   // axis on top of the lanes, in one file
+    const W = tlBody.clientWidth, H = +tlSvg.getAttribute("height");
+    const out = document.createElementNS(SVGNS, "svg");
+    out.setAttribute("xmlns", SVGNS); out.setAttribute("viewBox", `0 0 ${W} ${H + 30}`); out.setAttribute("width", W); out.setAttribute("height", H + 30);
+    for (const [src, dy] of [[tlHead, 0], [tlSvg, 30]]) {
+      const g = document.createElementNS(SVGNS, "g"); g.setAttribute("transform", `translate(0,${dy})`);
+      const copy = src.cloneNode(true); inlineStyles(src, copy);
+      [...copy.childNodes].forEach(n => g.appendChild(n)); out.appendChild(g);
+    }
+    out.querySelectorAll(".tl-guide, .tl-guide-t").forEach(n => n.remove());
+    appendLegend(out, 10, H + 30 + 14, W, H + 30);
+    downloadSvg(out, "timeline");
+    return;
+  }
+  const src = document.getElementById("graph-svg"), b = gView.getBBox(), pad = 20;
+  const out = src.cloneNode(true);
+  inlineStyles(src, out);
+  out.querySelector("#graph-view").setAttribute("transform", "");
+  out.setAttribute("viewBox", [b.x - pad, b.y - pad, b.width + 2 * pad, b.height + 2 * pad].join(" "));
+  out.setAttribute("width", b.width + 2 * pad); out.setAttribute("height", b.height + 2 * pad);
+  appendLegend(out, b.x, b.y + b.height + pad, b.width + 2 * pad, b.height + 2 * pad, b.x - pad, b.y - pad);
+  downloadSvg(out, "call-graph");
+};
+
+// ── call graph, Timeline view: one lane per function (same functions and order as the graph),
+// x = time, a bar wherever the function was running ──────────────────────────
+let gViewMode = "graph";
+const tlStage = document.getElementById("tl-stage"), tlBody = document.getElementById("tl-body");
+const tlHead = document.getElementById("tl-head"), tlSvg = document.getElementById("tl-svg");
+const TL = { LW: 330, RH: 22, v0: 0, v1: TOTAL || 1e-9 };
+const tlIndent = depth => 10 + Math.min(depth, 10) * 8;   // capped so deep rows keep room for their names
+const HINTS = {
+  graph: "each function sits under the caller that spends the most time in it · hover a box to preview its flow, click it to pin the whole flow through it (everything upstream and downstream) and open its details · click again, empty space or Esc to clear · drag to pan, scroll to zoom",
+  timeline: "hover a bar for the call running then, click it for its details, double-click to zoom to it · drag to pan, Ctrl/⌘ + scroll to zoom time · click a name for the function",
+};
+// legend, drawn as SVG so the same drawing goes into "Download SVG"
+function legendSvg(mode) {
+  const rows = mode === "graph" ? [
+    ["l-hot", 4, "most time: at least ¼ of the busiest arrow"],
+    ["l-dir", 1.6, "direct call (thicker = more time)"],
+    ["l-skip", 1.6, "calls through functions not shown"],
+    ["l-aux", 2, "another caller (hover a box, or All callers)"],
+  ] : [];
+  const W = 330, RH = 20;
+  const out = svgEl("svg", { class: "lg", xmlns: SVGNS });
+  let y = 4;
+  if (mode === "graph") {
+    for (const [cls, w, text] of rows) {
+      svgEl("line", { x1: 2, y1: y + 8, x2: 44, y2: y + 8, class: cls, "stroke-width": w }, out);
+      svgEl("path", { d: `M44,${y + 4} L50,${y + 8} L44,${y + 12} z`, class: cls === "l-hot" ? "f-hot" : cls === "l-aux" ? "f-aux" : "f-dir" }, out);
+      svgText(out, 60, y + 12, text);
+      y += RH;
+    }
+    if (gLink.on) {
+      svgEl("line", { x1: 2, y1: y + 8, x2: 44, y2: y + 8, class: "l-lk", "stroke-width": 3 }, out);
+      svgText(out, 60, y + 12, "Find link: call chain between the two ends");
+      y += RH;
+      svgEl("rect", { x: 6, y: y + 2, width: 38, height: 13, rx: 3, class: "lkbox" }, out);
+      svgText(out, 60, y + 12, "a function on the chain (thick = an end)");
+      y += RH;
+    }
+    // click highlight
+    for (const [cls, text] of [["callerbox", "upstream: the calls that led to the clicked box"], ["calleebox", "downstream: everything it ran, nested"]]) {
+      svgEl("rect", { x: 6, y: y + 2, width: 38, height: 13, rx: 3, class: cls }, out);
+      svgText(out, 60, y + 12, text);
+      y += RH;
+    }
+    // box anatomy
+    y += 4;
+    svgEl("rect", { class: "box", x: 2, y, width: 150, height: 40, rx: 6 }, out);
+    svgEl("rect", { x: 2, y, width: 4, height: 40, rx: 2, class: "f-hot" }, out);
+    svgText(out, 12, y + 15, "function", "mono");
+    svgText(out, 144, y + 15, "⚠2 +3 ↻", "m", "end");
+    svgText(out, 12, y + 31, "×calls · total · module", "m");
+    svgEl("rect", { x: 12, y: y + 35, width: 60, height: 2.5, class: "f-hot" }, out);
+    svgText(out, 162, y + 15, "one box per function");
+    svgText(out, 162, y + 31, "colored edge = its module", "m");
+    y += 48;
+    svgText(out, 2, y + 12, "×calls · total time · bar under the name = self time");
+    y += RH;
+    svgText(out, 2, y + 12, "⚠ raised exceptions · +N more callers · ↻ calls itself");
+    y += RH;
+  } else {
+    svgEl("rect", { x: 2, y: y + 3, width: 46, height: 11, rx: 2, class: "f-hot", opacity: .85 }, out);
+    svgText(out, 60, y + 12, "running (calls closer than a pixel merge)");
+    y += RH;
+    svgEl("rect", { x: 22, y: y + 1, width: 2, height: 15, class: "err-tick" }, out);
+    svgText(out, 60, y + 12, "raised an exception here");
+    y += RH;
+    svgText(out, 2, y + 12, "indented", "mono");
+    svgText(out, 60, y + 12, "called from the row above it (its main caller)");
+    y += RH;
+  }
+  out.setAttribute("width", W); out.setAttribute("height", y); out.setAttribute("viewBox", `0 0 ${W} ${y}`);
+  return out;
+}
+const legendBox = document.getElementById("graph-legend"), legendBtn = document.getElementById("graph-legend-btn");
+function showLegend(on) { legendBox.hidden = !on; legendBtn.classList.toggle("on", on); }
+legendBtn.onclick = () => showLegend(legendBox.hidden);
+document.getElementById("graph-legend-x").onclick = () => showLegend(false);
+function drawGraphView() {
+  document.getElementById("graph-legend-body").replaceChildren(legendSvg(gViewMode));
+  document.getElementById("graph-hint").textContent = HINTS[gViewMode];
+  document.getElementById("graph-all-l").hidden = gViewMode !== "graph";
+  gStage.hidden = gViewMode !== "graph";
+  tlStage.hidden = gViewMode !== "timeline";
+  if (gViewMode === "graph") drawGraph(); else drawTimeline();
+}
+document.querySelectorAll("[data-gview]").forEach(b => b.onclick = () => {
+  gViewMode = b.dataset.gview;
+  document.querySelectorAll("[data-gview]").forEach(x => x.classList.toggle("on", x === b));
+  drawGraphView();
+});
+
+const sortedCalls = new Map();   // function -> its calls sorted by start
+function callsByStart(fi) {
+  if (!sortedCalls.has(fi)) sortedCalls.set(fi, callsOf[fi].slice().sort((a, b) => D.s[a] - D.s[b]));
+  return sortedCalls.get(fi);
+}
+function niceStep(span, n) {
+  const raw = span / n, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  return [1, 2, 5, 10].map(m => m * p).find(v => v >= raw) || 10 * p;
+}
+let tlRaf = 0;
+const tlRedraw = () => { cancelAnimationFrame(tlRaf); tlRaf = requestAnimationFrame(drawTimeline); };
+
+function drawTimeline() {
+  if (tab !== "graph" || gViewMode !== "timeline") return;
+  const { rows } = graphModel();
+  const W = tlBody.clientWidth, { LW, RH } = TL, TW = Math.max(50, W - LW - 12);
+  const span = TL.v1 - TL.v0, X = t => LW + (t - TL.v0) / span * TW, px = span / TW;
+  tlHead.replaceChildren(); tlSvg.replaceChildren();
+  tlSvg.setAttribute("height", rows.length * RH + 8);
+  tlSvg.setAttribute("viewBox", `0 0 ${W} ${rows.length * RH + 8}`);
+  tlHead.setAttribute("viewBox", `0 0 ${W} 30`);
+
+  // time axis + grid
+  const ax = svgEl("g", { class: "tl-axis" }, tlHead);
+  svgText(ax, 10, 19, "function  (" + fmtT(TL.v0) + " → " + fmtT(TL.v1) + ")", "", "start");
+  const step = niceStep(span, Math.max(2, Math.floor(TW / 110)));
+  const grid = svgEl("g", {}, tlSvg);
+  for (let t = Math.ceil(TL.v0 / step) * step; t <= TL.v1 + 1e-12; t += step) {
+    const x = X(t);
+    svgEl("line", { x1: x, y1: 22, x2: x, y2: 30 }, ax);
+    svgText(ax, x, 17, "+" + fmtT(t), "", "middle");
+    svgEl("line", { x1: x, y1: 0, x2: x, y2: rows.length * RH + 8, class: "tl-grid" }, grid);
+  }
+  svgEl("line", { x1: LW - 6, y1: 0, x2: LW - 6, y2: rows.length * RH + 8, class: "tl-split" }, tlSvg);
+
+  rows.forEach(({ fi, depth }, r) => {
+    const s = fnStats[fi], y = r * RH;
+    const g = svgEl("g", { class: "tl-row" + (r % 2 ? " alt" : "") }, tlSvg);
+    g.dataset.fn = fi;
+    svgEl("rect", { class: "bg", x: 0, y, width: W, height: RH }, g);
+    const name = svgText(g, tlIndent(depth), y + 15, clipText(fnLabel(fi), LW - 60 - tlIndent(depth), 7.2), "t");
+    name.addEventListener("click", ev => { ev.stopPropagation(); renderFnDetail(fi); });
+    svgText(g, LW - 12, y + 15, fmtT(s.cumul), "s", "end");
+    // bars: the union of this function's calls, merged when closer than a pixel
+    const color = groupColor(fnGroup(fi));
+    const calls = callsByStart(fi);
+    let cur = null;
+    const flush = () => { if (cur) svgEl("rect", { x: X(cur[0]), y: y + 5, width: Math.max(1, X(cur[1]) - X(cur[0])), height: RH - 10, rx: 2, fill: color, opacity: .85 }, g); };
+    for (const c of calls) {
+      const a = D.s[c], b = a + tEff(c);
+      if (b < TL.v0 || a > TL.v1) continue;
+      const ca = Math.max(a, TL.v0), cb = Math.min(b, TL.v1);
+      if (cur && ca <= cur[1] + px) cur[1] = Math.max(cur[1], cb);
+      else { flush(); cur = [ca, cb]; }
+    }
+    flush();
+    for (const c of calls) if (has(c, F.RAISED)) {
+      const t = D.s[c] + tEff(c);
+      if (t >= TL.v0 && t <= TL.v1) svgEl("rect", { class: "tl-err", x: X(t) - 1, y: y + 2, width: 2, height: RH - 4 }, g);
+    }
+  });
+  timelineMarks();
+  graphFocus(gPinned);
+  if (gLink.on) linkApply();
+}
+// the call of a row's function running at time t (the innermost one, for recursion)
+function callAt(fi, t) {
+  const calls = callsByStart(fi);
+  let lo = 0, hi = calls.length - 1, k = -1;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (D.s[calls[m]] <= t) { k = m; lo = m + 1; } else hi = m - 1; }
+  const slack = (TL.v1 - TL.v0) / 400;   // a few pixels, so thin bars can be hovered
+  for (let j = k; j >= 0 && j > k - 200; j--) { const c = calls[j]; if (D.s[c] + tEff(c) >= t - slack) return c; }
+  if (k + 1 < calls.length && D.s[calls[k + 1]] <= t + slack) return calls[k + 1];
+  return -1;
+}
+function tlHit(ev) {
+  const r = tlSvg.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const TW = Math.max(50, tlBody.clientWidth - TL.LW - 12);
+  const rowsM = graphModel().rows, row = rowsM[Math.floor(y / TL.RH)];
+  const t = TL.v0 + (x - TL.LW) / TW * (TL.v1 - TL.v0);
+  return { x, t, inTrack: x >= TL.LW, fi: row ? row.fi : -1, call: row && x >= TL.LW ? callAt(row.fi, t) : -1 };
+}
+let tlGuide = null;
+tlBody.addEventListener("mousemove", ev => {
+  const h = tlHit(ev);
+  tlHead.querySelectorAll(".tl-guide, .tl-guide-t").forEach(n => n.remove());
+  if (tlGuide) tlGuide.remove(); tlGuide = null;
+  if (!h.inTrack) {   // over the names: the full name and totals
+    if (h.fi < 0) { tip.style.display = "none"; return; }
+    const st = fnStats[h.fi];
+    graphTip(ev, [["mono", st.name], ["muted", st.calls.toLocaleString() + " call" + (st.calls > 1 ? "s" : "") + " · " + fmtT(st.cumul) + " total · self " + fmtT(st.self) + " · click for details"]]);
+    return;
+  }
+  tlGuide = svgEl("line", { class: "tl-guide", x1: h.x, y1: 0, x2: h.x, y2: tlSvg.getAttribute("height") }, tlSvg);
+  svgEl("line", { class: "tl-guide", x1: h.x, y1: 0, x2: h.x, y2: 30 }, tlHead);
+  svgText(tlHead, h.x + 4, 28, "+" + fmtT(Math.max(0, h.t)), "tl-guide-t");
+  if (h.call < 0) { tip.style.display = "none"; return; }
+  const c = h.call;
+  graphTip(ev, [["mono", D.fns[D.f[c]] + "  #" + c],
+    ["muted", "started +" + fmtT(D.s[c]) + " · ran " + fmtT(tEff(c)) + " · self " + fmtT(D.st[c])]]
+    .concat(has(c, F.RAISED) ? [["err", "raised " + String(det(c).exception || "").slice(0, 120)]] : []));
+});
+tlBody.addEventListener("mouseleave", () => { tip.style.display = "none"; if (tlGuide) tlGuide.remove(); tlGuide = null; tlHead.querySelectorAll(".tl-guide, .tl-guide-t").forEach(n => n.remove()); });
+tlBody.addEventListener("click", ev => { if (tlMoved) return; const h = tlHit(ev); if (h.call >= 0) select(h.call); });
+tlBody.addEventListener("dblclick", ev => {
+  const h = tlHit(ev);
+  if (h.call < 0) return;
+  const a = D.s[h.call], b = a + tEff(h.call), pad = (b - a) * 0.08 || 1e-6;
+  TL.v0 = Math.max(0, a - pad); TL.v1 = Math.min(TOTAL, b + pad); tlRedraw();
+});
+// zoom time with Ctrl/⌘ + scroll (and trackpad pinch); plain scroll moves through the rows
+tlBody.addEventListener("wheel", ev => {
+  if (!ev.ctrlKey && !ev.metaKey) return;
+  ev.preventDefault();
+  const h = tlHit(ev), f = Math.exp(ev.deltaY * 0.002);
+  const span = Math.min(TOTAL, Math.max((TL.v1 - TL.v0) * f, TOTAL * 1e-7, 1e-9));
+  const at = Math.min(Math.max(h.t, TL.v0), TL.v1), ratio = (at - TL.v0) / (TL.v1 - TL.v0);
+  TL.v0 = Math.max(0, at - ratio * span); TL.v1 = Math.min(TOTAL, TL.v0 + span); TL.v0 = Math.max(0, TL.v1 - span);
+  tlRedraw();
+}, { passive: false });
+let tlMoved = false;
+tlBody.addEventListener("mousedown", ev => {
+  if (ev.button !== 0) return;
+  const start = ev.clientX, v0 = TL.v0, v1 = TL.v1, TW = Math.max(50, tlBody.clientWidth - TL.LW - 12);
+  tlMoved = false;
+  tlBody.classList.add("dragging");
+  const move = e => {
+    const dt = (e.clientX - start) / TW * (v1 - v0);
+    if (Math.abs(e.clientX - start) > 3) tlMoved = true;
+    const span = v1 - v0;
+    TL.v0 = Math.min(Math.max(0, v0 - dt), Math.max(0, TOTAL - span)); TL.v1 = TL.v0 + span;
+    tlRedraw();
+  };
+  const up = () => { tlBody.classList.remove("dragging"); removeEventListener("mousemove", move); removeEventListener("mouseup", up); };
+  addEventListener("mousemove", move); addEventListener("mouseup", up);
+});
+function timelineMarks() {
+  const q = (document.getElementById("q").value || "").trim().toLowerCase();
+  tlSvg.querySelectorAll(".tl-row").forEach(n => {
+    const fi = +n.dataset.fn;
+    n.classList.toggle("sel", fi === fnSelected);
+    n.classList.toggle("match", !!q && q[0] !== "#" && D.fns[fi].toLowerCase().includes(q));
+  });
+}
+
+// ── Find link: how two functions are connected, from the calls that actually happened ─────
+// A mode of its own: while it is on, clicking boxes picks the two ends instead of pinning the
+// flow highlight; turning it off gives the normal click behaviour back untouched.
+const gLink = { on: false, a: -1, b: -1, res: null, only: -1 };
+const linkBtn = document.getElementById("link-btn"), linkBar = document.getElementById("link-bar");
+const linkFrom = document.getElementById("link-from"), linkTo = document.getElementById("link-to");
+(() => {   // every function name, for the From / To inputs
+  const dl = document.getElementById("fn-names");
+  D.fns.forEach(n => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
+})();
+
+// Call chains between a and b. kind "down": b ran under a; "up": a ran under b; "common":
+// neither, so the chains meet in a common caller. Each chain lists every function on the way,
+// including ones the graph does not show. Chains with the same functions are grouped.
+function findLink(a, b) {
+  const groups = new Map();
+  const add = (key, fns, legs, n, t, example) => {
+    const g = groups.get(key) || groups.set(key, { fns, legs, n: 0, t: 0, example }).get(key);
+    g.n += n; g.t += t;
+  };
+  const chainUp = (c, stopFn) => {   // functions from c up to its nearest ancestor call of stopFn
+    const fns = [D.f[c]];
+    for (let x = D.p[c]; x !== -1; x = D.p[x]) { fns.push(D.f[x]); if (D.f[x] === stopFn) return fns.reverse(); }
+    return null;
+  };
+  const direct = (top, bottom) => {
+    for (const c of callsOf[bottom]) {
+      const fns = chainUp(c, top);
+      if (fns) add(fns.join(">"), fns, [fns], 1, tEff(c), c);
+    }
+  };
+  let kind = "down";
+  direct(a, b);
+  if (!groups.size) { kind = "up"; direct(b, a); }
+  if (!groups.size && a !== b) {
+    kind = "common";
+    // mark every call above a call of a; climbing from each call of b, the first marked call is
+    // where the two chains meet (their lowest common caller)
+    const above = new Uint8Array(N);
+    for (const c of callsOf[a]) for (let x = D.p[c]; x !== -1 && !above[x]; x = D.p[x]) above[x] = 1;
+    const aSorted = callsOf[a];   // preorder ids, ascending
+    for (const c of callsOf[b]) {
+      let m = D.p[c];
+      while (m !== -1 && !above[m]) m = D.p[m];
+      if (m === -1) continue;
+      let lo = 0, hi = aSorted.length - 1, k = -1;   // first call of a inside m's subtree
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (aSorted[mid] > m) { k = mid; hi = mid - 1; } else lo = mid + 1; }
+      if (k < 0 || aSorted[k] > subEnd[m]) continue;
+      const toA = chainUp(aSorted[k], D.f[m]), toB = chainUp(c, D.f[m]);
+      if (!toA || !toB) continue;
+      add(toA.join(">") + "|" + toB.join(">"), [D.f[m]], [toA, toB], 1, tEff(c), c);
+    }
+  }
+  const chains = [...groups.values()].sort((x, y) => y.n - x.n || x.fns.length - y.fns.length);
+  return { kind, a, b, chains };
+}
+
+function linkClear() {
+  gView.querySelectorAll(".lk, .lk-end, .lk-dim").forEach(n => n.classList.remove("lk", "lk-end", "lk-dim"));
+  gView.querySelectorAll(".g-e.lkpath").forEach(n => { n.classList.remove("lkpath", "show"); const p = n.querySelector("path"); if (p.dataset.marker) p.setAttribute("marker-end", p.dataset.marker); });
+  tlSvg.querySelectorAll(".tl-row.lk-dim").forEach(n => n.classList.remove("lk-dim"));
+}
+// paint the chains on the graph: path boxes and the arrows between consecutive shown functions
+function linkApply() {
+  linkClear();
+  if (!gLink.on) return;
+  const ends = [gLink.a, gLink.b].filter(f => f >= 0);
+  const onPath = new Set(ends), arrows = new Set();
+  if (gLink.res) {
+    const chains = gLink.only >= 0 ? [gLink.res.chains[gLink.only]] : gLink.res.chains;
+    const { shown } = graphModel();
+    for (const ch of chains) for (const leg of ch.legs) {
+      const vis = leg.filter(f => shown.has(f));
+      vis.forEach(f => onPath.add(f));
+      for (let i = 1; i < vis.length; i++) if (vis[i - 1] !== vis[i]) arrows.add(vis[i - 1] + ">" + vis[i]);
+    }
+  }
+  if (!ends.length) return;
+  gView.querySelectorAll(".g-n").forEach(n => {
+    const f = +n.dataset.fn;
+    n.classList.add(ends.includes(f) ? "lk-end" : onPath.has(f) ? "lk" : "lk-dim");
+  });
+  gView.querySelectorAll(".g-e").forEach(n => n.classList.add("lk-dim"));
+  for (const key of arrows) {
+    const g = gEdgeEl.get(key); if (!g) continue;
+    g.classList.remove("lk-dim"); g.classList.add("lkpath", "show");
+    const p = g.querySelector("path"); if (!p.dataset.marker) p.dataset.marker = p.getAttribute("marker-end");
+    p.setAttribute("marker-end", "url(#g-arrow-lk)");
+  }
+  tlSvg.querySelectorAll(".tl-row").forEach(n => n.classList.toggle("lk-dim", !onPath.has(+n.dataset.fn)));
+}
+
+function linkSet(which, fi) {
+  if (which === "a") gLink.a = fi; else gLink.b = fi;
+  linkFrom.value = gLink.a >= 0 ? D.fns[gLink.a] : "";
+  linkTo.value = gLink.b >= 0 ? D.fns[gLink.b] : "";
+  gLink.only = -1;
+  gLink.res = gLink.a >= 0 && gLink.b >= 0 ? findLink(gLink.a, gLink.b) : null;
+  linkApply();
+  renderLinkPanel();
+}
+// clicking boxes in link mode: first click = From, second = To, a third starts over
+function linkPick(fi) {
+  if (gLink.a < 0 || (gLink.a >= 0 && gLink.b >= 0)) { gLink.b = -1; linkSet("a", fi); }
+  else linkSet("b", fi);
+}
+function linkMode(on) {
+  gLink.on = on;
+  linkBtn.classList.toggle("on", on);
+  linkBar.hidden = !on;
+  if (on) { gPinned = -1; graphFocus(-1); linkApply(); renderLinkPanel(); }   // the flow highlight steps aside
+  else { linkClear(); }
+  document.getElementById("graph-legend-body").replaceChildren(legendSvg(gViewMode));
+}
+linkBtn.onclick = () => linkMode(!gLink.on);
+document.getElementById("link-swap").onclick = () => { const a = gLink.a; gLink.a = gLink.b; linkSet("b", a); };
+document.getElementById("link-clear").onclick = () => { gLink.a = gLink.b = -1; linkSet("a", -1); };
+for (const [input, which] of [[linkFrom, "a"], [linkTo, "b"]]) input.addEventListener("change", () => {
+  const v = input.value.trim(), fi = D.fns.indexOf(v);
+  if (fi >= 0) linkSet(which, fi); else if (!v) linkSet(which, -1);
+});
+
+function renderLinkPanel() {
+  right.replaceChildren();
+  const { a, b, res } = gLink;
+  right.appendChild(el("h2", "", "Find link"));
+  if (a < 0 || b < 0) {
+    right.appendChild(el("div", "note", a < 0 ? "Click the first function in the graph (or type it in From)." : "Now click the second function (or type it in To)."));
+    if (a >= 0) right.appendChild(kvGrid([["from", D.fns[a]]]));
+    return;
+  }
+  const head = el("div", "crumbs");
+  head.append(fnLink(a), el("span", "sep", res.kind === "common" ? "  and  " : "  →  "), fnLink(b));
+  right.appendChild(head);
+  const total = res.chains.reduce((x, c) => x + c.n, 0);
+  const lead = {
+    down: `${D.fns[b]} ran under ${D.fns[a]} in ${total} call${total > 1 ? "s" : ""}, through ${res.chains.length} different chain${res.chains.length > 1 ? "s" : ""}.`,
+    up: `The other way round: ${D.fns[a]} ran under ${D.fns[b]} in ${total} call${total > 1 ? "s" : ""}, through ${res.chains.length} different chain${res.chains.length > 1 ? "s" : ""}. Neither ran under ${D.fns[a]}.`,
+    common: res.chains.length ? `Neither one ever ran under the other. Their calls meet in ${new Set(res.chains.map(c => c.fns[0])).size} common caller${res.chains.length > 1 ? "s" : ""}: the chains below go from the meeting point down to each of them.` : "These two never appear in the same run of calls.",
+  }[res.kind];
+  if (a === b) right.appendChild(el("div", "note", "Both ends are the same function: the chains show how it calls itself."));
+  right.appendChild(el("div", "note", lead));
+  if (!res.chains.length) return;
+  right.appendChild(el("div", "note", "Amber on the graph. Click a chain to show only that one; hidden functions (not in the graph's top N) are listed in grey."));
+  const { shown } = graphModel();
+  res.chains.slice(0, 50).forEach((ch, k) => {
+    const box = el("div", "lk-chain" + (gLink.only === k ? " on" : ""));
+    const top = el("div", "lk-chain-head");
+    top.append(el("b", "", "Chain " + (k + 1)), el("span", "muted", ` · ${ch.n} call${ch.n > 1 ? "s" : ""} · ${fmtT(ch.t)} of ${labelShort(b)}`));
+    const ex = nodeLink(ch.example, "example #" + ch.example); ex.onclick = ev => { ev.stopPropagation(); showTab("tree"); goto(ch.example); };
+    top.append(el("span", "spacer"), ex);
+    box.appendChild(top);
+    ch.legs.forEach((leg, li) => {
+      if (res.kind === "common") box.appendChild(el("div", "muted lk-leg", li === 0 ? "down to " + labelShort(a) + ":" : "down to " + labelShort(b) + ":"));
+      const steps = el("div", "lk-steps");
+      leg.forEach((f, i) => {
+        if (i) steps.appendChild(el("span", "sep", "→"));
+        steps.appendChild(el("span", (f === a || f === b ? "lk-endname" : shown.has(f) ? "" : "muted"), D.fns[f]));
+      });
+      box.appendChild(steps);
+    });
+    box.onclick = () => { gLink.only = gLink.only === k ? -1 : k; linkApply(); renderLinkPanel(); };
+    right.appendChild(box);
+  });
+  if (res.chains.length > 50) right.appendChild(el("div", "note", (res.chains.length - 50) + " more chains"));
+}
+function labelShort(fi) { return fnLabel(fi); }
+
+// ── search and error list ───────────────────────────────────────────────────
+const results = document.getElementById("results");
+function showResults(title, ids, extra) {
+  results.replaceChildren();
+  const head = el("div", "head"); head.appendChild(el("b", "", title)); head.appendChild(el("span", "spacer"));
+  const x = el("span", "link", "close"); x.onclick = () => results.classList.remove("show"); head.appendChild(x);
+  results.appendChild(head);
+  for (const id of ids.slice(0, 500)) {
+    const r = el("div", "res");
+    r.appendChild(el("span", "nm" + (has(id, F.RAISED) ? " err" : ""), name(id) + (extra ? "  " + extra(id) : "")));
+    r.appendChild(el("span", "muted", "#" + id));
+    r.appendChild(el("span", "", fmtT(tEff(id))));
+    r.onclick = () => { if (tab === "fns") showTab("tree"); goto(id); };
+    results.appendChild(r);
+  }
+  if (ids.length > 500) results.appendChild(el("div", "note", "  " + (ids.length - 500) + " more: refine the search"));
+  results.classList.add("show");
+}
+let qTimer = 0;
+document.getElementById("q").addEventListener("input", () => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => {
+    const q = document.getElementById("q").value.trim();
+    if (tab === "fns") renderFnTable();
+    graphHighlight(document.getElementById("q").value);
+    if (!q) { results.classList.remove("show"); return; }
+    if (/^#\d+$/.test(q)) { const id = +q.slice(1); if (id < N) { results.classList.remove("show"); goto(id); } return; }
+    const ql = q.toLowerCase();
+    const ids = [];
+    D.fns.forEach((n, i) => { if (n.toLowerCase().includes(ql)) ids.push(...callsOf[i]); });
+    ids.sort((a, b) => tEff(b) - tEff(a));
+    showResults(ids.length.toLocaleString() + " calls matching “" + q + "” (slowest first)", ids);
+  }, 150);
+});
+btnErr.onclick = () => {
+  if (!raisedIds.length) { showResults("No exception was raised in this trace", []); return; }
+  showResults(raisedIds.length + " calls where an exception was raised", raisedIds,
+    id => "— " + String(det(id).exception || "").split("\n")[0].slice(0, 120));
+};
+
+// ── keyboard: ↑ ↓ move, → expand, ← collapse / parent ───────────────────────
+addEventListener("keydown", e => {
+  if (tab !== "tree" || e.target.tagName === "INPUT" || selected < 0) return;
+  const rows = [...treeEl.querySelectorAll(".row[data-id]")].filter(r => r.offsetParent !== null);
+  const i = rows.findIndex(r => +r.dataset.id === selected);
+  if (e.key === "ArrowDown" && i < rows.length - 1) { select(+rows[i + 1].dataset.id); rows[i + 1].scrollIntoView({ block: "nearest" }); }
+  else if (e.key === "ArrowUp" && i > 0) { select(+rows[i - 1].dataset.id); rows[i - 1].scrollIntoView({ block: "nearest" }); }
+  else if (e.key === "ArrowRight") toggleNode(selected, true);
+  else if (e.key === "ArrowLeft") {
+    const s = nodeState.get(selected);
+    if (s && s.open) toggleNode(selected, false); else if (D.p[selected] >= 0) { reveal(D.p[selected]); select(D.p[selected]); }
+  } else return;
+  e.preventDefault();
+});
+
+// deep link: page.html#n123 opens call #123
+const m = /^#n(\d+)$/.exec(location.hash);
+if (m && +m[1] < N) { reveal(+m[1]); select(+m[1], { noHash: true }); } else select(0, { noHash: true });
+</script>
+</body>
+</html>

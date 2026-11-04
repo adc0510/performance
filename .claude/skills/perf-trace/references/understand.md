@@ -19,6 +19,49 @@ before touching it.
 - `tree`, `path`, `node`: browse the call tree. `where NAME --root SRC`: the `file:line`
   of a definition.
 
+## An HTML page of the run
+
+`html TRACE [-o FILE] [--no-values]` writes one self-contained file, by default next to
+the trace as `<trace>.html`. It needs no network and no install, so it opens from a
+server's disk or a ticket attachment. Make one when the user wants to look at the run
+themselves, show it to their team, or follow the flow visually rather than read your
+summary.
+
+What each tab answers:
+
+- **Call tree**: every call in order, with wall / self time and time bars. Repeated
+  calls are merged as `×N` and expanded on demand. Selecting a call shows its arguments
+  at entry, its result, its exception (where it was raised, which caller caught it) and,
+  under TRACE_LOCALS, its locals line by line.
+- **Call graph**, *Graph* view: one box per function, with an arrow from caller to callee
+  labelled with the call count; thicker arrows carry more time. Clicking a box
+  highlights the whole flow through it: the calls that led to it, up to the entry point,
+  and everything it ran. **Find link** is a separate mode: pick two functions and it
+  lists the real call chains between them (either direction), or the common callers
+  where their chains meet.
+- **Call graph**, *Timeline* view: the same functions as rows on a time axis, with a
+  bar wherever each one was running and a red tick where it raised. This shows the
+  phases of the run and what overlapped.
+- **Functions**: per-function totals with callers and callees. **Flame**: every call on
+  a time axis, for where the time went.
+
+Handing it over: give the path, plus a link to each call you cite, as
+`<page>.html#n<ID>` (the same node ids as every other command). Large traces are fine:
+47k calls make a 19 MB page that opens in about a second. The graph and timeline can be
+downloaded as SVG, with their legend, for docs and slides.
+
+Limits to state when you point someone at the page:
+
+- The call graph shows the busiest N functions (30 by default, adjustable). A dashed
+  arrow means the calls went through functions that are not shown.
+- Each function is drawn under its main caller only: the one that spends the most time
+  in it. Other callers are counted as `+N` on the box and drawn on hover or with "All
+  callers".
+- A generator's timeline bar covers its whole lifetime, including the time its consumer
+  spent between yields (the Flame tab has the same caveat).
+- The page holds every captured value. Run `secrets` before it is shared, or rebuild it
+  with `--no-values` (structure and timing only; exception messages stay).
+
 ## Hygiene before sharing a trace
 
 - `secrets TRACE [--emails]`: values that look like credentials (API keys, tokens, JWTs,
